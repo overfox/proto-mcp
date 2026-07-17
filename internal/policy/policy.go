@@ -225,6 +225,16 @@ func (e *Engine) applyOverrideInto(into *document) error {
 		return fmt.Errorf("parse override: %w", err)
 	}
 
+	// Enforce the send floor on the override BEFORE merging: into is
+	// mutated in place (New()'s path merges straight into e.doc), so a
+	// post-merge rejection would leave the weakened entries applied.
+	// Override entries replace default blocks wholesale, and the
+	// embedded defaults already satisfy the floor, so validating just
+	// the override's own entries covers the merged result.
+	if err := enforceSendFloor(&override); err != nil {
+		return err
+	}
+
 	// Shallow merge: per-tool override REPLACES the default block.
 	// Don't deep-merge fields — a user who copies our default and
 	// forgets to carry over `confirm: true` would silently weaken
@@ -237,6 +247,41 @@ func (e *Engine) applyOverrideInto(into *document) error {
 	}
 	if override.Defaults.Decision != "" {
 		into.Defaults = override.Defaults
+	}
+	// idle_lock_minutes was documented in configuration.md but never
+	// merged from the override, so setting it had no effect. Zero
+	// means "not set" here — the embedded default is 0/disabled, so
+	// there is no force-back-to-zero case to preserve.
+	if override.IdleLockMinutes != 0 {
+		into.IdleLockMinutes = override.IdleLockMinutes
+	}
+	return nil
+}
+
+// sendFloorTools may never be weakened below prompt-with-zero-TTL:
+// these are the tools that put words in the user's mouth to third
+// parties. A stricter setting (deny) is allowed; allow or a nonzero
+// approval-cache TTL is not — an override attempting either is
+// rejected wholesale, keeping the previous policy in force (Reload)
+// or the embedded defaults (startup).
+var sendFloorTools = []string{
+	"mail_send", "mail_send_draft", "mail_reply", "mail_reply_all", "mail_forward",
+}
+
+func enforceSendFloor(doc *document) error {
+	for _, name := range sendFloorTools {
+		p, ok := doc.Tools[name]
+		if !ok {
+			continue // no entry → tool doesn't register (default-deny)
+		}
+		if p.Decision == DecisionAllow {
+			return fmt.Errorf("policy floor: %s cannot be set to allow (must stay prompt or deny)", name)
+		}
+		// parseDocument already validated the TTL string; TTLDuration
+		// cannot panic here.
+		if p.TTLDuration() != 0 {
+			return fmt.Errorf("policy floor: %s ttl must be 0 (every send re-prompts); got %q", name, p.TTL)
+		}
 	}
 	return nil
 }

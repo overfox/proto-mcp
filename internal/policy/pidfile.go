@@ -81,20 +81,45 @@ func WritePIDFile(path string) (cleanup func(), err error) {
 // than to send SIGHUP to a wrapper that ignores it and produce a
 // misleading success log.
 //
+// Two process shapes carry a live session: `protonmcp serve-stdio`
+// instances (same executable as us) and the launchd daemon
+// `protonmcpd`, whose argv is just the bare binary path — the old
+// `pgrep -f "protonmcp serve-stdio"` never matched it, so
+// lock/unlock/policy-reload silently skipped the daemon while
+// claiming to handle it (lock.go's doc comment). The daemon is
+// validated against the protonmcpd binary sitting next to our own
+// executable (make and the Homebrew cask install every product into
+// the same bin dir), preserving the D33/D34 never-signal-a-stranger
+// rule with the only identity we can vouch for.
+//
 // Returns ErrNotRunning if no matching process exists.
 func FindRunningPIDs() ([]int, error) {
-	out, err := exec.Command("pgrep", "-f", "protonmcp serve-stdio").Output()
-	if err != nil {
-		var ee *exec.ExitError
-		if errors.As(err, &ee) {
-			return nil, ErrNotRunning
-		}
-		return nil, fmt.Errorf("pgrep: %w", err)
-	}
 	self := os.Getpid()
 	selfExe, _ := os.Executable()
 	selfExe, _ = filepath.Abs(selfExe)
+	daemonExe := ""
+	if selfExe != "" {
+		daemonExe = filepath.Join(filepath.Dir(selfExe), "protonmcpd")
+	}
 
+	pids := pgrepMatching("-f", "protonmcp serve-stdio", self, selfExe)
+	pids = append(pids, pgrepMatching("-x", "protonmcpd", self, daemonExe)...)
+	if len(pids) == 0 {
+		return nil, ErrNotRunning
+	}
+	return pids, nil
+}
+
+// pgrepMatching runs pgrep with one flag+pattern and post-filters the
+// PIDs: self is excluded, and each PID's actual executable must match
+// wantExe (D33/D34 — see FindRunningPIDs). pgrep exiting 1 (no match)
+// or failing outright both yield nil; the caller treats an empty
+// combined result as ErrNotRunning.
+func pgrepMatching(flag, pattern string, self int, wantExe string) []int {
+	out, err := exec.Command("pgrep", flag, pattern).Output()
+	if err != nil {
+		return nil
+	}
 	var pids []int
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		if line == "" {
@@ -104,18 +129,16 @@ func FindRunningPIDs() ([]int, error) {
 		if err != nil || pid == self {
 			continue
 		}
-		// D33/D34: verify the PID's actual executable matches ours.
-		// caller.BinaryFor returns "" on can't-determine (permission /
-		// non-darwin); drop those rather than SIGHUP a stranger.
-		if !matchesExecutable(pid, selfExe) {
+		// D33/D34: verify the PID's actual executable matches the one
+		// we expect. caller.BinaryFor returns "" on can't-determine
+		// (permission / non-darwin); drop those rather than signal a
+		// stranger.
+		if !matchesExecutable(pid, wantExe) {
 			continue
 		}
 		pids = append(pids, pid)
 	}
-	if len(pids) == 0 {
-		return nil, ErrNotRunning
-	}
-	return pids, nil
+	return pids
 }
 
 // matchesExecutable returns true if the process at pid is running
