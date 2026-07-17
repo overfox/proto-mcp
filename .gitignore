@@ -33,3 +33,5 @@ helpers/lockwatch/protonmcp-lockwatch
 .vscode/
 *.swp
 *.txt
+packaging/mcpb/protonmcp-shim
+packaging/*.mcpb

@@ -1,0 +1,19 @@
+{
+  "manifest_version": "0.3",
+  "name": "protonmcp",
+  "display_name": "Proton Mail (protonmcp)",
+  "version": "1.0.2",
+  "description": "Touch-ID-gated Proton Mail access: read, search, organize, draft, and send via the local protonmcpd daemon.",
+  "author": {
+    "name": "overfox (fork of just-an-oldsalt/proto-mcp)",
+    "url": "https://github.com/overfox/proto-mcp"
+  },
+  "server": {
+    "type": "binary",
+    "entry_point": "protonmcp-shim",
+    "mcp_config": {
+      "command": "${__dirname}/protonmcp-shim",
+      "args": []
+    }
+  }
+}
