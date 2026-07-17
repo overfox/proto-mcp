@@ -13,6 +13,8 @@ TOUCHID_DIR   := helpers/touchid
 TOUCHID       := $(TOUCHID_DIR)/protonmcp-touchid
 LOCKWATCH_DIR := helpers/lockwatch
 LOCKWATCH     := $(LOCKWATCH_DIR)/protonmcp-lockwatch
+MENUBAR_DIR   := helpers/menubar
+MENUBAR       := $(MENUBAR_DIR)/protonmcp-menubar
 
 # Build inputs for the Go binaries. NOT just *.go: the binaries also
 # compile cgo (.c/.h, e.g. internal/keystore/access_control_darwin.*)
@@ -26,7 +28,7 @@ GO_INPUTS := $(shell find cmd internal -type f \( \
 	-name '*.yaml' -o -name '*.sql' \) 2>/dev/null)
 
 .PHONY: all
-all: $(PROTONMCP) $(PROTONMCPD) $(SHIM) $(TOUCHID) $(LOCKWATCH)
+all: $(PROTONMCP) $(PROTONMCPD) $(SHIM) $(TOUCHID) $(LOCKWATCH) $(MENUBAR)
 
 .PHONY: protonmcp
 protonmcp: $(PROTONMCP)
@@ -71,6 +73,15 @@ $(LOCKWATCH): $(LOCKWATCH_DIR)/main.swift
 
 .PHONY: lockwatch
 lockwatch: $(LOCKWATCH)
+
+# Menu bar indicator + kill switch. NSStatusItem app: shows daemon
+# state (running/locked/in-use/off) next to the clock and can disable
+# + bootout the launchd job entirely ("switch off") until re-enabled.
+$(MENUBAR): $(MENUBAR_DIR)/main.swift
+	swiftc -O -o $@ $<
+
+.PHONY: menubar
+menubar: $(MENUBAR)
 
 .PHONY: test
 test:
