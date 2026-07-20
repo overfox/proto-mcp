@@ -109,6 +109,14 @@ type document struct {
 	// 1 GiB. The 500 MiB total-cache ceiling is hardcoded in
 	// internal/store/attachments.go and not user-configurable.
 	MaxAttachmentBytes int64 `yaml:"max_attachment_bytes,omitempty"`
+	// AttachmentPathAllowlist: absolute directories from which
+	// path-based attachments (attachments[].path on the send/draft
+	// tools) may be read. Empty / missing → path-based attachments
+	// are refused entirely (secure default: the daemon reads no host
+	// file on a model's say-so unless the user opted a directory in).
+	// Entries must be absolute; symlinks are resolved before the
+	// containment check at use-site.
+	AttachmentPathAllowlist []string `yaml:"attachment_path_allowlist,omitempty"`
 }
 
 // DefaultMaxAttachmentBytes is the per-attachment cap when the
@@ -255,6 +263,14 @@ func (e *Engine) applyOverrideInto(into *document) error {
 	if override.IdleLockMinutes != 0 {
 		into.IdleLockMinutes = override.IdleLockMinutes
 	}
+	// Same never-merged bug as idle_lock_minutes: max_attachment_bytes
+	// was documented as overridable but silently ignored.
+	if override.MaxAttachmentBytes != 0 {
+		into.MaxAttachmentBytes = override.MaxAttachmentBytes
+	}
+	if len(override.AttachmentPathAllowlist) > 0 {
+		into.AttachmentPathAllowlist = override.AttachmentPathAllowlist
+	}
 	return nil
 }
 
@@ -357,6 +373,11 @@ func parseDocument(data []byte) (document, error) {
 	if doc.MaxAttachmentBytes < 0 || doc.MaxAttachmentBytes > (1<<30) {
 		return document{}, fmt.Errorf("max_attachment_bytes must be in [0, 1 GiB]; got %d", doc.MaxAttachmentBytes)
 	}
+	for _, dir := range doc.AttachmentPathAllowlist {
+		if !filepath.IsAbs(dir) {
+			return document{}, fmt.Errorf("attachment_path_allowlist entries must be absolute paths; got %q", dir)
+		}
+	}
 	return doc, nil
 }
 
@@ -381,4 +402,15 @@ func (e *Engine) MaxAttachmentBytes() int64 {
 		return DefaultMaxAttachmentBytes
 	}
 	return e.doc.MaxAttachmentBytes
+}
+
+// AttachmentPathAllowlist returns the directories path-based
+// attachments may be read from. Empty slice means the feature is
+// disabled. Returns a copy — callers can't mutate engine state.
+func (e *Engine) AttachmentPathAllowlist() []string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	out := make([]string, len(e.doc.AttachmentPathAllowlist))
+	copy(out, e.doc.AttachmentPathAllowlist)
+	return out
 }
