@@ -60,6 +60,7 @@ tools:
   labels_list:           { decision: allow }
   folders_list:          { decision: allow }
   mail_sync:             { decision: allow }
+  mail_counts:           { decision: allow }
 
   # Phase 9 read-only calendar tools — mirror-backed reads, allow-by-
   # default like the mail read tools. No write/RSVP path exists.

@@ -29,6 +29,7 @@ func mailSaveAttachment(deps Deps) mcp.Tool {
 		MessageID    string `json:"message_id"`
 		AttachmentID string `json:"attachment_id"`
 		Filename     string `json:"filename,omitempty"`
+		Directory    string `json:"directory,omitempty"`
 	}
 	type result struct {
 		SavedPath string `json:"saved_path"`
@@ -38,9 +39,11 @@ func mailSaveAttachment(deps Deps) mcp.Tool {
 
 	return mcp.Tool{
 		Name: "mail_save_attachment",
-		Description: "Save a decrypted attachment to ~/Downloads. " +
+		Description: "Save a decrypted attachment to ~/Downloads (default) or, via the optional " +
+			"directory param, into a directory inside the attachment_path_allowlist from policy.yaml " +
+			"(useful for saving straight into a project folder a sandboxed client can read). " +
 			"Filename is sanitized (RTL spoofing, control chars, path separators, leading dots stripped). " +
-			"Refuses paths outside ~/Downloads. Existing files get a (2), (3), ... suffix rather than " +
+			"Refuses any other destination. Existing files get a (2), (3), ... suffix rather than " +
 			"overwriting. On cache miss, fetches + caches first (same path as mail_download_attachment). " +
 			"Touch ID prompt shows the literal filename + target directory.",
 		InputSchema: json.RawMessage(`{
@@ -48,7 +51,8 @@ func mailSaveAttachment(deps Deps) mcp.Tool {
 			"properties": {
 				"message_id":    {"type": "string"},
 				"attachment_id": {"type": "string"},
-				"filename":      {"type": "string"}
+				"filename":      {"type": "string"},
+				"directory":     {"type": "string", "description": "Optional absolute target directory. Must be ~/Downloads or inside attachment_path_allowlist (policy.yaml)."}
 			},
 			"required": ["message_id", "attachment_id"],
 			"additionalProperties": false
@@ -72,7 +76,11 @@ func mailSaveAttachment(deps Deps) mcp.Tool {
 			} else {
 				fname = sanitize.Filename(fname)
 			}
-			body := "save attachment from " + subj + " as " + fname + " to ~/Downloads"
+			dest := "~/Downloads"
+			if in.Directory != "" {
+				dest = in.Directory
+			}
+			body := "save attachment from " + subj + " as " + fname + " to " + dest
 			title := mcp.SanitizePromptText("Approve mail_save_attachment?", 120)
 			return title, mcp.SanitizePromptText(body, 4000)
 		},
@@ -112,12 +120,28 @@ func mailSaveAttachment(deps Deps) mcp.Tool {
 			}
 
 			// 3. Resolve target directory + verify containment.
+			// Default stays ~/Downloads; an explicit directory must
+			// pass the same symlink-resolved allowlist containment
+			// the path-attachment read side uses.
 			home, err := os.UserHomeDir()
 			if err != nil {
 				return mcp.ErrorResult("mail_save_attachment: home dir: %v", err), nil
 			}
 			rootDir := filepath.Clean(filepath.Join(home, "Downloads"))
-			if err := os.MkdirAll(rootDir, 0o700); err != nil {
+			if in.Directory != "" {
+				resolved, aerr := resolveAllowlisted(deps, in.Directory)
+				if aerr != nil {
+					return mcp.ErrorResult(
+						"mail_save_attachment: directory %q: %v (must be ~/Downloads or inside attachment_path_allowlist)",
+						in.Directory, aerr,
+					), nil
+				}
+				st, serr := os.Stat(resolved)
+				if serr != nil || !st.IsDir() {
+					return mcp.ErrorResult("mail_save_attachment: directory %q is not an existing directory", in.Directory), nil
+				}
+				rootDir = resolved
+			} else if err := os.MkdirAll(rootDir, 0o700); err != nil {
 				return mcp.ErrorResult("mail_save_attachment: mkdir ~/Downloads: %v", err), nil
 			}
 			cleanedDest := filepath.Clean(filepath.Join(rootDir, fname))
@@ -127,7 +151,7 @@ func mailSaveAttachment(deps Deps) mcp.Tool {
 			// substituted slashes already; this is belt + suspenders.)
 			if filepath.Dir(cleanedDest) != rootDir {
 				return mcp.ErrorResult(
-					"mail_save_attachment: refusing path outside ~/Downloads (resolved to %q)",
+					"mail_save_attachment: refusing path outside the target directory (resolved to %q)",
 					cleanedDest,
 				), nil
 			}

@@ -9,14 +9,16 @@ import (
 
 // SearchHit is one row in a search result.
 type SearchHit struct {
-	MessageID   string
-	ThreadID    string
-	Subject     string
-	FromAddress string
-	FromName    string
-	Date        time.Time
-	Folder      string
-	Snippet     string // up to ~200 chars from body_text
+	MessageID      string
+	ThreadID       string
+	Subject        string
+	FromAddress    string
+	FromName       string
+	Date           time.Time
+	Folder         string
+	Snippet        string // up to ~200 chars from body_text
+	Unread         bool
+	HasAttachments bool
 }
 
 // SearchOpts narrows the search and pages results.
@@ -102,6 +104,16 @@ func (s *Store) Search(ctx context.Context, query string, opts SearchOpts) ([]Se
 	if parsed.hasAttachment {
 		conds = append(conds, "messages.has_attachments = 1")
 	}
+	if parsed.label != "" {
+		// label: accepts a label_id or a case-insensitive label
+		// name; the subquery matches either against the labels
+		// mirror. An unknown value simply matches zero rows.
+		conds = append(conds, `messages.id IN (
+			SELECT message_id FROM message_labels
+			 WHERE label_id = ?
+			    OR label_id IN (SELECT id FROM labels WHERE LOWER(name) = LOWER(?)))`)
+		args = append(args, parsed.label, parsed.label)
+	}
 	if !parsed.before.IsZero() {
 		conds = append(conds, "messages.date < ?")
 		args = append(args, parsed.before.Unix())
@@ -155,7 +167,8 @@ func (s *Store) Search(ctx context.Context, query string, opts SearchOpts) ([]Se
 	// orderBy is one of two hard-coded literals (the FTS-rank or the
 	// plain date-DESC variants above), NOT user input.
 	q := fmt.Sprintf(`
-SELECT id, thread_id, subject, from_address, from_name, date, folder, body_text
+SELECT id, thread_id, subject, from_address, from_name, date, folder, body_text,
+       unread, has_attachments
   FROM messages
  WHERE %s
  ORDER BY %s
@@ -175,11 +188,16 @@ SELECT id, thread_id, subject, from_address, from_name, date, folder, body_text
 			h        SearchHit
 			dateUnix int64
 			bodyText *string
+			unread   int
+			hasAtt   int
 		)
 		if err := rows.Scan(&h.MessageID, &h.ThreadID, &h.Subject,
-			&h.FromAddress, &h.FromName, &dateUnix, &h.Folder, &bodyText); err != nil {
+			&h.FromAddress, &h.FromName, &dateUnix, &h.Folder, &bodyText,
+			&unread, &hasAtt); err != nil {
 			return nil, fmt.Errorf("search scan: %w", err)
 		}
+		h.Unread = unread != 0
+		h.HasAttachments = hasAtt != 0
 		h.Date = time.Unix(dateUnix, 0).UTC()
 		if bodyText != nil {
 			h.Snippet = snippet(*bodyText, 200)
@@ -187,6 +205,29 @@ SELECT id, thread_id, subject, from_address, from_name, date, folder, body_text
 		hits = append(hits, h)
 	}
 	return hits, rows.Err()
+}
+
+// Counts returns total and unread message counts for an optional
+// folder / label scope. One cheap aggregate instead of paging
+// envelope lists 200 at a time to answer "how many unread?".
+func (s *Store) Counts(ctx context.Context, filter ListFilter) (total, unread int64, err error) {
+	conds := []string{"1=1"}
+	var args []any
+	if filter.Folder != "" {
+		conds = append(conds, "folder = ?")
+		args = append(args, filter.Folder)
+	}
+	if filter.LabelID != "" {
+		conds = append(conds,
+			"id IN (SELECT message_id FROM message_labels WHERE label_id = ?)")
+		args = append(args, filter.LabelID)
+	}
+	q := "SELECT COUNT(*), COALESCE(SUM(unread), 0) FROM messages WHERE " +
+		strings.Join(conds, " AND ")
+	if err := s.DB.QueryRowContext(ctx, q, args...).Scan(&total, &unread); err != nil {
+		return 0, 0, fmt.Errorf("counts: %w", err)
+	}
+	return total, unread, nil
 }
 
 // snippet returns up to maxRunes runes of input, collapsing whitespace

@@ -31,7 +31,18 @@ let plistPath = "\(home)/Library/LaunchAgents/\(daemonLabel).plist"
 let daemonLogPath = "\(home)/Library/Logs/protonmcp/daemon.log"
 let appSupport = "\(home)/Library/Application Support/protonmcp"
 let auditLogPath = "\(appSupport)/audit.log"
+let policyPath = "\(appSupport)/policy.yaml"
 let inUseWindow: TimeInterval = 5.0
+// idle_lock_minutes value restored when Keep Alive is switched OFF.
+let defaultIdleLockMinutes = 15
+
+// protonmcpCLI is the CLI binary installed next to this helper
+// (make/brew put every product in the same bin dir) — used for
+// `policy reload` after a Keep Alive toggle.
+let protonmcpCLI: String = {
+    let dir = (Bundle.main.executablePath! as NSString).deletingLastPathComponent
+    return dir + "/protonmcp"
+}()
 
 // runCmd executes a binary with args and returns (exit code, stdout).
 // Absolute paths only; nothing here interpolates user input into a shell.
@@ -233,6 +244,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         menu.addItem(.separator())
 
+        let keepAlive = NSMenuItem(title: "Keep Alive — no idle timeout",
+                                   action: #selector(toggleKeepAlive), keyEquivalent: "")
+        keepAlive.target = self
+        keepAlive.state = keepAliveEnabled() ? .on : .off
+        keepAlive.toolTip = "On: the session never locks from inactivity. " +
+            "Off: auto-lock after \(defaultIdleLockMinutes) min idle. " +
+            "Screen lock and sleep always lock the session either way."
+        menu.addItem(keepAlive)
+        menu.addItem(.separator())
+
         let audit = NSMenuItem(title: "Open Audit Log",
                                action: #selector(openAudit), keyEquivalent: "")
         audit.target = self
@@ -241,6 +262,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let quit = NSMenuItem(title: "Quit Indicator (daemon unaffected)",
                               action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quit)
+    }
+
+    // MARK: - Keep Alive (idle-timeout toggle)
+
+    // keepAliveEnabled reads policy.yaml: idle_lock_minutes 0 (or
+    // absent) means the idle timer is off → session never idle-locks.
+    // Screen-lock / sleep locking is separate (lockwatch) and is
+    // deliberately NOT touched by this toggle.
+    private func keepAliveEnabled() -> Bool {
+        guard let text = try? String(contentsOfFile: policyPath, encoding: .utf8) else {
+            return true // no policy file → daemon default is 0/disabled
+        }
+        for line in text.split(separator: "\n") {
+            let t = line.trimmingCharacters(in: .whitespaces)
+            if t.hasPrefix("idle_lock_minutes:") {
+                let v = t.dropFirst("idle_lock_minutes:".count)
+                    .trimmingCharacters(in: .whitespaces)
+                return Int(v) == 0
+            }
+        }
+        return true // key absent → 0/disabled
+    }
+
+    private func setIdleLockMinutes(_ minutes: Int) {
+        var lines: [String]
+        if let text = try? String(contentsOfFile: policyPath, encoding: .utf8) {
+            lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        } else {
+            lines = []
+        }
+        var replaced = false
+        for i in lines.indices {
+            if lines[i].trimmingCharacters(in: .whitespaces).hasPrefix("idle_lock_minutes:") {
+                lines[i] = "idle_lock_minutes: \(minutes)"
+                replaced = true
+                break
+            }
+        }
+        if !replaced {
+            lines.append("idle_lock_minutes: \(minutes)")
+        }
+        let out = lines.joined(separator: "\n")
+        try? out.write(toFile: policyPath, atomically: true, encoding: .utf8)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: policyPath)
+        // Hot-reload: the daemon re-reads policy.yaml on SIGHUP via
+        // `protonmcp policy reload` (finds protonmcpd since PROTO
+        // fork fix). Failure is non-fatal — next daemon restart
+        // picks the file up anyway.
+        runCmd(protonmcpCLI, ["policy", "reload"])
+    }
+
+    @objc private func toggleKeepAlive() {
+        setIdleLockMinutes(keepAliveEnabled() ? defaultIdleLockMinutes : 0)
+        refresh()
     }
 
     // MARK: - Actions

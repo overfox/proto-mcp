@@ -12,7 +12,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
+	"strings"
+	"syscall"
 
 	gpa "github.com/ProtonMail/go-proton-api"
 
@@ -96,11 +100,59 @@ func AcquireResumeOnly(ctx context.Context) (*Bundle, error) {
 		if errors.Is(err, keystore.ErrNotFound) {
 			return nil, loginRequired(noStoredSessionMsg)
 		}
+		// A transport failure says nothing about the stored session:
+		// resuming behind a captive portal, a downed link, or a
+		// network that blocks Proton used to come back as
+		// ErrLoginRequired, which made protonmcpd exit "cleanly" and
+		// stay dead until a human ran `daemon start`. Classify it
+		// separately so callers can wait the outage out instead.
+		if isNetworkError(err) {
+			return nil, fmt.Errorf("%w: %v", ErrNetworkUnavailable, err)
+		}
 		return nil, loginRequired(
 			"stored session unusable (%v) — run `protonmcp logout && protonmcp login` "+
 				"from a terminal to refresh credentials", err)
 	}
 	return bundle, nil
+}
+
+// ErrNetworkUnavailable marks a resume failure caused by the network
+// path to Proton, not by the stored credentials. Callers should
+// retry later rather than demand a re-login.
+var ErrNetworkUnavailable = errors.New("proton API unreachable")
+
+// isNetworkError reports whether err is transport-shaped: timeouts,
+// dial/TLS failures, unreachable hosts. Auth rejections (401/422
+// API errors) deliberately do NOT match — those really do need
+// `protonmcp login`.
+func isNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) {
+		return true
+	}
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return true
+	}
+	for _, errno := range []syscall.Errno{
+		syscall.ECONNREFUSED, syscall.ECONNRESET,
+		syscall.EHOSTUNREACH, syscall.ENETUNREACH, syscall.ETIMEDOUT,
+	} {
+		if errors.Is(err, errno) {
+			return true
+		}
+	}
+	// go-proton-api wraps transport failures in prose; fall back to
+	// its known phrasings when the typed chain was dropped.
+	s := err.Error()
+	return strings.Contains(s, "no response from API") ||
+		strings.Contains(s, "TLS handshake timeout")
 }
 
 // TryResume opens an existing Keychain entry, rebuilds the jar +

@@ -27,7 +27,7 @@ func mailSearch(deps Deps) mcp.Tool {
 	return mcp.Tool{
 		Name: "mail_search",
 		Description: "Full-text + structured search over the local mirror. Query DSL: " +
-			"from:alice  to:bob  subject:\"gear list\"  in:inbox  " +
+			"from:alice  to:bob  subject:\"gear list\"  in:inbox  label:<name-or-id>  " +
 			"before:2026-01-01  after:2025-12-01  has:attachment  " +
 			"plus bare full-text terms (subject + body + sender). " +
 			"All criteria are AND-joined. Date range can also be supplied as " +
@@ -56,7 +56,7 @@ func mailSearch(deps Deps) mcp.Tool {
 				return nil, mcp.NewError(mcp.CodeInvalidParams, "mail_search: query is required")
 			}
 
-			opts := store.SearchOpts{Limit: in.Limit}
+			opts := store.SearchOpts{Limit: normalizeListLimit(in.Limit)}
 			if in.Since != "" {
 				t, err := parseListDate(in.Since)
 				if err != nil {

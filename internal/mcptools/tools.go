@@ -61,6 +61,7 @@ func All(deps Deps) []mcp.Tool {
 		accountWhoami(deps),
 		mailList(deps),
 		mailSearch(deps),
+		mailCounts(deps),
 		mailRead(deps),
 		mailReadThread(deps),
 		mailListAttachments(deps),

@@ -175,36 +175,9 @@ func decodeAndValidateAttachments(deps Deps, atts []sendAttachmentInput) ([]deco
 //     backstop, and the size cap is enforced from Stat before the
 //     read so a huge file can't balloon memory first.
 func readAllowlistedAttachment(deps Deps, p string, cap int64) ([]byte, error) {
-	var allow []string
-	if deps.Policy != nil {
-		allow = deps.Policy.AttachmentPathAllowlist()
-	}
-	if len(allow) == 0 {
-		return nil, fmt.Errorf("path %q refused: attachment_path_allowlist is empty. "+
-			"Add allowed directories in ~/Library/Application Support/protonmcp/policy.yaml, "+
-			"or pass content_b64 instead", p)
-	}
-	if !filepath.IsAbs(p) {
-		return nil, fmt.Errorf("path %q must be absolute", p)
-	}
-	resolved, err := filepath.EvalSymlinks(p)
+	resolved, err := resolveAllowlisted(deps, p)
 	if err != nil {
-		return nil, fmt.Errorf("resolve path %q: %w", p, err)
-	}
-	contained := false
-	for _, dir := range allow {
-		rdir, err := filepath.EvalSymlinks(dir)
-		if err != nil {
-			continue // allowlisted dir unresolvable → can't grant from it
-		}
-		rel, err := filepath.Rel(rdir, resolved)
-		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			contained = true
-			break
-		}
-	}
-	if !contained {
-		return nil, fmt.Errorf("path %q is outside attachment_path_allowlist", p)
+		return nil, err
 	}
 	f, err := os.OpenFile(resolved, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
@@ -226,6 +199,42 @@ func readAllowlistedAttachment(deps Deps, p string, cap int64) ([]byte, error) {
 		)
 	}
 	return io.ReadAll(f)
+}
+
+// resolveAllowlisted enforces the attachment_path_allowlist policy
+// on an absolute path: symlink-resolves it FIRST (a symlink planted
+// inside an allowlisted dir can't point outside it), then checks
+// containment against each symlink-resolved allowlist dir via
+// filepath.Rel (string-prefix tricks like /allowed-evil don't pass).
+// Returns the resolved path on success. Shared by path-based
+// attachment reads and mail_save_attachment's directory override.
+func resolveAllowlisted(deps Deps, p string) (string, error) {
+	var allow []string
+	if deps.Policy != nil {
+		allow = deps.Policy.AttachmentPathAllowlist()
+	}
+	if len(allow) == 0 {
+		return "", fmt.Errorf("path %q refused: attachment_path_allowlist is empty. "+
+			"Add allowed directories in ~/Library/Application Support/protonmcp/policy.yaml", p)
+	}
+	if !filepath.IsAbs(p) {
+		return "", fmt.Errorf("path %q must be absolute", p)
+	}
+	resolved, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		return "", fmt.Errorf("resolve path %q: %w", p, err)
+	}
+	for _, dir := range allow {
+		rdir, err := filepath.EvalSymlinks(dir)
+		if err != nil {
+			continue // allowlisted dir unresolvable → can't grant from it
+		}
+		rel, err := filepath.Rel(rdir, resolved)
+		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return resolved, nil
+		}
+	}
+	return "", fmt.Errorf("path %q is outside attachment_path_allowlist", p)
 }
 
 // uploadAttachmentsAndCollectKeys uploads every decoded attachment

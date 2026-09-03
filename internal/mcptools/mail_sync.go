@@ -23,11 +23,14 @@ func mailSync(deps Deps) mcp.Tool {
 		LabelsDeleted    int    `json:"labels_deleted"`
 		Pages            int    `json:"pages"`
 		ElapsedMS        int64  `json:"elapsed_ms"`
+		EventsUpserted   int    `json:"events_upserted"`
+		EventsDeleted    int    `json:"events_deleted"`
+		CalendarWarning  string `json:"calendar_warning,omitempty"`
 	}
 
 	return mcp.Tool{
 		Name: "mail_sync",
-		Description: "Pull recent changes from Proton into the local mirror. " +
+		Description: "Pull recent changes from Proton into the local mirror — mail AND calendar. " +
 			"Call this BEFORE mail_list or mail_search when the user's question implies " +
 			"they're looking for recent activity: \"just got\", \"today\", \"this morning\", " +
 			"\"latest from X\", anything time-anchored to now. " +
@@ -50,7 +53,10 @@ func mailSync(deps Deps) mcp.Tool {
 				"labels_upserted":   {"type": "integer"},
 				"labels_deleted":    {"type": "integer"},
 				"pages":             {"type": "integer"},
-				"elapsed_ms":        {"type": "integer"}
+				"elapsed_ms":        {"type": "integer"},
+				"events_upserted":   {"type": "integer"},
+				"events_deleted":    {"type": "integer"},
+				"calendar_warning":  {"type": "string"}
 			}
 		}`),
 		Handler: func(ctx mcp.Context, _ json.RawMessage) (*mcp.ToolResult, error) {
@@ -67,7 +73,7 @@ func mailSync(deps Deps) mcp.Tool {
 				}
 				return mcp.ErrorResult("mail_sync failed: %v", err), nil
 			}
-			return mcp.StructuredResult(result{
+			out := result{
 				StartCursor:      res.StartCursor,
 				EndCursor:        res.EndCursor,
 				MessagesUpserted: res.MessagesUpserted,
@@ -76,7 +82,19 @@ func mailSync(deps Deps) mcp.Tool {
 				LabelsDeleted:    res.LabelsDeleted,
 				Pages:            res.Pages,
 				ElapsedMS:        res.Elapsed.Milliseconds(),
-			})
+			}
+			// Calendar rides along (same pattern as the background
+			// tick): previously there was NO in-band way to freshen
+			// events — a just-received invite stayed invisible until
+			// the next 2-minute poll. Calendar failure must not fail
+			// the mail sync; it degrades to a warning.
+			if calRes, calErr := syncpkg.RunCalendarOnce(ctx.Std, deps.Session, deps.Store); calErr != nil {
+				out.CalendarWarning = "calendar sync failed: " + calErr.Error()
+			} else if calRes != nil {
+				out.EventsUpserted = calRes.EventsUpserted
+				out.EventsDeleted = calRes.EventsDeleted
+			}
+			return mcp.StructuredResult(out)
 		},
 	}
 }

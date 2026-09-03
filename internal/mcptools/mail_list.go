@@ -83,7 +83,7 @@ func mailList(deps Deps) mcp.Tool {
 				folder = ""
 			}
 			opts := store.SearchOpts{
-				Limit: in.Limit,
+				Limit: normalizeListLimit(in.Limit),
 				Filter: store.ListFilter{
 					Folder:     folder,
 					LabelID:    in.LabelID,
@@ -154,15 +154,33 @@ func parseListDate(s string) (time.Time, error) {
 
 func hitToSummary(h store.SearchHit) messageSummary {
 	return messageSummary{
-		MessageID:   h.MessageID,
-		ThreadID:    h.ThreadID,
-		Subject:     h.Subject,
-		FromAddress: h.FromAddress,
-		FromName:    h.FromName,
-		Date:        h.Date,
-		Folder:      h.Folder,
-		Snippet:     h.Snippet,
+		MessageID:      h.MessageID,
+		ThreadID:       h.ThreadID,
+		Subject:        h.Subject,
+		FromAddress:    h.FromAddress,
+		FromName:       h.FromName,
+		Date:           h.Date,
+		Folder:         h.Folder,
+		Snippet:        h.Snippet,
+		Unread:         h.Unread,
+		HasAttachments: h.HasAttachments,
 	}
+}
+
+// normalizeListLimit mirrors the store's clamp (0 → 50, max 200) at
+// the handler layer. The handlers must know the EFFECTIVE limit to
+// decide whether to emit next_cursor: with in.Limit left at 0 the
+// store still returned 50 rows, but the `opts.Limit > 0` cursor guard
+// never fired — so every default-limit call silently looked like the
+// final page.
+func normalizeListLimit(n int) int {
+	if n <= 0 {
+		return 50
+	}
+	if n > 200 {
+		return 200
+	}
+	return n
 }
 
 const messageListSchema = `{

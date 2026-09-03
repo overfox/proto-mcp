@@ -174,13 +174,28 @@ func mailDraftUpdate(deps Deps) mcp.Tool {
 			cc := pickAddrList(in.CC, current.CCList)
 			bcc := pickAddrList(in.BCC, current.BCCList)
 			// body_text / body_html / nothing — if nothing supplied,
-			// keep the existing body via empty pass to buildDraftTemplate
-			// (which treats both empty as plain text "" — wrong).
-			// Instead, default to text version of current body so the
-			// SDK keeps the same content.
+			// keep the existing body. current.Body is armored PGP
+			// ciphertext at this point (CreateDraft encrypts to the
+			// sender), so it must be DECRYPTED first — the old
+			// sanitize.Text(current.Body) path silently replaced the
+			// body with PGP armor on any metadata-only update.
+			// Decrypt via the PROTO-125 helper and preserve the
+			// original MIME type.
+			_, addrKR, err := senderKeyring(deps)
+			if err != nil {
+				return mcp.ErrorResult("mail_draft_update: %v", err), nil
+			}
 			text, html := in.BodyText, in.BodyHTML
 			if text == "" && html == "" {
-				text = sanitize.Text(current.Body)
+				plain, derr := decryptDraftBody(addrKR, current.Body)
+				if derr != nil {
+					return mcp.ErrorResult("mail_draft_update: decrypt current body: %v", derr), nil
+				}
+				if string(current.MIMEType) == "text/html" {
+					html = plain
+				} else {
+					text = plain
+				}
 			}
 
 			toStrs := toEmailStrings(to)
@@ -196,10 +211,6 @@ func mailDraftUpdate(deps Deps) mcp.Tool {
 				return mcp.ErrorResult("mail_draft_update: %v", err), nil
 			}
 
-			_, addrKR, err := senderKeyring(deps)
-			if err != nil {
-				return mcp.ErrorResult("mail_draft_update: %v", err), nil
-			}
 			msg, err := deps.Session.Client.UpdateDraft(ctx.Std, in.DraftID, addrKR, gpa.UpdateDraftReq{
 				Message: tpl,
 			})
@@ -300,7 +311,7 @@ func mailDraftList(deps Deps) mcp.Tool {
 				}
 			}
 			opts := store.SearchOpts{
-				Limit:  in.Limit,
+				Limit:  normalizeListLimit(in.Limit),
 				Filter: store.ListFilter{Folder: "drafts"},
 			}
 			qhash := filterHash(opts.Filter)

@@ -18,6 +18,7 @@ type parsedQuery struct {
 	likes map[string]string
 
 	folder        string
+	label         string // label: value — label_id OR label name, resolved in Search
 	hasAttachment bool
 	before        time.Time
 	after         time.Time
@@ -57,6 +58,12 @@ func parseQuery(input string) parsedQuery {
 			default:
 				p.folder = lower
 			}
+		case "label":
+			// Accept either a label_id (exact) or a label NAME
+			// (case-insensitive, resolved against the labels
+			// mirror). Users think in names; the model often only
+			// has ids — support both in one prefix.
+			p.label = val
 		case "has":
 			if strings.EqualFold(val, "attachment") || strings.EqualFold(val, "attachments") {
 				p.hasAttachment = true

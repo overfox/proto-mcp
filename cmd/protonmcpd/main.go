@@ -181,9 +181,36 @@ func run() error {
 	rt, err := serve.Setup(ctx, serve.SetupConfig{
 		DBPath: *dbPath,
 		AcquireSession: func(ctx context.Context) (serve.SessionBundle, error) {
-			acquireCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-			defer cancel()
-			return session.AcquireResumeOnly(acquireCtx)
+			// A network outage used to surface as ErrLoginRequired →
+			// clean exit → daemon dead until a human ran `daemon
+			// start` (observed when a network blocked Proton
+			// outright). The Touch ID gate has already fired by the
+			// time this runs, so waiting the outage out here causes
+			// no prompt storms: retry with capped backoff until the
+			// network returns, a genuine auth failure appears, or
+			// the daemon is stopped.
+			delay := 15 * time.Second
+			for {
+				acquireCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+				b, err := session.AcquireResumeOnly(acquireCtx)
+				cancel()
+				if err == nil {
+					return b, nil
+				}
+				if !errors.Is(err, session.ErrNetworkUnavailable) {
+					return nil, err
+				}
+				slog.Warn("proton unreachable; will retry session resume",
+					"err", err.Error(), "retry_in", delay.String())
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(delay):
+				}
+				if delay *= 2; delay > 5*time.Minute {
+					delay = 5 * time.Minute
+				}
+			}
 		},
 		SweepBodiesAtStartup: serve.SweepStaleBodies,
 	})
