@@ -351,10 +351,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func switchOn() {
-        runCmd("/bin/launchctl", ["enable", "gui/\(getuid())/\(daemonLabel)"])
-        runCmd("/bin/launchctl", ["bootstrap", "gui/\(getuid())", plistPath])
-        runCmd("/bin/launchctl", ["kickstart", "gui/\(getuid())/\(daemonLabel)"])
-        refresh()
+        // D39-class race: launchd refuses a bootstrap for a short
+        // window after the same label was booted out. The old
+        // single-shot version swallowed that failure via runCmd,
+        // leaving the job enabled but UNLOADED — the kill switch
+        // looked toggled back on while the daemon stayed dead.
+        // Retry with growing delays, off the main thread so the
+        // menu doesn't beachball.
+        DispatchQueue.global(qos: .userInitiated).async {
+            runCmd("/bin/launchctl", ["enable", "gui/\(getuid())/\(daemonLabel)"])
+            for attempt in 1...5 {
+                let (code, _) = runCmd("/bin/launchctl", ["bootstrap", "gui/\(getuid())", plistPath])
+                // Success, or already bootstrapped (a previous attempt
+                // landed): verify via print rather than trusting the
+                // exit code alone.
+                let (pcode, _) = runCmd("/bin/launchctl", ["print", "gui/\(getuid())/\(daemonLabel)"])
+                if code == 0 || pcode == 0 { break }
+                Thread.sleep(forTimeInterval: Double(attempt))
+            }
+            runCmd("/bin/launchctl", ["kickstart", "gui/\(getuid())/\(daemonLabel)"])
+            DispatchQueue.main.async { self.refresh() }
+        }
     }
 
     @objc private func lockNow() {
