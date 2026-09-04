@@ -63,6 +63,7 @@ func runCmd(_ path: String, _ args: [String]) -> (Int32, String) {
 enum DaemonState {
     case killSwitched   // 🔴 disabled by the user
     case notRunning     // ⚪ enabled but no process
+    case connecting     // 🟠 process up, session not established (offline / startup)
     case locked         // 🟡 running, session locked
     case inUse          // 🔵 running, unlocked, recent tool call
     case connected      // 🟢 running, unlocked, idle
@@ -71,6 +72,7 @@ enum DaemonState {
         switch self {
         case .killSwitched: return "🔴"
         case .notRunning:   return "⚪"
+        case .connecting:   return "🟠"
         case .locked:       return "🟡"
         case .inUse:        return "🔵"
         case .connected:    return "🟢"
@@ -81,6 +83,7 @@ enum DaemonState {
         switch self {
         case .killSwitched: return "SWITCHED OFF — Claude access blocked"
         case .notRunning:   return "Disconnected (daemon not running)"
+        case .connecting:   return "Connecting — waiting for Proton (network unreachable or starting up)"
         case .locked:       return "Connected — locked (Touch ID to unlock)"
         case .inUse:        return "Connected — IN USE"
         case .connected:    return "Connected — logged in"
@@ -125,19 +128,30 @@ final class StatusPoller {
         return String(data: data, encoding: .utf8) ?? ""
     }
 
-    private func isLocked() -> Bool {
-        // The daemon logs every lock/unlock transition; the most recent
-        // marker wins. "protonmcpd ready" implies an unlocked session
-        // (startup gate approved + keys acquired).
+    // scanDaemonLog derives (locked, serving) from the daemon log's
+    // transition markers; the most recent marker of each kind wins.
+    // "protonmcpd ready" implies an unlocked, serving session (startup
+    // gate approved + keys acquired + socket open). "will retry
+    // session resume" means the process is alive but has no session —
+    // typically Proton unreachable — so the socket is not serving yet
+    // and the icon must NOT read green.
+    private func scanDaemonLog() -> (locked: Bool, serving: Bool) {
         let tail = tailFile(daemonLogPath)
         var locked = false
+        var serving = false
         for line in tail.split(separator: "\n") {
             if line.contains("msg=\"daemon locked\"") { locked = true }
-            if line.contains("msg=\"daemon unlocked\"") || line.contains("msg=\"protonmcpd ready\"") {
+            if line.contains("msg=\"daemon unlocked\"") { locked = false }
+            if line.contains("msg=\"protonmcpd ready\"") {
                 locked = false
+                serving = true
+            }
+            if line.contains("will retry session resume") ||
+                line.contains("msg=\"daemon drained gracefully\"") {
+                serving = false
             }
         }
-        return locked
+        return (locked, serving)
     }
 
     private func checkActivity() {
@@ -163,9 +177,16 @@ final class StatusPoller {
         checkActivity()
         if isDisabled() {
             state = .killSwitched
-        } else if daemonPID() == nil {
+            return
+        }
+        if daemonPID() == nil {
             state = .notRunning
-        } else if isLocked() {
+            return
+        }
+        let log = scanDaemonLog()
+        if !log.serving {
+            state = .connecting
+        } else if log.locked {
             state = .locked
         } else if Date() < activeUntil {
             state = .inUse
@@ -235,7 +256,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                         action: #selector(unlockNow), keyEquivalent: "")
                 unlock.target = self
                 menu.addItem(unlock)
-            } else if poller.state != .notRunning {
+            } else if poller.state == .connected || poller.state == .inUse {
+                // Lock Now only makes sense with a live session —
+                // .connecting has no keys to zero yet.
                 let lock = NSMenuItem(title: "Lock Now",
                                       action: #selector(lockNow), keyEquivalent: "")
                 lock.target = self
