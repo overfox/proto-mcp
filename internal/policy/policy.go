@@ -117,6 +117,26 @@ type document struct {
 	// Entries must be absolute; symlinks are resolved before the
 	// containment check at use-site.
 	AttachmentPathAllowlist []string `yaml:"attachment_path_allowlist,omitempty"`
+	// KeepAlive: when true, the read-only attachment-access tools in
+	// keepAliveSuppressibleTools skip their Touch ID prompt for the
+	// session. Defaults false (missing → secure: those tools prompt).
+	// Driven by the menu bar "Keep Alive" toggle. The suppressible
+	// set is HARDCODED (see keepAliveSuppressibleTools) so no config
+	// or injected policy file can widen keep-alive suppression to
+	// mutating tools (send / move / label / trash / delete) — the
+	// same defense-in-depth stance as the send floor.
+	KeepAlive bool `yaml:"keep_alive,omitempty"`
+}
+
+// keepAliveSuppressibleTools is the ONLY set of tools whose Touch ID
+// prompt KeepAlive removes. Deliberately limited to read-only
+// attachment access — fetching an attachment to read it is what
+// prompts most often during ordinary reading. Every mailbox-mutating
+// tool is absent, so KeepAlive can never un-gate a send, move, label,
+// trash, or delete no matter what the config says.
+var keepAliveSuppressibleTools = map[string]bool{
+	"mail_download_attachment": true,
+	"mail_save_attachment":     true,
 }
 
 // DefaultMaxAttachmentBytes is the per-attachment cap when the
@@ -176,6 +196,14 @@ func (e *Engine) Decide(tool string, _ []byte, _ Caller) (Decision, *ToolPolicy)
 	defer e.mu.RUnlock()
 
 	if p, ok := e.doc.Tools[tool]; ok {
+		// KeepAlive downgrades ONLY the hardcoded read-only
+		// attachment-access tools from prompt → allow, and only when
+		// they were actually going to prompt (a config that denies
+		// one stays denied). Mutating tools are never in the set.
+		if e.doc.KeepAlive && keepAliveSuppressibleTools[tool] && p.Decision == DecisionPrompt {
+			p.Decision = DecisionAllow
+			return DecisionAllow, &p
+		}
 		return p.Decision, &p
 	}
 	d := e.doc.Defaults
@@ -270,6 +298,12 @@ func (e *Engine) applyOverrideInto(into *document) error {
 	}
 	if len(override.AttachmentPathAllowlist) > 0 {
 		into.AttachmentPathAllowlist = override.AttachmentPathAllowlist
+	}
+	// keep_alive defaults false in the embedded config, so the only
+	// way it turns on is the override setting it true; `keep_alive:
+	// false` and an absent key both correctly leave it off.
+	if override.KeepAlive {
+		into.KeepAlive = true
 	}
 	return nil
 }

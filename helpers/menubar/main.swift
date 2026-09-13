@@ -267,13 +267,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         menu.addItem(.separator())
 
-        let keepAlive = NSMenuItem(title: "Keep Alive — no idle timeout",
+        let keepAlive = NSMenuItem(title: "Keep Alive — no idle lock, no attachment prompts",
                                    action: #selector(toggleKeepAlive), keyEquivalent: "")
         keepAlive.target = self
         keepAlive.state = keepAliveEnabled() ? .on : .off
-        keepAlive.toolTip = "On: the session never locks from inactivity. " +
-            "Off: auto-lock after \(defaultIdleLockMinutes) min idle. " +
-            "Screen lock and sleep always lock the session either way."
+        keepAlive.toolTip = "On: session never idle-locks, AND attachment " +
+            "download/save stop asking for Touch ID. " +
+            "Off: auto-lock after \(defaultIdleLockMinutes) min idle; attachments prompt. " +
+            "Sending, moving, labeling, trashing and deleting ALWAYS need Touch ID either way, " +
+            "and screen lock / sleep always lock the session."
         menu.addItem(keepAlive)
         menu.addItem(.separator())
 
@@ -289,26 +291,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - Keep Alive (idle-timeout toggle)
 
-    // keepAliveEnabled reads policy.yaml: idle_lock_minutes 0 (or
-    // absent) means the idle timer is off → session never idle-locks.
-    // Screen-lock / sleep locking is separate (lockwatch) and is
-    // deliberately NOT touched by this toggle.
+    // keepAliveEnabled reads the keep_alive flag from policy.yaml.
+    // Absent / false → OFF (the secure default: attachments prompt
+    // and the idle timer runs). The toggle keeps keep_alive and
+    // idle_lock_minutes in lockstep, so keep_alive alone is the
+    // authoritative UI state.
     private func keepAliveEnabled() -> Bool {
         guard let text = try? String(contentsOfFile: policyPath, encoding: .utf8) else {
-            return true // no policy file → daemon default is 0/disabled
+            return false
         }
         for line in text.split(separator: "\n") {
             let t = line.trimmingCharacters(in: .whitespaces)
-            if t.hasPrefix("idle_lock_minutes:") {
-                let v = t.dropFirst("idle_lock_minutes:".count)
-                    .trimmingCharacters(in: .whitespaces)
-                return Int(v) == 0
+            if t.hasPrefix("keep_alive:") {
+                let v = t.dropFirst("keep_alive:".count).trimmingCharacters(in: .whitespaces)
+                return v == "true"
             }
         }
-        return true // key absent → 0/disabled
+        return false
     }
 
-    private func setIdleLockMinutes(_ minutes: Int) {
+    // setScalarKey upserts a single `key: value` line in policy.yaml,
+    // preserving every other line (idle_lock_minutes, the attachment
+    // allowlist, etc.). Nested blocks like `tools:` are never touched.
+    private func setScalarKey(_ key: String, _ value: String) {
         var lines: [String]
         if let text = try? String(contentsOfFile: policyPath, encoding: .utf8) {
             lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
@@ -317,27 +322,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         var replaced = false
         for i in lines.indices {
-            if lines[i].trimmingCharacters(in: .whitespaces).hasPrefix("idle_lock_minutes:") {
-                lines[i] = "idle_lock_minutes: \(minutes)"
+            if lines[i].trimmingCharacters(in: .whitespaces).hasPrefix("\(key):") {
+                lines[i] = "\(key): \(value)"
                 replaced = true
                 break
             }
         }
         if !replaced {
-            lines.append("idle_lock_minutes: \(minutes)")
+            lines.append("\(key): \(value)")
         }
         let out = lines.joined(separator: "\n")
         try? out.write(toFile: policyPath, atomically: true, encoding: .utf8)
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: policyPath)
-        // Hot-reload: the daemon re-reads policy.yaml on SIGHUP via
-        // `protonmcp policy reload` (finds protonmcpd since PROTO
-        // fork fix). Failure is non-fatal — next daemon restart
-        // picks the file up anyway.
-        runCmd(protonmcpCLI, ["policy", "reload"])
     }
 
     @objc private func toggleKeepAlive() {
-        setIdleLockMinutes(keepAliveEnabled() ? defaultIdleLockMinutes : 0)
+        let turningOn = !keepAliveEnabled()
+        // keep_alive drives attachment-prompt suppression; idle timer
+        // moves with it (0 = never idle-lock when on, 15 when off).
+        // Both written before a single hot reload so the daemon sees
+        // a consistent policy.
+        setScalarKey("keep_alive", turningOn ? "true" : "false")
+        setScalarKey("idle_lock_minutes", turningOn ? "0" : "\(defaultIdleLockMinutes)")
+        // Hot-reload: the daemon re-reads policy.yaml on SIGHUP via
+        // `protonmcp policy reload` (finds protonmcpd since the PROTO
+        // fork fix). Failure is non-fatal — a later daemon restart
+        // picks the file up anyway.
+        runCmd(protonmcpCLI, ["policy", "reload"])
         refresh()
     }
 
