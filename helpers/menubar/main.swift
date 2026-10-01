@@ -267,15 +267,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         menu.addItem(.separator())
 
-        let keepAlive = NSMenuItem(title: "Keep Alive — no idle lock, no attachment prompts",
+        let keepAlive = NSMenuItem(title: "Keep Alive — stay connected, no attachment prompts",
                                    action: #selector(toggleKeepAlive), keyEquivalent: "")
         keepAlive.target = self
         keepAlive.state = keepAliveEnabled() ? .on : .off
-        keepAlive.toolTip = "On: session never idle-locks, AND attachment " +
-            "download/save stop asking for Touch ID. " +
-            "Off: auto-lock after \(defaultIdleLockMinutes) min idle; attachments prompt. " +
-            "Sending, moving, labeling, trashing and deleting ALWAYS need Touch ID either way, " +
-            "and screen lock / sleep always lock the session."
+        keepAlive.toolTip = "On: Proton stays connected through screen lock, sleep and idle, " +
+            "and attachment download/save don't ask for Touch ID. " +
+            "Off: the session locks on screen lock, sleep, or \(defaultIdleLockMinutes) min idle. " +
+            "Sending, moving, labeling, trashing and deleting ALWAYS need Touch ID; " +
+            "Lock Now and Switch Off always work."
         menu.addItem(keepAlive)
         menu.addItem(.separator())
 

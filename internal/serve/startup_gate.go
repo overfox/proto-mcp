@@ -47,8 +47,8 @@ func promptStartupTouchID(ctx context.Context, helperPath string, logger *slog.L
 		Caller  string `json:"caller"`
 		Confirm bool   `json:"confirm"`
 	}{
-		Title:   "Approve protonmcp startup",
-		Body:    "Touch ID required to unlock the saved Proton session and start the MCP daemon.",
+		Title:   "Unlock Proton Mail for Claude",
+		Body:    "Touch ID required to unlock your saved Proton session so Claude can access Proton Mail.",
 		Caller:  "protonmcp daemon",
 		Confirm: false,
 	})

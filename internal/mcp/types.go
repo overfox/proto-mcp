@@ -129,6 +129,12 @@ type Tool struct {
 	// the generic "tool was requested with these (redacted) args"
 	// body.
 	PromptBody func(args json.RawMessage) (title, body string) `json:"-"`
+
+	// AllowWhenLocked lets the tool run while the daemon is locked.
+	// Only for tools whose job is to END the locked state (proton_connect)
+	// — they do their own Touch ID gating. Everything else must leave
+	// this false so a locked daemon refuses it.
+	AllowWhenLocked bool `json:"-"`
 }
 
 // Handler is the tool's actual implementation. params is the raw

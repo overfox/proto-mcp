@@ -141,12 +141,13 @@ func (m *Middleware) runTool(ctx context.Context, t Tool, args json.RawMessage, 
 	// logged (logger.Warn-rate-limited at the caller level if
 	// needed). For now we log every locked call at Warn — the
 	// daemon is presumed to lock infrequently.
-	if m.lockState != nil {
+	if m.lockState != nil && !t.AllowWhenLocked {
 		if locked, reason := m.lockState(); locked {
 			logger.Warn("tool call refused: daemon locked",
 				"tool", t.Name, "reason", reason,
 				"caller_pid", callerInfo.PID)
-			return ErrorResult("daemon is locked (%s); run `protonmcp unlock` to resume", reason), nil
+			return ErrorResult("Proton is locked (%s). Call the proton_connect tool to ask the user "+
+				"for Touch ID, then retry this call.", reason), nil
 		}
 	}
 

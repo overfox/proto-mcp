@@ -74,6 +74,10 @@ type Runtime struct {
 	// it, so a pending unlock can't freeze the daemon (PROTO-141).
 	unlockMu sync.Mutex
 
+	// connectFailedAt records the last declined proton_connect, guarded
+	// by mu. Drives connectCooldown.
+	connectFailedAt time.Time
+
 	// Phase 7/A — auto-lock infrastructure. idleTracker bumps on
 	// every tool call via the mcp.WithToolCallObserver hook.
 	// lockwatchCancel terminates the Swift lockwatch helper on
@@ -174,12 +178,49 @@ func (r *Runtime) Unlock(ctx context.Context) error {
 			Session: sess,
 			Store:   r.Store,
 			Policy:  r.Policy,
+			Connect: r.Connect,
 		}))
 	}
 	r.locked = false
 	r.lockReason = ""
 	slog.Info("daemon unlocked")
 	return nil
+}
+
+// connectCooldown is how long proton_connect refuses to re-prompt after
+// a declined or failed Touch ID. Stops a looping or prompt-injected
+// model from stacking dialogs on the user's screen.
+const connectCooldown = 20 * time.Second
+
+// Connect backs the proton_connect tool. Already unlocked → reports
+// that without prompting. Locked → runs the same Touch-ID-gated Unlock
+// as SIGUSR2 / `protonmcp unlock`.
+func (r *Runtime) Connect(ctx context.Context) (alreadyConnected bool, email string, err error) {
+	if locked, _ := r.Locked(); !locked {
+		return true, r.sessionEmail(), nil
+	}
+	r.mu.RLock()
+	wait := time.Until(r.connectFailedAt.Add(connectCooldown))
+	r.mu.RUnlock()
+	if wait > 0 {
+		return false, "", fmt.Errorf("previous Touch ID attempt was declined; retry in %ds", int(wait.Seconds())+1)
+	}
+	if err := r.Unlock(ctx); err != nil {
+		r.mu.Lock()
+		r.connectFailedAt = time.Now()
+		r.mu.Unlock()
+		return false, "", err
+	}
+	return false, r.sessionEmail(), nil
+}
+
+func (r *Runtime) sessionEmail() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.Session == nil {
+		return ""
+	}
+	return r.Session.Email
 }
 
 // SessionBundle is the cmd-side wrapper around a Proton session.
@@ -418,6 +459,7 @@ func Setup(ctx context.Context, cfg SetupConfig) (*Runtime, error) {
 		Session: sess,
 		Store:   st,
 		Policy:  engine,
+		Connect: rt.Connect,
 	}) {
 		srv.Register(tl)
 	}
@@ -467,9 +509,13 @@ func Setup(ctx context.Context, cfg SetupConfig) (*Runtime, error) {
 	// call Lock with the reason. If the helper isn't built, fall
 	// through silently — the daemon still works, just without the
 	// auto-lock triggers.
-	go rt.idleTracker.run(context.Background(), engine.IdleLockMinutes, rt.Lock, logger)
+	// Both automatic triggers route through autoLock so Keep Alive can
+	// veto them. Manual locks (SIGUSR1 / `protonmcp lock` / menu Lock
+	// Now) call rt.Lock directly and are never vetoed.
+	autoLock := keepAliveGuard(engine.KeepAlive, rt.Lock, logger)
+	go rt.idleTracker.run(context.Background(), engine.IdleLockMinutes, autoLock, logger)
 	if lockwatchPath, found := resolveLockwatchPath(); found {
-		rt.lockwatchCancel = startLockwatch(lockwatchPath, rt.Lock, logger)
+		rt.lockwatchCancel = startLockwatch(lockwatchPath, autoLock, logger)
 	} else {
 		logger.Info("lockwatch helper not found; screen-lock and sleep auto-lock disabled",
 			"hint", "run `make lockwatch` from the repo root")

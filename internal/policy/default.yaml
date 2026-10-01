@@ -34,6 +34,9 @@ max_attachment_bytes: 26214400
 tools:
   # Phase 3 read tools — all allow.
   account_whoami:        { decision: allow }
+  # Runs while locked; its Touch ID prompt (the session unlock) IS the
+  # gate, so a policy prompt here would only double-prompt.
+  proton_connect:        { decision: allow }
   mail_list:             { decision: allow }
   mail_search:           { decision: allow }
   mail_read:             { decision: allow }

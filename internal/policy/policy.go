@@ -438,6 +438,15 @@ func (e *Engine) MaxAttachmentBytes() int64 {
 	return e.doc.MaxAttachmentBytes
 }
 
+// KeepAlive reports whether the user has Keep Alive switched on.
+// Read at event time (not cached by callers) so a menu-bar toggle
+// plus policy reload takes effect on the very next lock trigger.
+func (e *Engine) KeepAlive() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.doc.KeepAlive
+}
+
 // AttachmentPathAllowlist returns the directories path-based
 // attachments may be read from. Empty slice means the feature is
 // disabled. Returns a copy — callers can't mutate engine state.

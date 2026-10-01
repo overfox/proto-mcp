@@ -159,8 +159,47 @@ func TestMiddlewareLockedRefusesCall(t *testing.T) {
 		t.Errorf("expected isError; got %+v", result)
 	}
 	text := result["content"].([]any)[0].(map[string]any)["text"].(string)
-	if !strings.Contains(text, "locked") || !strings.Contains(text, "protonmcp unlock") {
+	if !strings.Contains(text, "locked") || !strings.Contains(text, "proton_connect") {
 		t.Errorf("locked-daemon text missing expected hints: %s", text)
+	}
+}
+
+// TestMiddlewareLockedAllowsUnlockTool — a tool flagged AllowWhenLocked
+// (proton_connect) runs while locked; an ordinary tool on the same
+// locked server is still refused.
+func TestMiddlewareLockedAllowsUnlockTool(t *testing.T) {
+	var connectCalled, echoCalled bool
+	srv := New(nil, WithLockState(func() (bool, string) { return true, "screen_locked" }))
+	srv.Register(Tool{
+		Name:            "proton_connect",
+		Description:     "unlock",
+		InputSchema:     json.RawMessage(`{"type":"object"}`),
+		AllowWhenLocked: true,
+		Handler: func(ctx Context, _ json.RawMessage) (*ToolResult, error) {
+			connectCalled = true
+			return StructuredResult(map[string]string{"status": "connected"})
+		},
+	})
+	srv.Register(Tool{
+		Name:        "echo",
+		Description: "echo",
+		InputSchema: json.RawMessage(`{"type":"object"}`),
+		Handler: func(ctx Context, _ json.RawMessage) (*ToolResult, error) {
+			echoCalled = true
+			return StructuredResult(map[string]string{"ok": "yes"})
+		},
+	})
+	roundtrip(t, srv,
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}`,
+		`{"jsonrpc":"2.0","method":"notifications/initialized"}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"proton_connect","arguments":{}}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo","arguments":{}}}`,
+	)
+	if !connectCalled {
+		t.Error("AllowWhenLocked tool was refused while locked")
+	}
+	if echoCalled {
+		t.Error("ordinary tool ran while locked")
 	}
 }
 

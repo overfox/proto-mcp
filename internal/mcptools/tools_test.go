@@ -57,11 +57,12 @@ func TestAllToolsBuild(t *testing.T) {
 	defer st.Close()
 
 	tools := All(Deps{Store: st})
-	if len(tools) != 35 {
-		t.Errorf("expected 35 tools, got %d", len(tools))
+	if len(tools) != 36 {
+		t.Errorf("expected 36 tools, got %d", len(tools))
 	}
 
 	want := map[string]bool{
+		"proton_connect":        false,
 		"account_whoami":        false,
 		"mail_list":             false,
 		"mail_search":           false,
@@ -149,8 +150,8 @@ func TestAllToolsRegisterIntoServer(t *testing.T) {
 		srv.Register(tl)
 	}
 	got := srv.Tools()
-	if len(got) != 35 {
-		t.Errorf("server registry has %d tools, want 35", len(got))
+	if len(got) != 36 {
+		t.Errorf("server registry has %d tools, want 36", len(got))
 	}
 }
 

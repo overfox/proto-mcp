@@ -21,6 +21,8 @@
 package mcptools
 
 import (
+	"context"
+
 	"github.com/just-an-oldsalt/proto-mcp/internal/mcp"
 	"github.com/just-an-oldsalt/proto-mcp/internal/policy"
 	protonclient "github.com/just-an-oldsalt/proto-mcp/internal/proton"
@@ -51,6 +53,12 @@ type Deps struct {
 	// without it) — handlers fall back to allow-by-default in that
 	// case.
 	Policy *policy.Engine
+
+	// Connect ends a locked state by running the runtime's Touch-ID-gated
+	// unlock. Returns whether the session was already connected and the
+	// account email. nil when there is no runtime to unlock (tests,
+	// one-shot CLI paths) — proton_connect then reports that.
+	Connect func(ctx context.Context) (alreadyConnected bool, email string, err error)
 }
 
 // All returns every tool registered, in the order the server should
@@ -58,6 +66,7 @@ type Deps struct {
 // affects how tools/list reads if a human inspects the wire transcript.
 func All(deps Deps) []mcp.Tool {
 	return []mcp.Tool{
+		protonConnect(deps),
 		accountWhoami(deps),
 		mailList(deps),
 		mailSearch(deps),
