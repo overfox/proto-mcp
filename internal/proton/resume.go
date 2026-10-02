@@ -83,22 +83,28 @@ func Resume(ctx context.Context, mgr *gpa.Manager, args ResumeArgs) (*Session, e
 	// the OnAuthUpdate hook (wired by the caller) writes the new pair
 	// back to the Keychain.
 	sess := &Session{
-		Client:        client,
-		Email:         args.Email,
-		UID:           args.UID,
-		AccessToken:   args.AccessToken,
-		RefreshToken:  args.RefreshToken,
-		SaltedKeyPass: args.SaltedKeyPass,
+		Client:       client,
+		Email:        args.Email,
+		UID:          args.UID,
+		AccessToken:  args.AccessToken,
+		RefreshToken: args.RefreshToken,
+		// Deep copy: a secret.Secret struct copy shares its backing
+		// array, and the caller (session.TryResume) Zero()s its copy on
+		// return. Sharing left this session holding all-zero key
+		// material of full length; the next token refresh then re-saved
+		// those zeros to the Keychain, and the following resume failed
+		// with "private key checksum failure".
+		SaltedKeyPass: secret.New(args.SaltedKeyPass.Bytes()),
 	}
 	sess.installAuthHandler()
 
 	closeAndWrap := func(format string, vals ...any) error {
-		// Best-effort revoke. If the refresh succeeded but a follow-up
-		// call failed, the access token we just got is still good and
-		// we should revoke it server-side rather than leak it.
-		revokeCtx, cancel := detachedShutdownCtx()
-		defer cancel()
-		_ = client.AuthDelete(revokeCtx)
+		// Close locally only; never revoke the server session here. A
+		// resume can fail for reasons that say nothing about the stored
+		// credentials (a network blip, a transient API error), and a
+		// revoke turns those into a forced re-login. It also destroys
+		// the evidence when key unlock fails. Explicit logout is the
+		// only path that revokes (Session.CloseAndRevoke).
 		client.Close()
 		return fmt.Errorf(format, vals...)
 	}

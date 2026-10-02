@@ -116,6 +116,15 @@ const blobVersion = 3
 // Uses the keybase/go-keychain path with AccessibleWhenUnlocked. The
 // Phase-7/D SecAccessControl path is intentionally NOT called here
 // — see the blobVersion comment for why (restricted-entitlement wall).
+func allZero(b []byte) bool {
+	for _, c := range b {
+		if c != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func Save(l Live) error {
 	if l.Email == "" || l.UID == "" || l.RefreshToken == "" {
 		return errors.New("keystore: refusing to save incomplete session (need email, uid, refresh_token)")
@@ -127,6 +136,13 @@ func Save(l Live) error {
 	// diagnostic clue. Pair with C-4 (OnAuthUpdate guard).
 	if len(l.SaltedKeyPass.Bytes()) == 0 {
 		return errors.New("keystore: refusing to save empty SaltedKeyPass (D16: likely Close/OnAuthUpdate race)")
+	}
+	// Zero() wipes in place, so a Secret that shares a backing array
+	// with a zeroed copy still reports its full length. All-zero bytes
+	// are never a real key password; saving them would corrupt the
+	// Keychain blob exactly like the empty case.
+	if allZero(l.SaltedKeyPass.Bytes()) {
+		return errors.New("keystore: refusing to save zeroed SaltedKeyPass (key material was wiped while still in use)")
 	}
 	blob := savedBlob{
 		Email:         l.Email,
