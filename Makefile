@@ -83,6 +83,33 @@ $(MENUBAR): $(MENUBAR_DIR)/main.swift
 .PHONY: menubar
 menubar: $(MENUBAR)
 
+# Claude Desktop extension bundle: the manifest + the shim, zipped.
+# Install via Settings > Extensions (the durable registration path —
+# Desktop rewrites claude_desktop_config.json on quit).
+MCPB_DIR      := packaging/mcpb
+MCPB          := packaging/protonmcp.mcpb
+MENUBAR_LABEL := zone.dort.protonmcp-menubar
+
+$(MCPB): $(MCPB_DIR)/manifest.json $(SHIM)
+	cp $(SHIM) $(MCPB_DIR)/protonmcp-shim
+	rm -f $@
+	cd $(MCPB_DIR) && zip -q -X ../$(notdir $@) manifest.json protonmcp-shim
+
+# Local "rebuild and roll out" for the dev machine: build everything,
+# put the Swift helpers next to the Go binaries in bin/ (where the
+# daemon and the menu bar look for their siblings), re-record the
+# daemon hash + restart it via `daemon install`, restart the menu bar
+# LaunchAgent, and refresh the .mcpb (a prerequisite, so it's rebuilt
+# before the restarts). Running Claude sessions survive the daemon
+# restart: the shim reconnects on its own.
+.PHONY: deploy
+deploy: all $(MCPB)
+	cp $(TOUCHID) $(LOCKWATCH) $(MENUBAR) $(BINDIR)/
+	$(PROTONMCP) daemon install
+	launchctl kickstart -k gui/$$(id -u)/$(MENUBAR_LABEL) || \
+		echo "warning: menu bar LaunchAgent $(MENUBAR_LABEL) not loaded; skipped restart"
+	@echo "Deployed. Reinstall $(MCPB) in Claude Desktop only if the manifest changed."
+
 .PHONY: test
 test:
 	go test ./...
