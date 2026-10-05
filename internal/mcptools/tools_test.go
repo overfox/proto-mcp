@@ -22,7 +22,7 @@ import (
 // '^[a-zA-Z0-9_-]{1,64}$'".
 // expectedToolCount is the number of tools All registers. One
 // constant so both count assertions move together.
-const expectedToolCount = 41
+const expectedToolCount = 43
 
 var claudeDesktopNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)
 
@@ -115,6 +115,8 @@ func TestAllToolsBuild(t *testing.T) {
 		"mail_unstar":          false,
 		"mail_attachment_text": false,
 		"contacts_search":      false,
+		"mail_digest":          false,
+		"mail_awaiting_reply":  false,
 	}
 	for _, tl := range tools {
 		if _, ok := want[tl.Name]; !ok {

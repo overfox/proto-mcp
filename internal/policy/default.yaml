@@ -83,6 +83,9 @@ tools:
   folders_list:          { decision: allow }
   mail_sync:             { decision: allow }
   mail_counts:           { decision: allow }
+  # Mirror-backed triage summaries (read-only).
+  mail_digest:           { decision: allow }
+  mail_awaiting_reply:   { decision: allow }
 
   # Phase 9 read-only calendar tools — mirror-backed reads, allow-by-
   # default like the mail read tools. No write/RSVP path exists.
