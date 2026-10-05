@@ -731,7 +731,7 @@ func Setup(ctx context.Context, cfg SetupConfig) (*Runtime, error) {
 	}
 	go rt.idleTracker.run(bgCtx, engine.IdleLockMinutes, idleSkip, autoLock, logger)
 	if lockwatchPath, found := resolveLockwatchPath(); found {
-		rt.lockwatchCancel = startLockwatch(lockwatchPath, autoLock, logger)
+		rt.lockwatchCancel = startLockwatch(lockwatchPath, autoLock, rt.Lock, logger)
 	} else {
 		logger.Info("lockwatch helper not found; screen-lock and sleep auto-lock disabled",
 			"hint", "run `make lockwatch` from the repo root")

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"testing"
 )
 
 // Helper pinning.
@@ -122,4 +123,16 @@ func ownerOK(st os.FileInfo, uid int) bool {
 // approve anything, but it can silently disable auto-lock.
 func VerifyLockwatchHelper(path string) error {
 	return verifyHelper(path, lockwatchHelperSHA256, nil, os.Getuid())
+}
+
+// SetLockwatchHashForTesting pins the lockwatch hash from another
+// package's tests and returns a restore func. It refuses to do anything
+// outside `go test`, so a production binary can't be re-pinned at runtime.
+func SetLockwatchHashForTesting(hash string) (restore func()) {
+	if !testing.Testing() {
+		return func() {}
+	}
+	prev := lockwatchHelperSHA256
+	lockwatchHelperSHA256 = hash
+	return func() { lockwatchHelperSHA256 = prev }
 }

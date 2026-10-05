@@ -34,9 +34,14 @@ import (
 // If the binary path is invalid the function returns a no-op cancel
 // and logs a warning — the daemon proceeds without auto-lock
 // triggers.
-func startLockwatch(binPath string, lockFn func(reason string), logger *slog.Logger) func() {
+//
+// onTamper is called when the helper fails its pinned-hash check. It
+// must be an unconditional lock (not the Keep Alive-guarded autoLock):
+// a swapped helper means something on this account is tampering with
+// the daemon, and silently running without auto-lock would hide it.
+func startLockwatch(binPath string, lockFn, onTamper func(reason string), logger *slog.Logger) func() {
 	ctx, cancel := context.WithCancel(context.Background())
-	go runLockwatchLoop(ctx, binPath, lockFn, logger)
+	go runLockwatchLoop(ctx, binPath, lockFn, onTamper, logger)
 	return cancel
 }
 
@@ -46,9 +51,9 @@ func startLockwatch(binPath string, lockFn func(reason string), logger *slog.Log
 // 30s ceiling (during which screen-lock auto-lock is not armed).
 const lockwatchHealthyRun = 60 * time.Second
 
-func runLockwatchLoop(ctx context.Context, binPath string, lockFn func(reason string), logger *slog.Logger) {
+func runLockwatchLoop(ctx context.Context, binPath string, lockFn, onTamper func(reason string), logger *slog.Logger) {
 	runLockwatchLoopWith(ctx, func(ctx context.Context) error {
-		return runLockwatchOnce(ctx, binPath, lockFn, logger)
+		return runLockwatchOnce(ctx, binPath, lockFn, onTamper, logger)
 	}, logger, time.Now, time.After)
 }
 
@@ -96,8 +101,10 @@ func runLockwatchLoopWith(
 	}
 }
 
-func runLockwatchOnce(ctx context.Context, binPath string, lockFn func(reason string), logger *slog.Logger) error {
+func runLockwatchOnce(ctx context.Context, binPath string, lockFn, onTamper func(reason string), logger *slog.Logger) error {
 	if err := approval.VerifyLockwatchHelper(binPath); err != nil { // pinned hash; fail closed
+		logger.Error("lockwatch helper failed verification; locking", "err", err.Error())
+		onTamper("lockwatch_helper_untrusted")
 		return err
 	}
 	cmd := exec.CommandContext(ctx, binPath)
