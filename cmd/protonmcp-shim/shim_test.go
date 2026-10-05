@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net"
 	"os"
 	"path/filepath"
@@ -18,42 +19,41 @@ func TestDefaultSocketPathHasExpectedShape(t *testing.T) {
 	}
 }
 
-// TestEmitDaemonUnavailableError checks the JSON-RPC error frame we
-// emit when the daemon isn't reachable. It must be valid NDJSON
-// (one line, ends with \n) and include the dial error so the user
-// can act on it.
-func TestEmitDaemonUnavailableError(t *testing.T) {
-	// Redirect os.Stdout to a temp file for inspection. The
-	// emitDaemonUnavailableError function writes directly to it.
-	tmp, err := os.CreateTemp(t.TempDir(), "stdout*.log")
-	if err != nil {
-		t.Fatal(err)
+// TestErrorFrame checks the JSON-RPC error frames the shim
+// synthesizes. They must be valid NDJSON (one line, ends with \n),
+// echo the request id, and carry structured data when given.
+func TestErrorFrame(t *testing.T) {
+	b := errorFrame(json.RawMessage(`7`),
+		unreachableMessage("/tmp/test.sock", 0, net.ErrClosed),
+		map[string]any{"dial_error": net.ErrClosed.Error()})
+	s := string(b)
+	if !strings.HasSuffix(s, "\n") || strings.Count(s, "\n") != 1 {
+		t.Errorf("error frame must be exactly one NDJSON line: %q", s)
 	}
-	defer tmp.Close()
-	orig := os.Stdout
-	os.Stdout = tmp
-	defer func() { os.Stdout = orig }()
-
-	emitDaemonUnavailableError("/tmp/test.sock", net.ErrClosed)
-	tmp.Sync()
-	_ = tmp.Close()
-
-	data, err := os.ReadFile(tmp.Name())
-	if err != nil {
-		t.Fatal(err)
+	var resp struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Error   struct {
+			Code    int               `json:"code"`
+			Message string            `json:"message"`
+			Data    map[string]string `json:"data"`
+		} `json:"error"`
 	}
-	s := string(data)
-	if !strings.HasSuffix(s, "\n") {
-		t.Error("error frame must end with newline (NDJSON framing)")
+	if err := json.Unmarshal(b, &resp); err != nil {
+		t.Fatalf("invalid JSON: %v (%s)", err, s)
 	}
-	if !strings.Contains(s, `"jsonrpc":"2.0"`) {
-		t.Errorf("missing JSON-RPC envelope: %s", s)
+	if resp.JSONRPC != "2.0" || string(resp.ID) != "7" || resp.Error.Code != errCodeDaemon {
+		t.Errorf("bad envelope: %s", s)
 	}
-	if !strings.Contains(s, "/tmp/test.sock") {
-		t.Errorf("missing socket path: %s", s)
+	if !strings.Contains(resp.Error.Message, "/tmp/test.sock") ||
+		!strings.Contains(resp.Error.Message, "protonmcp daemon start") {
+		t.Errorf("message lacks path / remedy: %s", resp.Error.Message)
 	}
-	if !strings.Contains(s, `"data":{"dial_error":`) {
+	if resp.Error.Data["dial_error"] == "" {
 		t.Errorf("missing structured dial_error: %s", s)
+	}
+	if got := string(errorFrame(nil, "x", nil)); !strings.Contains(got, `"id":null`) {
+		t.Errorf("missing id should encode as null: %s", got)
 	}
 }
 
