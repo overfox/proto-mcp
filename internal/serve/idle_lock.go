@@ -33,20 +33,22 @@ func newIdleTracker() *idleTracker {
 }
 
 // bumpActivity records "tool call happened just now." Lock-free.
-// Wired into the mcp.Middleware via mcp.WithToolCallObserver.
+// Wired into the mcp.Middleware via mcp.WithToolCallObserver, and
+// called by Runtime.Unlock so an unlock counts as activity.
 func (t *idleTracker) bumpActivity() {
 	t.lastActivity.Store(time.Now().UnixNano())
 }
 
 // run polls every 30 seconds. minutesFn is called on each tick so
-// policy reloads pick up new thresholds without restart. lockFn is
-// the runtime's Lock method.
+// policy reloads pick up new thresholds without restart. skipFn
+// reports whether the check is moot this tick (runtime already locked,
+// or Keep Alive on); lockFn is the (Keep-Alive-guarded) runtime Lock.
 //
 // 30s tick is the granularity / responsiveness trade-off: a user
 // setting idle_lock_minutes=1 sees the lock fire 0–30s after the
 // last activity, which is acceptable. A finer tick would burn CPU
 // for no real gain.
-func (t *idleTracker) run(ctx context.Context, minutesFn func() int, lockFn func(reason string), logger *slog.Logger) {
+func (t *idleTracker) run(ctx context.Context, minutesFn func() int, skipFn func() bool, lockFn func(reason string), logger *slog.Logger) {
 	const tickInterval = 30 * time.Second
 	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()
@@ -57,23 +59,36 @@ func (t *idleTracker) run(ctx context.Context, minutesFn func() int, lockFn func
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			minutes := minutesFn()
-			if minutes <= 0 {
-				continue
-			}
-			threshold := time.Duration(minutes) * time.Minute
-			since := time.Since(time.Unix(0, t.lastActivity.Load()))
-			if since >= threshold {
-				logger.Info("idle threshold exceeded; locking daemon",
-					"idle_minutes", int(since.Minutes()),
-					"threshold_minutes", minutes)
-				lockFn("idle_timeout")
-				// Don't reset lastActivity here. Unlock re-acquires
-				// the session and the next tool call will bump it.
-				// Locking from already-locked is a no-op so the
-				// next tick won't re-fire.
-			}
+			t.check(minutesFn, skipFn, lockFn, logger)
 		}
+	}
+}
+
+// check is one tick of run. Split out so tests can drive it without
+// waiting on the 30s ticker.
+//
+// Skips entirely while skipFn says so (locked: there is nothing to
+// lock; Keep Alive: the guard would veto it anyway). The old
+// code logged "idle threshold exceeded" every tick for as long as the
+// daemon stayed locked (13k lines overnight). Activity is reset by
+// Runtime.Unlock, so the threshold restarts from the moment of unlock
+// rather than from the last pre-lock tool call — previously a daemon
+// re-locked within one tick of every unlock.
+func (t *idleTracker) check(minutesFn func() int, skipFn func() bool, lockFn func(reason string), logger *slog.Logger) {
+	if skipFn != nil && skipFn() {
+		return
+	}
+	minutes := minutesFn()
+	if minutes <= 0 {
+		return
+	}
+	threshold := time.Duration(minutes) * time.Minute
+	since := time.Since(time.Unix(0, t.lastActivity.Load()))
+	if since >= threshold {
+		logger.Info("idle threshold exceeded; locking daemon",
+			"idle_minutes", int(since.Minutes()),
+			"threshold_minutes", minutes)
+		lockFn("idle_timeout")
 	}
 }
 

@@ -29,16 +29,24 @@ import (
 func newStartupGatedAcquire(helperPath string, inner func(context.Context) (SessionBundle, error), logger *slog.Logger) func(context.Context) (SessionBundle, error) {
 	return func(ctx context.Context) (SessionBundle, error) {
 		if err := promptStartupTouchID(ctx, helperPath, logger); err != nil {
-			return nil, fmt.Errorf("touch-id startup gate: %w", err)
+			return nil, fmt.Errorf("%w: %w", ErrTouchIDGate, err)
 		}
 		return inner(ctx)
 	}
 }
 
+// ErrTouchIDGate wraps every failure of the Touch ID prompt itself
+// (declined, timed out, helper error) — as opposed to a failure of the
+// session acquire that runs after an approval. Setup matches it to come
+// up locked instead of failing: exiting non-zero made launchd relaunch
+// the daemon, which prompted again, all night.
+var ErrTouchIDGate = errors.New("touch-id startup gate")
+
 // startupGateTimeout caps the Touch ID prompt. 60s matches the
 // approval broker's per-call timeout doubled — startup is rare and
-// the user may need a moment to locate their finger.
-const startupGateTimeout = 60 * time.Second
+// the user may need a moment to locate their finger. A var so tests
+// can shorten it.
+var startupGateTimeout = 60 * time.Second
 
 func promptStartupTouchID(ctx context.Context, helperPath string, logger *slog.Logger) error {
 	payload, _ := json.Marshal(struct {
@@ -68,6 +76,16 @@ func promptStartupTouchID(ctx context.Context, helperPath string, logger *slog.L
 		return nil
 	}
 
+	// Context first: CommandContext kills the helper on timeout /
+	// cancel, which surfaces as an ExitError with code -1. Matching
+	// the exit code first mislabelled every timeout as "helper exit -1".
+	if subCtx.Err() != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("startup approval aborted: %w", ctx.Err())
+		}
+		return fmt.Errorf("startup approval timed out after %s", startupGateTimeout)
+	}
+
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
 		switch exitErr.ExitCode() {
@@ -80,8 +98,5 @@ func promptStartupTouchID(ctx context.Context, helperPath string, logger *slog.L
 		}
 	}
 
-	if errors.Is(subCtx.Err(), context.DeadlineExceeded) {
-		return fmt.Errorf("startup approval timed out after %s", startupGateTimeout)
-	}
 	return fmt.Errorf("helper invocation failed: %v", err)
 }

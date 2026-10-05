@@ -96,3 +96,7 @@ func TestUnlock_RebindsSessionAndTools(t *testing.T) {
 		t.Errorf("tool count after unlock = %d, want %d", got, want)
 	}
 }
+
+func newTestSession(email string) *protonclient.Session {
+	return &protonclient.Session{Email: email}
+}

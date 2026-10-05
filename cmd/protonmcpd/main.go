@@ -129,6 +129,7 @@ func run() error {
 	fs := flag.NewFlagSet("protonmcpd", flag.ContinueOnError)
 	socketPath := fs.String("socket", "", "Unix socket path (default: ~/Library/Application Support/protonmcp/protonmcp.sock)")
 	dbPath := fs.String("db", "", "SQLite store path (default: platform-standard data dir)")
+	statePath := fs.String("state", "", "state file read by the menu bar (default: ~/Library/Application Support/protonmcp/state.json)")
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		return err
 	}
@@ -178,43 +179,38 @@ func run() error {
 		return err
 	}
 
+	// state.json for the menu bar: "starting" now, heartbeat from here
+	// on (including while Setup waits on Touch ID or the network), and
+	// removed on the way out.
+	if *statePath == "" {
+		p, err := serve.DefaultStatePath()
+		if err != nil {
+			return err
+		}
+		*statePath = p
+	}
+	state := serve.NewStatePublisher(*statePath, slog.Default())
+	state.SetState(serve.StateStarting, "", "")
+	defer state.Remove()
+	stateCtx, stopState := context.WithCancel(context.Background())
+	defer stopState()
+	go state.Run(stateCtx)
+
 	rt, err := serve.Setup(ctx, serve.SetupConfig{
 		DBPath: *dbPath,
 		AcquireSession: func(ctx context.Context) (serve.SessionBundle, error) {
-			// A network outage used to surface as ErrLoginRequired →
-			// clean exit → daemon dead until a human ran `daemon
-			// start` (observed when a network blocked Proton
-			// outright). The Touch ID gate has already fired by the
-			// time this runs, so waiting the outage out here causes
-			// no prompt storms: retry with capped backoff until the
-			// network returns, a genuine auth failure appears, or
-			// the daemon is stopped.
-			delay := 15 * time.Second
-			for {
-				acquireCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-				b, err := session.AcquireResumeOnly(acquireCtx)
-				cancel()
-				if err == nil {
-					return b, nil
-				}
-				if !errors.Is(err, session.ErrNetworkUnavailable) {
-					return nil, err
-				}
-				slog.Warn("proton unreachable; will retry session resume",
-					"err", err.Error(), "retry_in", delay.String())
-				select {
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				case <-time.After(delay):
-				}
-				if delay *= 2; delay > 5*time.Minute {
-					delay = 5 * time.Minute
-				}
-			}
+			return acquireWithRetry(ctx, session.AcquireResumeOnly, state, time.After)
 		},
 		SweepBodiesAtStartup: serve.SweepStaleBodies,
+		State:                state,
 	})
 	if err != nil {
+		// SIGTERM while Setup waited (Touch ID prompt, network retry)
+		// is a clean stop, not a failure.
+		if ctx.Err() != nil {
+			slog.Info("protonmcpd stopped during startup", "err", err.Error())
+			return nil
+		}
 		return err
 	}
 	defer rt.Close()
@@ -232,13 +228,59 @@ func run() error {
 		_ = os.Remove(sockPath)
 	}()
 
+	locked, reason := rt.Locked()
 	slog.Info("protonmcpd ready",
-		"email", rt.Session.Email,
+		"email", rt.Email(),
+		"locked", locked,
+		"lock_reason", reason,
 		"tools", len(rt.MCPServer.Tools()),
 		"socket", sockPath,
 	)
 
 	return acceptLoop(ctx, listener, rt)
+}
+
+// acquireWithRetry resumes the session, waiting out network outages
+// (and 429 / 5xx, which session classifies the same way).
+//
+// A network outage used to surface as ErrLoginRequired → clean exit →
+// daemon dead until a human ran `daemon start` (observed when a
+// network blocked Proton outright). The Touch ID gate has already
+// fired by the time this runs, so waiting the outage out here causes
+// no prompt storms: retry with capped backoff until the network
+// returns, a genuine auth failure appears, or ctx ends (SIGTERM, or
+// the unlock's own deadline). Under serve.WithoutNetworkRetry
+// (proton_connect) it makes a single attempt so the tool call returns
+// promptly. While waiting, the state file says "connecting".
+func acquireWithRetry(
+	ctx context.Context,
+	resume func(context.Context) (*session.Bundle, error),
+	state *serve.StatePublisher,
+	after func(time.Duration) <-chan time.Time,
+) (serve.SessionBundle, error) {
+	delay := 15 * time.Second
+	for {
+		acquireCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		b, err := resume(acquireCtx)
+		cancel()
+		if err == nil {
+			return b, nil
+		}
+		if !errors.Is(err, session.ErrNetworkUnavailable) || !serve.NetworkRetryAllowed(ctx) {
+			return nil, err
+		}
+		state.SetState(serve.StateConnecting, "", "")
+		slog.Warn("proton unreachable; will retry session resume",
+			"err", err.Error(), "retry_in", delay.String())
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-after(delay):
+		}
+		if delay *= 2; delay > 5*time.Minute {
+			delay = 5 * time.Minute
+		}
+	}
 }
 
 // resolveSocketPath returns the configured socket path, creating
