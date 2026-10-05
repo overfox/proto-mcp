@@ -56,8 +56,8 @@ func (r *Request) IsNotification() bool {
 // is populated. ID echoes the request's ID verbatim (or is null for
 // errors on un-parseable requests).
 type Response struct {
-	JSONRPC string          `json:"jsonrpc"`        // always "2.0"
-	ID      json.RawMessage `json:"id"`             // matches Request.ID; "null" for parse errors
+	JSONRPC string          `json:"jsonrpc"` // always "2.0"
+	ID      json.RawMessage `json:"id"`      // matches Request.ID; "null" for parse errors
 	Result  any             `json:"result,omitempty"`
 	Error   *Error          `json:"error,omitempty"`
 }
@@ -144,12 +144,12 @@ type Tool struct {
 // Return shape:
 //
 //   - (result, nil)   → tool succeeded. result becomes the "result"
-//                       field of the JSON-RPC response.
+//     field of the JSON-RPC response.
 //   - (nil, *Error)   → protocol-level failure (typically invalid
-//                       params). Caller emits a JSON-RPC error.
+//     params). Caller emits a JSON-RPC error.
 //   - (nil, error)    → tool-execution failure. Caller wraps it as
-//                       a tool result with isError: true so the LLM
-//                       sees the message.
+//     a tool result with isError: true so the LLM
+//     sees the message.
 type Handler func(ctx Context, params json.RawMessage) (*ToolResult, error)
 
 // Context is a small bag of per-call state. Kept as a struct rather

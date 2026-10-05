@@ -196,7 +196,7 @@ func readOne(ctx mcp.Context, deps Deps, msgID, format string, refresh bool, max
 	}
 
 	out.ThreadID = threadID
-	out.Subject = body.Subject
+	out.Subject = wrapUntrustedSubject(body.Subject)
 	out.From = body.From
 	out.MIMEType = body.MIMEType
 	out.References = body.References
@@ -209,7 +209,7 @@ func readOne(ctx mcp.Context, deps Deps, msgID, format string, refresh bool, max
 // applyEnvelope fills the header-ish fields from the mirror row.
 func applyEnvelope(out *readResult, m store.Message) {
 	out.ThreadID = m.ThreadID
-	out.Subject = m.Subject
+	out.Subject = wrapUntrustedSubject(m.Subject)
 	out.From = m.FromAddress
 	out.To = decodeAddressJSON(m.ToJSON)
 	out.Cc = decodeAddressJSON(m.CcJSON)

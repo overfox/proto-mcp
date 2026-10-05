@@ -834,6 +834,12 @@ func (r *Runtime) syncSession(ctx context.Context, sess *protonclient.Session, s
 			"labels_deleted", res.LabelsDeleted)
 	}
 
+	// Owner-defined auto rules (rules_set with auto: true, each created
+	// behind Touch ID) run on freshly synced mail. Actions are limited
+	// to label / move / star / mark_read by the rules engine; a failure
+	// is logged and never aborts the sync.
+	r.applyAutoRules(syncCtx, sess, st, logger)
+
 	// Calendar sync rides the same tick + lock gate but is a separate
 	// poll (the event stream carries no calendar delta). A calendar
 	// failure is logged and ignored — it must not abort the mail sync.
@@ -849,6 +855,23 @@ func (r *Runtime) syncSession(ctx context.Context, sess *protonclient.Session, s
 			"events_upserted", calRes.EventsUpserted,
 			"events_deleted", calRes.EventsDeleted,
 			"calendars_deleted", calRes.CalendarsDeleted)
+	}
+}
+
+func (r *Runtime) applyAutoRules(ctx context.Context, sess *protonclient.Session, st *store.Store, logger *slog.Logger) {
+	rep, err := mcptools.ApplyAutoRules(ctx, mcptools.Deps{Session: sess, Store: st, Policy: r.Policy})
+	if err != nil {
+		if ctx.Err() == nil {
+			logger.Warn("auto rules failed", "err", err.Error())
+		}
+		return
+	}
+	for _, res := range rep.Results {
+		if res.Error != "" {
+			logger.Warn("auto rule failed", "rule", res.Rule, "err", res.Error)
+		} else if len(res.Applied) > 0 {
+			logger.Info("auto rule applied", "rule", res.Rule, "matched", res.Matched, "applied", res.Applied)
+		}
 	}
 }
 

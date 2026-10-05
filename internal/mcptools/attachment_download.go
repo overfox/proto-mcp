@@ -329,6 +329,9 @@ func writeAttachmentStaging(attachmentID, filename string, content []byte) (stri
 		_ = os.Remove(dest)
 		return "", fmt.Errorf("write staging file: %w", err)
 	}
+	if err := setQuarantine(dest); err != nil {
+		slog.Warn("could not set quarantine attribute on staged attachment", "err", err.Error())
+	}
 	return dest, nil
 }
 
