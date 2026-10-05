@@ -39,15 +39,24 @@ protonmcpd: $(PROTONMCPD)
 .PHONY: shim
 shim: $(SHIM)
 
-$(PROTONMCP): $(GO_INPUTS) go.mod go.sum
+# Helper pinning: the Go binaries embed the SHA-256 of the Swift
+# helpers they exec, and refuse to run a helper whose hash differs
+# (internal/approval/verify.go). The helpers are therefore build
+# prerequisites, hashed after they're built. NOTE: anything that
+# rewrites a helper afterwards (e.g. `make sign` codesigning it) changes
+# its hash — sign the helpers BEFORE building the Go binaries.
+APPROVAL_PKG   := github.com/just-an-oldsalt/proto-mcp/internal/approval
+HELPER_LDFLAGS  = -X $(APPROVAL_PKG).touchIDHelperSHA256=$$(shasum -a 256 $(TOUCHID) | cut -d' ' -f1) -X $(APPROVAL_PKG).lockwatchHelperSHA256=$$(shasum -a 256 $(LOCKWATCH) | cut -d' ' -f1)
+
+$(PROTONMCP): $(GO_INPUTS) go.mod go.sum $(TOUCHID) $(LOCKWATCH)
 	@mkdir -p $(BINDIR)
-	go build -o $@ ./cmd/protonmcp
+	go build -ldflags "$(HELPER_LDFLAGS)" -o $@ ./cmd/protonmcp
 
 # Daemon variant. Phase 6/A: same internal/serve.Runtime, transport
 # is a Unix socket accept loop instead of stdin/stdout.
-$(PROTONMCPD): $(GO_INPUTS) go.mod go.sum
+$(PROTONMCPD): $(GO_INPUTS) go.mod go.sum $(TOUCHID) $(LOCKWATCH)
 	@mkdir -p $(BINDIR)
-	go build -o $@ ./cmd/protonmcpd
+	go build -ldflags "$(HELPER_LDFLAGS)" -o $@ ./cmd/protonmcpd
 
 # Phase 6/B: stdio↔socket forwarder Claude clients spawn instead
 # of serve-stdio. Tiny binary, no internal/ deps; the cross-binary

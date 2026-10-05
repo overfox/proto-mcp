@@ -1,5 +1,6 @@
-// Package approval drives the Touch ID prompt + NSAlert confirmation
-// for tool calls the policy engine has gated.
+// Package approval drives the Touch ID prompt for tool calls the
+// policy engine has gated (a single dialog; the helper no longer shows
+// a separate NSAlert for confirm: true).
 //
 // The Swift helper (helpers/touchid/protonmcp-touchid) does the
 // actual UI work; this package execs it with a JSON payload on stdin
@@ -22,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
 	"time"
 
@@ -55,10 +57,18 @@ type Request struct {
 // Construct via New(). Safe for concurrent use; the cache has its
 // own lock.
 type Broker struct {
-	helperPath  string
-	cache       *cache
-	logger      *slog.Logger
+	helperPath    string
+	cache         *cache
+	logger        *slog.Logger
 	helperTimeout time.Duration
+
+	// helperSHA256 is the hex SHA-256 the helper must match before
+	// every exec (embedded at build time; see verify.go). Empty →
+	// unpinned dev build: owner/permission checks + a loud warning.
+	// Tests inject it directly.
+	helperSHA256 string
+	// uid is the expected helper owner (the daemon's own uid).
+	uid int
 }
 
 // New constructs a Broker. helperPath should resolve to an
@@ -92,6 +102,8 @@ func New(helperPath string, logger *slog.Logger) (*Broker, error) {
 		cache:         newCache(),
 		logger:        logger,
 		helperTimeout: 30 * time.Second,
+		helperSHA256:  touchIDHelperSHA256,
+		uid:           os.Getuid(),
 	}, nil
 }
 
@@ -145,6 +157,14 @@ func (b *Broker) runHelper(ctx context.Context, r Request) (string, error) {
 		return "", fmt.Errorf("approval: marshal request: %w", err)
 	}
 
+	// Helper pinning: re-verify the helper before EVERY exec so a
+	// helper swapped after startup is caught. Fail closed.
+	if verr := verifyHelper(b.helperPath, b.helperSHA256, b.logger, b.uid); verr != nil {
+		b.logger.Error("approval helper verification failed; refusing approval",
+			"tool", r.Tool, "err", verr.Error())
+		return "", fmt.Errorf("%w: %v", mcperrors.ErrAuthFailed, verr)
+	}
+
 	subCtx, cancel := context.WithTimeout(ctx, b.helperTimeout)
 	defer cancel()
 
@@ -190,6 +210,30 @@ func (b *Broker) runHelper(ctx context.Context, r Request) (string, error) {
 		return "", mcperrors.ErrUserCanceled
 	}
 	return "", fmt.Errorf("%w: %v", mcperrors.ErrAuthFailed, err)
+}
+
+// Approver returns a callback that runs a one-off Touch ID prompt with
+// the given title/body, bypassing policy and the approval cache. Used
+// by tool handlers that must gate a sub-step themselves (e.g. attaching
+// a file from outside attachment_path_allowlist to a draft). Because it
+// never consults the policy engine, Keep Alive cannot suppress it.
+//
+// Safe on a nil *Broker: the returned func always refuses, so a daemon
+// without a helper fails closed instead of skipping the prompt.
+func (b *Broker) Approver() func(ctx context.Context, title, body string) error {
+	return func(ctx context.Context, title, body string) error {
+		if b == nil {
+			return fmt.Errorf("%w: approval broker unavailable", mcperrors.ErrAuthFailed)
+		}
+		_, err := b.runHelper(ctx, Request{
+			Tool:   "approve_inline",
+			Caller: caller.FromContext(ctx),
+			Policy: policy.ToolPolicy{Decision: policy.DecisionPrompt},
+			Title:  title,
+			Body:   body,
+		})
+		return err
+	}
 }
 
 // ResolveHelperPath finds the touchid binary using the standard
