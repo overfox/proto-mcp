@@ -129,9 +129,10 @@ func readOne(ctx mcp.Context, deps Deps, msgID, format string, refresh bool, max
 	if !refresh {
 		cached, err := deps.Store.GetCachedBody(ctx.Std, msgID)
 		switch {
-		case err == nil && !(meta.HasAttachments && cached.Attachments == nil):
+		case err == nil && (!(meta.HasAttachments && cached.Attachments == nil) || deps.Session == nil):
 			// (A body cached before attachment metadata was kept is
-			// treated as a miss once, so the refetch fills it in.)
+			// treated as a miss once, so the refetch fills it in —
+			// unless there's no session to refetch with.)
 			out.FromCache = true
 			out.CachedAt = cached.CachedAt
 			out.MIMEType = cached.MIMEType
