@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -43,7 +44,10 @@ func mailSaveAttachment(deps Deps) mcp.Tool {
 			"directory param, into a directory inside the attachment_path_allowlist from policy.yaml " +
 			"(useful for saving straight into a project folder a sandboxed client can read). " +
 			"Filename is sanitized (RTL spoofing, control chars, path separators, leading dots stripped). " +
-			"Refuses any other destination. Existing files get a (2), (3), ... suffix rather than " +
+			"Refuses any other destination, hidden directories (.claude, .vscode, ...), AI-agent/IDE config " +
+			"filenames (CLAUDE.md, AGENTS.md, .mcp.json, settings.json, ...) and run-on-open extensions " +
+			"(.command, .app, .webloc, ...). Saved files are tagged with com.apple.quarantine. " +
+			"Existing files get a (2), (3), ... suffix rather than " +
 			"overwriting. On cache miss, fetches + caches first (same path as mail_download_attachment). " +
 			"Touch ID prompt shows the literal filename + target directory.",
 		InputSchema: json.RawMessage(`{
@@ -118,6 +122,13 @@ func mailSaveAttachment(deps Deps) mcp.Tool {
 			if fname == "" || fname == "." || fname == "/" || fname == "\\" {
 				return mcp.ErrorResult("mail_save_attachment: refusing empty / invalid filename %q after sanitization", fname), nil
 			}
+			// Agent/IDE config names (CLAUDE.md, .mcp.json, ...) and
+			// run-on-open extensions (.command, .app, ...) are refused:
+			// Keep Alive can suppress this tool's Touch ID prompt, so
+			// these checks are the compensating control.
+			if err := checkSaveName(fname); err != nil {
+				return mcp.ErrorResult("mail_save_attachment: %v", err), nil
+			}
 
 			// 3. Resolve target directory + verify containment.
 			// Default stays ~/Downloads; an explicit directory must
@@ -144,6 +155,9 @@ func mailSaveAttachment(deps Deps) mcp.Tool {
 			} else if err := os.MkdirAll(rootDir, 0o700); err != nil {
 				return mcp.ErrorResult("mail_save_attachment: mkdir ~/Downloads: %v", err), nil
 			}
+			if err := checkSaveDir(rootDir); err != nil {
+				return mcp.ErrorResult("mail_save_attachment: %v", err), nil
+			}
 			cleanedDest := filepath.Clean(filepath.Join(rootDir, fname))
 			// Parent of cleanedDest must equal rootDir. If
 			// filepath.Clean expanded any "..", the parent diverges
@@ -165,6 +179,12 @@ func mailSaveAttachment(deps Deps) mcp.Tool {
 			if _, err := f.Write(content); err != nil {
 				_ = os.Remove(finalPath)
 				return mcp.ErrorResult("mail_save_attachment: write: %v", err), nil
+			}
+			// Tag it like a browser download so Gatekeeper warns before
+			// anything in it runs. Best-effort: log, don't fail.
+			if qerr := setQuarantine(finalPath); qerr != nil {
+				slog.Warn("mail_save_attachment: could not set quarantine xattr",
+					"path", finalPath, "err", qerr.Error())
 			}
 
 			return mcp.StructuredResult(result{

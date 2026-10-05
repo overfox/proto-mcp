@@ -248,7 +248,7 @@ func (m *Middleware) runTool(ctx context.Context, t Tool, args json.RawMessage, 
 		}
 		// Phase 5/D — per-tool prompt body. Send-family tools build
 		// a literal "To: ... Subject: ..." string so the user reads
-		// exactly what they're approving in the NSAlert.
+		// exactly what they're approving in the Touch ID dialog.
 		title, body := defaultPromptTitle(t.Name), defaultPromptBody(t.Name, args, pol)
 		if t.PromptBody != nil {
 			title, body = t.PromptBody(args)
@@ -319,7 +319,7 @@ type Logger interface {
 // Per-tool PromptBody implementations (in internal/mcptools) MUST
 // also route their output through SanitizePromptText. The send-family
 // builds the recipient list from raw LLM input, so the choke point
-// for the NSAlert content is essential.
+// for the Touch ID dialog content is essential.
 func defaultPromptTitle(tool string) string {
 	return SanitizePromptText("Approve "+tool+"?", 120)
 }
@@ -335,7 +335,7 @@ func defaultPromptBody(tool string, args json.RawMessage, _ *policy.ToolPolicy) 
 }
 
 // SanitizePromptText is the single chokepoint for any text the
-// approval broker is about to feed into NSAlert. SECURITY D21 +
+// approval broker is about to feed into the Touch ID dialog. SECURITY D21 +
 // D23: LLM-supplied content (recipients, subject) routes verbatim
 // into a macOS dialog, exposing the user to:
 //

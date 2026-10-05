@@ -30,15 +30,51 @@ func engineWithAllowlist(t *testing.T, dirs ...string) *policy.Engine {
 	return e
 }
 
-// Empty allowlist (the shipped default) refuses every path attachment.
-func TestPathAttachmentRefusedWithoutAllowlist(t *testing.T) {
-	f := filepath.Join(t.TempDir(), "doc.pdf")
-	if err := os.WriteFile(f, []byte("x"), 0o600); err != nil {
+// fakeHome points $HOME at a fresh temp dir and returns it
+// symlink-resolved (macOS temp dirs live under /var → /private/var).
+func fakeHome(t *testing.T) string {
+	t.Helper()
+	h := t.TempDir()
+	t.Setenv("HOME", h)
+	r, err := filepath.EvalSymlinks(h)
+	if err != nil {
 		t.Fatal(err)
 	}
+	return r
+}
+
+func writeFile(t *testing.T, p, content string) string {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+const needsApprovalMsg = "outside attachment_path_allowlist and needs a Touch ID approval"
+
+// Empty allowlist (the shipped default) + no approval gate: a home
+// file is refused (it would need a Touch ID approval).
+func TestPathAttachmentRefusedWithoutAllowlist(t *testing.T) {
+	home := fakeHome(t)
+	f := writeFile(t, filepath.Join(home, "Documents", "doc.pdf"), "x")
 	_, err := decodeAndValidateAttachments(Deps{}, []sendAttachmentInput{{Path: f}})
-	if err == nil || !strings.Contains(err.Error(), "attachment_path_allowlist is empty") {
-		t.Fatalf("err = %v, want empty-allowlist refusal", err)
+	if err == nil || !strings.Contains(err.Error(), needsApprovalMsg) {
+		t.Fatalf("err = %v, want needs-approval refusal", err)
+	}
+}
+
+// Paths outside $HOME and /Volumes are refused outright.
+func TestPathAttachmentOutsideHomeRefused(t *testing.T) {
+	fakeHome(t)
+	f := writeFile(t, filepath.Join(t.TempDir(), "doc.pdf"), "x")
+	approve := func([]resolvedAttachmentPath) error { return nil }
+	_, err := decodeAttachmentsGated(Deps{}, []sendAttachmentInput{{Path: f}}, approve)
+	if err == nil || !strings.Contains(err.Error(), "outside your home folder and /Volumes") {
+		t.Fatalf("err = %v, want outside-home refusal", err)
 	}
 }
 
@@ -60,40 +96,39 @@ func TestPathAttachmentHappyPath(t *testing.T) {
 	}
 }
 
-// A path outside every allowlisted dir is refused, including the
-// string-prefix trick (/allowed-evil vs /allowed).
+// A path outside every allowlisted dir isn't silently granted,
+// including the string-prefix trick (/allowed-evil vs /allowed): it
+// falls to the needs-approval tier.
 func TestPathAttachmentOutsideAllowlist(t *testing.T) {
-	dir := t.TempDir()
-	evil := dir + "-evil"
-	if err := os.MkdirAll(evil, 0o700); err != nil {
+	home := fakeHome(t)
+	dir := filepath.Join(home, "allowed")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	f := filepath.Join(evil, "secret.txt")
-	if err := os.WriteFile(f, []byte("secret"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	f := writeFile(t, filepath.Join(home, "allowed-evil", "secret.txt"), "secret")
 	deps := Deps{Policy: engineWithAllowlist(t, dir)}
 	_, err := decodeAndValidateAttachments(deps, []sendAttachmentInput{{Path: f}})
-	if err == nil || !strings.Contains(err.Error(), "outside attachment_path_allowlist") {
-		t.Fatalf("err = %v, want outside-allowlist refusal", err)
+	if err == nil || !strings.Contains(err.Error(), needsApprovalMsg) {
+		t.Fatalf("err = %v, want needs-approval refusal", err)
 	}
 }
 
 // A symlink planted inside the allowlisted dir pointing outside it
-// must not grant access to the target.
+// must not grant silent access to the target.
 func TestPathAttachmentSymlinkEscape(t *testing.T) {
-	dir := t.TempDir()
-	outside := filepath.Join(t.TempDir(), "ssh_key")
-	if err := os.WriteFile(outside, []byte("PRIVATE"), 0o600); err != nil {
+	home := fakeHome(t)
+	dir := filepath.Join(home, "allowed")
+	outside := writeFile(t, filepath.Join(home, "Private", "notes.txt"), "PRIVATE")
+	link := filepath.Join(dir, "innocent.pdf")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	link := filepath.Join(dir, "innocent.pdf")
 	if err := os.Symlink(outside, link); err != nil {
 		t.Fatal(err)
 	}
 	deps := Deps{Policy: engineWithAllowlist(t, dir)}
 	_, err := decodeAndValidateAttachments(deps, []sendAttachmentInput{{Path: link}})
-	if err == nil || !strings.Contains(err.Error(), "outside attachment_path_allowlist") {
+	if err == nil || !strings.Contains(err.Error(), needsApprovalMsg) {
 		t.Fatalf("err = %v, want symlink-escape refusal", err)
 	}
 }

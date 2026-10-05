@@ -6,14 +6,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"net/mail"
+	"regexp"
+	"sort"
 	"strings"
+	"time"
 
 	gpa "github.com/ProtonMail/go-proton-api"
 	"github.com/ProtonMail/gopenpgp/v2/crypto"
 
 	"github.com/just-an-oldsalt/proto-mcp/internal/mcp"
 	"github.com/just-an-oldsalt/proto-mcp/internal/policy"
+	"github.com/just-an-oldsalt/proto-mcp/internal/sanitize"
 )
 
 // decodeBase64 is a thin wrapper for clarity at call sites that
@@ -26,15 +31,18 @@ func decodeBase64(s string) ([]byte, error) {
 //
 //	mail_send         — compose + send (new draft → send → done)
 //	mail_send_draft   — send an existing draft (mail_draft_create → send later)
-//	mail_reply        — reply to one message; To = original sender
-//	mail_reply_all    — reply to all; CC = original To+CC minus self
-//	mail_forward      — forward; new To list, body prefixed with quote header
+//	mail_reply        — reply to one message; To = original sender (+ extra_to / cc)
+//	mail_reply_all    — reply to all; CC = original To+CC minus self (+ extra_to / cc)
+//	mail_forward      — forward; new To list, optional quoted original
 //
-// All five are decision:prompt + confirm:true in default.yaml. The
-// Touch-ID prompt + NSAlert literal-recipient body fires before any
-// network call. allowed_recipients and rate_limit enforcement happen
-// in the MCP middleware between policy and broker (see
-// internal/mcp/middleware.go).
+// All five are decision:prompt + ttl:0 in default.yaml (the send floor
+// forbids weakening that). The single Touch ID dialog shows recipients,
+// subject, a body excerpt and every attachment (send_prompt.go) before
+// any network call, and the handler refuses to send anything other than
+// what that dialog showed (sendLedger). allowed_recipients and
+// rate_limit enforcement happen in the MCP middleware between policy
+// and broker (see internal/mcp/middleware.go), and allowed_recipients is
+// re-checked in finalizeSend against the final recipient list.
 
 // sendInput is the public shape for mail_send. Reply / reply_all /
 // forward use variants that reference an existing message_id.
@@ -55,17 +63,23 @@ type sendResult struct {
 	Sent       bool     `json:"sent"`
 }
 
+// sendDialogNote is appended to every send tool description.
+const sendDialogNote = " The Touch ID dialog shown before sending lists every recipient (flagging " +
+	"addresses outside your own domains as external), the subject, the start of the body, and every " +
+	"attachment with its size; the send is refused if what would be sent differs from what the dialog showed."
+
 func mailSend(deps Deps) mcp.Tool {
 	return mcp.Tool{
 		Name: "mail_send",
 		Description: "Compose and send a message in one step. IRREVERSIBLE — once sent, " +
 			"it cannot be unsent. Optional `attachments` array uploads files alongside " +
-			"the body (each entry: filename, mime_type, content_b64). Refuses individual " +
+			"the body (each entry: filename + content_b64, or an absolute host `path`). Paths inside " +
+			"attachment_path_allowlist attach as-is; any other file under the user's home folder or " +
+			"/Volumes is allowed but its full path is listed in the send dialog. Paths inside a " +
+			"Cowork/VM sandbox (/sessions/..., /mnt/...) are not host paths. Refuses individual " +
 			"or cumulative attachment sizes exceeding max_attachment_bytes (default 25 MiB). " +
 			"Refuses PGP/MIME-encrypted external recipients — send to a Proton address or " +
-			"a recipient without an on-file PGP key instead. The NSAlert shown before " +
-			"Touch ID approval lists every recipient, the literal subject, and a one-line " +
-			"attachment summary.",
+			"a recipient without an on-file PGP key instead." + sendDialogNote,
 		InputSchema: json.RawMessage(`{
 			"type": "object",
 			"properties": {
@@ -92,7 +106,8 @@ func mailSend(deps Deps) mcp.Tool {
 				return nil, mcp.NewError(mcp.CodeInvalidParams,
 					"mail_send: subject and at least one to recipient are required")
 			}
-			return sendCompose(ctx, deps, "mail_send", "", in)
+			entry, have := sendLedger.take("mail_send", raw)
+			return sendCompose(ctx, deps, "mail_send", "", in, ledgerGate(entry, have))
 		},
 	}
 }
@@ -102,8 +117,11 @@ func mailSendDraft(deps Deps) mcp.Tool {
 		DraftID string `json:"draft_id"`
 	}
 	return mcp.Tool{
-		Name:        "mail_send_draft",
-		Description: "Send an existing draft. IRREVERSIBLE. Recipients and subject come from the draft itself; the NSAlert reads them back so the user verifies.",
+		Name: "mail_send_draft",
+		Description: "Send an existing draft. IRREVERSIBLE. Recipients, subject, body and attachments come " +
+			"from the draft itself and are read back in the Touch ID dialog. If the draft can't be loaded " +
+			"for the dialog, or it is changed (e.g. by mail_draft_update) after the dialog was shown, the " +
+			"send is refused." + sendDialogNote,
 		InputSchema: json.RawMessage(`{
 			"type": "object",
 			"properties": {"draft_id": {"type": "string"}},
@@ -120,14 +138,22 @@ func mailSendDraft(deps Deps) mcp.Tool {
 		PromptBody: func(args json.RawMessage) (string, string) {
 			var in input
 			_ = json.Unmarshal(args, &in)
-			body := "Send draft " + sanitizeField(in.DraftID)
-			if recips := lookupDraftRecipients(deps, in.DraftID); recips != "" {
-				body += "\n" + recips
-			} else {
-				body += " to its stored recipients (could not resolve addresses for display)."
+			title := mcp.SanitizePromptText("Approve mail_send_draft?", 120)
+			ctx, cancel := context.WithTimeout(context.Background(), promptServerFetch)
+			defer cancel()
+			draft, plain, err := fetchDraftPlain(ctx, deps, in.DraftID)
+			if err != nil {
+				reason := "could not load draft " + shortID(in.DraftID) + ": " + err.Error()
+				sendLedger.record("mail_send_draft", args, sendApproval{failure: reason})
+				return title, formatSendPrompt(deps, sendPromptSpec{
+					Action:   "Send draft",
+					Tool:     "mail_send_draft",
+					Subject:  "(unknown)",
+					Warnings: []string{"COULD NOT LOAD THE DRAFT — approving will NOT send it (" + clipRunes(err.Error(), 100) + ")"},
+				})
 			}
-			return mcp.SanitizePromptText("Approve mail_send_draft?", 120),
-				mcp.SanitizePromptText(body, 4000)
+			sendLedger.record("mail_send_draft", args, sendApproval{draftDigest: draftDigest(draft, plain)})
+			return title, formatSendPrompt(deps, draftPromptSpec(draft, plain))
 		},
 		Handler: func(ctx mcp.Context, raw json.RawMessage) (*mcp.ToolResult, error) {
 			var in input
@@ -137,122 +163,226 @@ func mailSendDraft(deps Deps) mcp.Tool {
 			if in.DraftID == "" {
 				return nil, mcp.NewError(mcp.CodeInvalidParams, "mail_send_draft: draft_id is required")
 			}
-			return sendDraftByID(ctx, deps, "mail_send_draft", in.DraftID)
+			entry, have := sendLedger.take("mail_send_draft", raw)
+			if !have {
+				return mcp.ErrorResult("mail_send_draft refused: %s", errNoApprovalRecord), nil
+			}
+			if entry.failure != "" {
+				return mcp.ErrorResult("mail_send_draft refused: the approval dialog could not show the draft (%s); "+
+					"nothing was sent", entry.failure), nil
+			}
+			return sendDraftByID(ctx, deps, "mail_send_draft", in.DraftID, entry.draftDigest)
 		},
 	}
 }
 
-func mailReply(deps Deps) mcp.Tool {
-	type input struct {
-		InReplyTo   string                `json:"in_reply_to"`
-		BodyText    string                `json:"body_text,omitempty"`
-		BodyHTML    string                `json:"body_html,omitempty"`
-		Attachments []sendAttachmentInput `json:"attachments,omitempty"`
+// replyInput is the shared input for mail_reply / mail_reply_all.
+// ExtraTo / CC add recipients on top of the ones derived from the
+// parent message.
+type replyInput struct {
+	InReplyTo   string                `json:"in_reply_to"`
+	ExtraTo     []string              `json:"extra_to,omitempty"`
+	CC          []string              `json:"cc,omitempty"`
+	BodyText    string                `json:"body_text,omitempty"`
+	BodyHTML    string                `json:"body_html,omitempty"`
+	Attachments []sendAttachmentInput `json:"attachments,omitempty"`
+}
+
+const replyInputSchema = `{
+	"type": "object",
+	"properties": {
+		"in_reply_to": {"type": "string"},
+		"extra_to":    {"type": "array", "items": {"type": "string"}, "description": "Additional To recipients beyond the ones derived from the original message."},
+		"cc":          {"type": "array", "items": {"type": "string"}, "description": "Additional CC recipients."},
+		"body_text":   {"type": "string"},
+		"body_html":   {"type": "string"},
+		"attachments": ` + attachmentInputSchemaFragment + `
+	},
+	"required": ["in_reply_to"],
+	"additionalProperties": false
+}`
+
+// extractReplyRecipients exposes the args-resident reply recipients
+// (extra_to + cc) to the middleware allowlist stage. Parent-derived
+// recipients are checked in finalizeSend.
+func extractReplyRecipients(args json.RawMessage) []string {
+	var in replyInput
+	if err := json.Unmarshal(args, &in); err != nil {
+		return nil
 	}
+	var out []string
+	for _, entry := range append(append([]string{}, in.ExtraTo...), in.CC...) {
+		out = append(out, normalizeRecipientList(entry)...)
+	}
+	return out
+}
+
+func mailReply(deps Deps) mcp.Tool {
 	return mcp.Tool{
 		Name: "mail_reply",
-		Description: "Reply to a message. IRREVERSIBLE once sent. To = original sender. " +
+		Description: "Reply to a message. IRREVERSIBLE once sent. To = original sender, plus any " +
+			"`extra_to` addresses; optional `cc` adds CC recipients. " +
 			"Subject prefixed Re: if not already. Optional `attachments` array attaches " +
-			"new files (does NOT carry over parent attachments — use mail_forward for that).",
-		InputSchema: json.RawMessage(`{
-			"type": "object",
-			"properties": {
-				"in_reply_to": {"type": "string"},
-				"body_text":   {"type": "string"},
-				"body_html":   {"type": "string"},
-				"attachments": ` + attachmentInputSchemaFragment + `
-			},
-			"required": ["in_reply_to"],
-			"additionalProperties": false
-		}`),
+			"new files (does NOT carry over parent attachments — use mail_forward for that)." + sendDialogNote,
+		InputSchema:  json.RawMessage(replyInputSchema),
 		OutputSchema: json.RawMessage(sendResultSchema),
-		// For reply, the recipient comes from the original message
-		// — needs a network fetch to extract. Skip server-side
-		// allowlist check; the handler validates before SendDraft.
-		Recipients: nil,
-		PromptBody: func(args json.RawMessage) (string, string) {
-			var in input
-			_ = json.Unmarshal(args, &in)
-			body := "Reply to message " + sanitizeField(in.InReplyTo)
-			if recips := lookupReplyRecipients(deps, in.InReplyTo, false); recips != "" {
-				body += "\n" + recips
-			} else {
-				body += " (recipient = original sender)."
-			}
-			if decoded, err := decodeAndValidateAttachments(deps, in.Attachments); err == nil {
-				if s := attachmentsSummary(decoded); s != "" {
-					body += "\n" + s
-				}
-			}
-			return mcp.SanitizePromptText("Approve mail_reply?", 120),
-				mcp.SanitizePromptText(body, 4000)
-		},
-		Handler: func(ctx mcp.Context, raw json.RawMessage) (*mcp.ToolResult, error) {
-			var in input
-			if err := json.Unmarshal(raw, &in); err != nil {
-				return nil, mcp.NewError(mcp.CodeInvalidParams, "mail_reply: "+err.Error())
-			}
-			if in.InReplyTo == "" {
-				return nil, mcp.NewError(mcp.CodeInvalidParams, "mail_reply: in_reply_to is required")
-			}
-			return sendReply(ctx, deps, "mail_reply", in.InReplyTo, false, in.BodyText, in.BodyHTML, in.Attachments)
-		},
+		Recipients:   extractReplyRecipients,
+		PromptBody:   replyPromptBody(deps, "mail_reply", false),
+		Handler:      replyHandler(deps, "mail_reply", false),
 	}
 }
 
 func mailReplyAll(deps Deps) mcp.Tool {
-	type input struct {
-		InReplyTo   string                `json:"in_reply_to"`
-		BodyText    string                `json:"body_text,omitempty"`
-		BodyHTML    string                `json:"body_html,omitempty"`
-		Attachments []sendAttachmentInput `json:"attachments,omitempty"`
-	}
 	return mcp.Tool{
 		Name: "mail_reply_all",
 		Description: "Reply-all to a message. IRREVERSIBLE. " +
-			"To = original sender. CC = original To+CC minus your own addresses. " +
+			"To = original sender (+ `extra_to`). CC = original To+CC minus your own addresses (+ `cc`). " +
 			"BCC dropped (BCC by definition not visible to other recipients). " +
-			"Optional `attachments` array — same shape as mail_send.",
-		InputSchema: json.RawMessage(`{
-			"type": "object",
-			"properties": {
-				"in_reply_to": {"type": "string"},
-				"body_text":   {"type": "string"},
-				"body_html":   {"type": "string"},
-				"attachments": ` + attachmentInputSchemaFragment + `
-			},
-			"required": ["in_reply_to"],
-			"additionalProperties": false
-		}`),
+			"Optional `attachments` array — same shape as mail_send." + sendDialogNote,
+		InputSchema:  json.RawMessage(replyInputSchema),
 		OutputSchema: json.RawMessage(sendResultSchema),
-		Recipients:   nil,
-		PromptBody: func(args json.RawMessage) (string, string) {
-			var in input
-			_ = json.Unmarshal(args, &in)
-			body := "Reply-all to message " + sanitizeField(in.InReplyTo)
-			if recips := lookupReplyRecipients(deps, in.InReplyTo, true); recips != "" {
-				body += "\n" + recips
-			} else {
-				body += " (sender + original To/CC minus you)."
+		Recipients:   extractReplyRecipients,
+		PromptBody:   replyPromptBody(deps, "mail_reply_all", true),
+		Handler:      replyHandler(deps, "mail_reply_all", true),
+	}
+}
+
+// replyParent is the subset of a parent message a reply needs.
+type replyParent struct {
+	Sender  string
+	To, CC  []string
+	Subject string
+}
+
+func replyParentFromMessage(m gpa.Message) replyParent {
+	p := replyParent{To: addressStrings(m.ToList), CC: addressStrings(m.CCList), Subject: m.Subject}
+	if m.Sender != nil {
+		p.Sender = m.Sender.Address
+	}
+	return p
+}
+
+// lookupReplyParent resolves the parent for the reply dialog: the
+// server first (the same source the handler uses), else the local
+// mirror. ok=false when neither can answer.
+func lookupReplyParent(deps Deps, messageID string) (replyParent, bool) {
+	if messageID == "" {
+		return replyParent{}, false
+	}
+	if deps.Session != nil && deps.Session.Client != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), promptServerFetch)
+		m, err := deps.Session.Client.GetMessage(ctx, messageID)
+		cancel()
+		if err == nil {
+			return replyParentFromMessage(m), true
+		}
+	}
+	if deps.Store != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), promptLookupTimeout)
+		defer cancel()
+		m, err := deps.Store.GetMessage(ctx, messageID)
+		if err == nil && m.FromAddress != "" {
+			return replyParent{
+				Sender:  m.FromAddress,
+				To:      addressesFromJSON(m.ToJSON),
+				CC:      addressesFromJSON(m.CcJSON),
+				Subject: m.Subject,
+			}, true
+		}
+	}
+	return replyParent{}, false
+}
+
+// replyRecipients computes who a reply goes to. Shared by the dialog
+// and the handler so the two can be compared exactly.
+func replyRecipients(p replyParent, self []string, replyAll bool, extraTo, extraCC []string) (to, cc []string) {
+	seen := map[string]bool{}
+	add := func(list *[]string, addr string, skipSelf bool) {
+		key := strings.ToLower(strings.TrimSpace(addr))
+		if key == "" || seen[key] || (skipSelf && contains(self, key)) {
+			return
+		}
+		seen[key] = true
+		*list = append(*list, addr)
+	}
+	add(&to, p.Sender, false)
+	for _, a := range extraTo {
+		add(&to, a, false)
+	}
+	if replyAll {
+		for _, a := range append(append([]string{}, p.To...), p.CC...) {
+			add(&cc, a, true)
+		}
+	}
+	for _, a := range extraCC {
+		add(&cc, a, false)
+	}
+	return to, cc
+}
+
+func replySubject(s string) string {
+	if !strings.HasPrefix(strings.ToLower(s), "re:") {
+		return "Re: " + s
+	}
+	return s
+}
+
+func replyPromptBody(deps Deps, tool string, replyAll bool) func(json.RawMessage) (string, string) {
+	return func(args json.RawMessage) (string, string) {
+		var in replyInput
+		_ = json.Unmarshal(args, &in)
+		spec := sendPromptSpec{Action: "Reply", Tool: tool, BodyText: in.BodyText, BodyHTML: in.BodyHTML}
+		if replyAll {
+			spec.Action = "Reply-all"
+		}
+		var rec sendApproval
+		if p, ok := lookupReplyParent(deps, in.InReplyTo); ok {
+			spec.To, spec.CC = replyRecipients(p, selfAddresses(deps), replyAll, in.ExtraTo, in.CC)
+			spec.Subject = replySubject(p.Subject)
+			rec.recipients = recipientSet(spec.To, spec.CC)
+		} else {
+			rec.failure = "could not resolve original message " + shortID(in.InReplyTo)
+			spec.Warnings = append(spec.Warnings,
+				"COULD NOT RESOLVE THE ORIGINAL MESSAGE — approving will NOT send")
+			spec.To, spec.CC = in.ExtraTo, in.CC
+			spec.Subject = "(unknown)"
+		}
+		for _, a := range append(append([]string{}, in.ExtraTo...), in.CC...) {
+			if err := ensureValidEmail(a); err != nil {
+				spec.Warnings = append(spec.Warnings, "invalid address "+clipRunes(a, 60)+" — the call will be refused")
 			}
-			if decoded, err := decodeAndValidateAttachments(deps, in.Attachments); err == nil {
-				if s := attachmentsSummary(decoded); s != "" {
-					body += "\n" + s
-				}
+		}
+		var outside []string
+		spec.Attachments, outside = describeAttachments(deps, in.Attachments)
+		rec.outsidePaths = pathSet(outside)
+		sendLedger.record(tool, args, rec)
+		return mcp.SanitizePromptText("Approve "+tool+"?", 120), formatSendPrompt(deps, spec)
+	}
+}
+
+func replyHandler(deps Deps, tool string, replyAll bool) mcp.Handler {
+	return func(ctx mcp.Context, raw json.RawMessage) (*mcp.ToolResult, error) {
+		var in replyInput
+		if err := json.Unmarshal(raw, &in); err != nil {
+			return nil, mcp.NewError(mcp.CodeInvalidParams, tool+": "+err.Error())
+		}
+		if in.InReplyTo == "" {
+			return nil, mcp.NewError(mcp.CodeInvalidParams, tool+": in_reply_to is required")
+		}
+		for _, a := range append(append([]string{}, in.ExtraTo...), in.CC...) {
+			if err := ensureValidEmail(a); err != nil {
+				return nil, mcp.NewError(mcp.CodeInvalidParams, tool+": "+err.Error())
 			}
-			return mcp.SanitizePromptText("Approve mail_reply_all?", 120),
-				mcp.SanitizePromptText(body, 4000)
-		},
-		Handler: func(ctx mcp.Context, raw json.RawMessage) (*mcp.ToolResult, error) {
-			var in input
-			if err := json.Unmarshal(raw, &in); err != nil {
-				return nil, mcp.NewError(mcp.CodeInvalidParams, "mail_reply_all: "+err.Error())
-			}
-			if in.InReplyTo == "" {
-				return nil, mcp.NewError(mcp.CodeInvalidParams, "mail_reply_all: in_reply_to is required")
-			}
-			return sendReply(ctx, deps, "mail_reply_all", in.InReplyTo, true, in.BodyText, in.BodyHTML, in.Attachments)
-		},
+		}
+		entry, have := sendLedger.take(tool, raw)
+		if !have {
+			return mcp.ErrorResult("%s refused: %s", tool, errNoApprovalRecord), nil
+		}
+		if entry.failure != "" {
+			return mcp.ErrorResult("%s refused: the approval dialog could not show the recipients (%s); "+
+				"nothing was sent", tool, entry.failure), nil
+		}
+		return sendReply(ctx, deps, tool, in, replyAll, entry)
 	}
 }
 
@@ -260,12 +390,13 @@ func mailForward(deps Deps) mcp.Tool {
 	return mcp.Tool{
 		Name: "mail_forward",
 		Description: "Forward a message to new recipients. IRREVERSIBLE. " +
-			"Subject prefixed Fwd:. Body is the new content; the original message " +
-			"is NOT quoted automatically — pass it as part of body_text if desired. " +
+			"Subject prefixed Fwd:. Body is the new content; set `include_original: true` to append " +
+			"the standard quoted original (From/Date/Subject/To/Cc header block + the original's text body). " +
 			"Optional `attachments` array attaches new files. Set " +
 			"`include_parent_attachments: true` to carry over the parent message's " +
 			"attachments via re-encrypted session keys (no byte-level round-trip; " +
-			"the server keeps the encrypted bytes and just re-keys for the new draft).",
+			"the server keeps the encrypted bytes and just re-keys for the new draft); " +
+			"they are listed in the send dialog." + sendDialogNote,
 		InputSchema: json.RawMessage(`{
 			"type": "object",
 			"properties": {
@@ -276,7 +407,8 @@ func mailForward(deps Deps) mcp.Tool {
 				"body_text":                  {"type": "string"},
 				"body_html":                  {"type": "string"},
 				"attachments":                ` + attachmentInputSchemaFragment + `,
-				"include_parent_attachments": {"type": "boolean", "default": false}
+				"include_parent_attachments": {"type": "boolean", "default": false},
+				"include_original":           {"type": "boolean", "default": false, "description": "Append the quoted original message (header block + text body) below body."}
 			},
 			"required": ["forward_of", "to"],
 			"additionalProperties": false
@@ -287,24 +419,13 @@ func mailForward(deps Deps) mcp.Tool {
 			if err := json.Unmarshal(args, &in); err != nil {
 				return nil
 			}
-			return append(append(append([]string{}, in.To...), in.CC...), in.BCC...)
-		},
-		PromptBody: func(args json.RawMessage) (string, string) {
-			var in forwardInput
-			_ = json.Unmarshal(args, &in)
-			body := fmt.Sprintf("Forward message %s\nTo: %s\nCC: %s\nBCC: %s",
-				sanitizeField(in.ForwardOf),
-				joinAddrs(in.To),
-				joinAddrs(in.CC),
-				joinAddrs(in.BCC))
-			if decoded, err := decodeAndValidateAttachments(deps, in.Attachments); err == nil {
-				if s := attachmentsSummary(decoded); s != "" {
-					body += "\n" + s
-				}
+			var out []string
+			for _, entry := range append(append(append([]string{}, in.To...), in.CC...), in.BCC...) {
+				out = append(out, normalizeRecipientList(entry)...)
 			}
-			return mcp.SanitizePromptText("Approve mail_forward?", 120),
-				mcp.SanitizePromptText(body, 4000)
+			return out
 		},
+		PromptBody: forwardPromptBody(deps),
 		Handler: func(ctx mcp.Context, raw json.RawMessage) (*mcp.ToolResult, error) {
 			var in forwardInput
 			if err := json.Unmarshal(raw, &in); err != nil {
@@ -314,9 +435,75 @@ func mailForward(deps Deps) mcp.Tool {
 				return nil, mcp.NewError(mcp.CodeInvalidParams,
 					"mail_forward: forward_of and at least one to recipient are required")
 			}
-			return sendForward(ctx, deps, in)
+			entry, have := sendLedger.take("mail_forward", raw)
+			if have && entry.failure != "" {
+				return mcp.ErrorResult("mail_forward refused: the approval dialog could not show the forwarded "+
+					"attachments (%s); nothing was sent", entry.failure), nil
+			}
+			return sendForward(ctx, deps, in, entry, have)
 		},
 	}
+}
+
+func forwardPromptBody(deps Deps) func(json.RawMessage) (string, string) {
+	return func(args json.RawMessage) (string, string) {
+		var in forwardInput
+		_ = json.Unmarshal(args, &in)
+		spec := sendPromptSpec{
+			Action: "Forward", Tool: "mail_forward",
+			To: in.To, CC: in.CC, BCC: in.BCC,
+			BodyText: in.BodyText, BodyHTML: in.BodyHTML,
+		}
+		var rec sendApproval
+
+		var parent *gpa.Message
+		if deps.Session != nil && deps.Session.Client != nil && in.ForwardOf != "" {
+			ctx, cancel := context.WithTimeout(context.Background(), promptServerFetch)
+			if m, err := deps.Session.Client.GetMessage(ctx, in.ForwardOf); err == nil {
+				parent = &m
+			}
+			cancel()
+		}
+		if parent != nil {
+			spec.Subject = forwardSubject(parent.Subject)
+		} else {
+			spec.Subject = "Fwd: " + lookupSubject(deps, in.ForwardOf)
+		}
+		if in.IncludeOriginal {
+			from := ""
+			if parent != nil && parent.Sender != nil {
+				from = " from " + parent.Sender.Address
+			}
+			spec.BodySuffix = "+ quoted original message" + from
+		}
+		if in.IncludeParentAttachments {
+			if parent == nil {
+				rec.failure = "could not load the original message to list its attachments"
+				spec.Warnings = append(spec.Warnings,
+					"COULD NOT LIST THE ORIGINAL'S ATTACHMENTS — approving will NOT send")
+			} else {
+				for _, a := range parent.Attachments {
+					spec.Attachments = append(spec.Attachments, promptAttachment{
+						Name: sanitize.Filename(a.Name), Size: a.Size, Parent: true,
+					})
+					rec.parentAttachmentIDs = append(rec.parentAttachmentIDs, a.ID)
+				}
+				sort.Strings(rec.parentAttachmentIDs)
+			}
+		}
+		newAtts, outside := describeAttachments(deps, in.Attachments)
+		spec.Attachments = append(spec.Attachments, newAtts...)
+		rec.outsidePaths = pathSet(outside)
+		sendLedger.record("mail_forward", args, rec)
+		return mcp.SanitizePromptText("Approve mail_forward?", 120), formatSendPrompt(deps, spec)
+	}
+}
+
+func forwardSubject(s string) string {
+	if !strings.HasPrefix(strings.ToLower(s), "fwd:") {
+		return "Fwd: " + s
+	}
+	return s
 }
 
 // forwardInput is the parsed input for mail_forward. Hoisted to the
@@ -327,7 +514,7 @@ func mailForward(deps Deps) mcp.Tool {
 // carries the parent message's attachments over to the new draft
 // without a byte-round-trip via CreateDraftReq.AttachmentKeyPackets.
 // Any explicit `attachments` provided on the input get uploaded
-// alongside.
+// alongside. IncludeOriginal appends the quoted original body.
 type forwardInput struct {
 	ForwardOf                string                `json:"forward_of"`
 	To                       []string              `json:"to"`
@@ -337,6 +524,7 @@ type forwardInput struct {
 	BodyHTML                 string                `json:"body_html,omitempty"`
 	Attachments              []sendAttachmentInput `json:"attachments,omitempty"`
 	IncludeParentAttachments bool                  `json:"include_parent_attachments,omitempty"`
+	IncludeOriginal          bool                  `json:"include_original,omitempty"`
 }
 
 // ============================================================
@@ -394,48 +582,33 @@ func normalizeRecipientList(s string) []string {
 	return out
 }
 
-// sendPromptBody returns a PromptBody func that formats the literal
-// To / CC / BCC / Subject lines the user sees in the NSAlert.
-// Body content is replaced with sha256+bytes via the redact path
-// — recipient list, subject, and counts are what matter at approval
-// time. Phase 8/B — also appends an attachment summary line when
-// the call carries attachments.
-func sendPromptBody(toolName string) func(json.RawMessage) (string, string) {
-	return sendPromptBodyWithDeps(Deps{}, toolName)
-}
-
-// sendPromptBodyWithDeps is the Phase 8/B variant — passes Deps so
-// the closure can validate + summarize the attachments list for
-// display. Validation errors are swallowed (the handler will
-// surface them with a better message); the closure best-efforts
-// the prompt-body fields and lets the user approve based on what
-// did parse.
+// sendPromptBodyWithDeps returns mail_send's PromptBody: recipients,
+// subject, body excerpt and every attachment (send_prompt.go), and
+// records the out-of-allowlist paths it listed for the handler.
 func sendPromptBodyWithDeps(deps Deps, toolName string) func(json.RawMessage) (string, string) {
 	return func(args json.RawMessage) (string, string) {
 		var in sendInput
 		_ = json.Unmarshal(args, &in)
-		body := fmt.Sprintf(
-			"To: %s\nCC: %s\nBCC: %s\nSubject: %s",
-			joinAddrs(in.To),
-			joinAddrs(in.CC),
-			joinAddrs(in.BCC),
-			sanitizeField(in.Subject),
-		)
-		if decoded, err := decodeAndValidateAttachments(deps, in.Attachments); err == nil {
-			if s := attachmentsSummary(decoded); s != "" {
-				body += "\n" + s
-			}
+		spec := sendPromptSpec{
+			Action: "Send", Tool: toolName,
+			To: in.To, CC: in.CC, BCC: in.BCC,
+			Subject:  in.Subject,
+			BodyText: in.BodyText, BodyHTML: in.BodyHTML,
 		}
-		return mcp.SanitizePromptText("Approve "+toolName+"?", 120),
-			mcp.SanitizePromptText(body, 4000)
+		var outside []string
+		spec.Attachments, outside = describeAttachments(deps, in.Attachments)
+		sendLedger.record(toolName, args, sendApproval{outsidePaths: pathSet(outside)})
+		return mcp.SanitizePromptText("Approve "+toolName+"?", 120), formatSendPrompt(deps, spec)
 	}
 }
 
 // sendCompose is mail_send: create a draft, send it, return.
 // Phase 8/B — uploads attachments to the draft between CreateDraft
-// and SendDraft so they ride on the same send call.
-func sendCompose(ctx mcp.Context, deps Deps, toolName, parentID string, in sendInput) (*mcp.ToolResult, error) {
-	decoded, err := decodeAndValidateAttachments(deps, in.Attachments)
+// and SendDraft so they ride on the same send call. gate approves
+// out-of-allowlist path attachments (send family: they must have been
+// listed in the approved dialog).
+func sendCompose(ctx mcp.Context, deps Deps, toolName, parentID string, in sendInput, gate attachmentGate) (*mcp.ToolResult, error) {
+	decoded, err := decodeAttachmentsGated(deps, in.Attachments, gate)
 	if err != nil {
 		return mcp.ErrorResult("%s: %v", toolName, err), nil
 	}
@@ -462,16 +635,33 @@ func sendCompose(ctx mcp.Context, deps Deps, toolName, parentID string, in sendI
 	return finalizeSend(ctx, deps, toolName, addrKR, draft, tpl, mimeType, allRecipients(in.To, in.CC, in.BCC), attKeys)
 }
 
-// sendDraftByID is mail_send_draft: load draft, send.
+// sendDraftByID is mail_send_draft: load draft, verify it is the draft
+// the user approved, send.
+//
+// Draft-swap protection: the dialog fetched the draft and recorded
+// draftDigest(recipients, subject, MIME type, decrypted body,
+// attachment IDs). A mail_draft_update landing between the dialog and
+// this fetch would change what gets sent, so the digest is recomputed
+// here and any difference refuses the send.
 //
 // Phase 8/B — existing draft attachments are already uploaded to
 // the server; we just need to recover their session keys via the
 // sender keyring so AddTextPackage can re-encrypt them per
 // recipient. No new upload, no attachment input on this tool.
-func sendDraftByID(ctx mcp.Context, deps Deps, toolName, draftID string) (*mcp.ToolResult, error) {
-	draft, err := deps.Session.Client.GetMessage(ctx.Std, draftID)
+func sendDraftByID(ctx mcp.Context, deps Deps, toolName, draftID, approvedDigest string) (*mcp.ToolResult, error) {
+	// PROTO-125: draft.Body is armored CIPHERTEXT (CreateDraft encrypted
+	// it to us). finalizeSend → AddTextPackage treats its body argument
+	// as PLAINTEXT and encrypts it again — double-encrypting the message
+	// into garbage. fetchDraftPlain decrypts it back to the original
+	// plaintext so the send path encrypts it exactly once.
+	draft, plainBody, err := fetchDraftPlain(ctx.Std, deps, draftID)
 	if err != nil {
-		return mcp.ErrorResult("%s: fetch draft: %v", toolName, err), nil
+		return mcp.ErrorResult("%s: %v", toolName, err), nil
+	}
+	if approvedDigest == "" || draftDigest(draft, plainBody) != approvedDigest {
+		return mcp.ErrorResult("%s refused: the draft changed after you approved it (recipients, subject, "+
+			"body or attachments differ from what the Touch ID dialog showed); nothing was sent — "+
+			"call mail_send_draft again to review the current draft", toolName), nil
 	}
 	_, addrKR, err := senderKeyring(deps)
 	if err != nil {
@@ -486,15 +676,6 @@ func sendDraftByID(ctx mcp.Context, deps Deps, toolName, draftID string) (*mcp.T
 		addressStrings(draft.CCList),
 		addressStrings(draft.BCCList),
 	)
-	// PROTO-125: draft.Body is armored CIPHERTEXT (CreateDraft encrypted
-	// it to us). finalizeSend → AddTextPackage treats its body argument
-	// as PLAINTEXT and encrypts it again — double-encrypting the message
-	// into garbage. Decrypt it back to the original plaintext so the send
-	// path encrypts it exactly once, identical to the mail_send flow.
-	plainBody, err := decryptDraftBody(addrKR, draft.Body)
-	if err != nil {
-		return mcp.ErrorResult("%s: decrypt draft body: %v", toolName, err), nil
-	}
 	tpl := gpa.DraftTemplate{
 		Subject:  draft.Subject,
 		Sender:   draft.Sender,
@@ -542,83 +723,95 @@ func recoverDraftAttachmentKeys(addrKR *crypto.KeyRing, draft gpa.Message) (map[
 }
 
 // sendReply is the reply / reply_all body. Fetches the original,
-// builds the recipient lists, calls sendCompose with ParentID.
-// Phase 8/B — accepts attachments and forwards them through
-// sendCompose's upload + send path.
-func sendReply(ctx mcp.Context, deps Deps, toolName, parentID string, replyAll bool, bodyText, bodyHTML string, attachments []sendAttachmentInput) (*mcp.ToolResult, error) {
-	parent, err := deps.Session.Client.GetMessage(ctx.Std, parentID)
+// builds the recipient lists (parent-derived + extra_to / cc), checks
+// they are exactly the ones the approval dialog showed, and calls
+// sendCompose with ParentID. Phase 8/B — accepts attachments.
+func sendReply(ctx mcp.Context, deps Deps, toolName string, in replyInput, replyAll bool, entry sendApproval) (*mcp.ToolResult, error) {
+	parent, err := deps.Session.Client.GetMessage(ctx.Std, in.InReplyTo)
 	if err != nil {
 		return mcp.ErrorResult("%s: fetch parent: %v", toolName, err), nil
 	}
-
-	// Subject — prefix Re: if not already.
-	subject := parent.Subject
-	if !strings.HasPrefix(strings.ToLower(subject), "re:") {
-		subject = "Re: " + subject
+	p := replyParentFromMessage(parent)
+	to, cc := replyRecipients(p, selfAddresses(deps), replyAll, in.ExtraTo, in.CC)
+	if got := recipientSet(to, cc); !sameStrings(got, entry.recipients) {
+		return mcp.ErrorResult("%s refused: the recipients would be %s but the approval dialog showed %s; "+
+			"nothing was sent — retry to review the current recipients",
+			toolName, strings.Join(got, ", "), strings.Join(entry.recipients, ", ")), nil
 	}
 
-	// Recipients.
-	to := []string{}
-	if parent.Sender != nil {
-		to = append(to, parent.Sender.Address)
-	}
-	cc := []string{}
-	if replyAll {
-		self := selfAddresses(deps)
-		for _, a := range parent.ToList {
-			if a != nil && !contains(self, strings.ToLower(a.Address)) && !contains(to, a.Address) {
-				cc = append(cc, a.Address)
-			}
-		}
-		for _, a := range parent.CCList {
-			if a != nil && !contains(self, strings.ToLower(a.Address)) && !contains(to, a.Address) {
-				cc = append(cc, a.Address)
-			}
-		}
-	}
-
-	return sendCompose(ctx, deps, toolName, parentID, sendInput{
-		Subject:     subject,
+	return sendCompose(ctx, deps, toolName, in.InReplyTo, sendInput{
+		Subject:     replySubject(p.Subject),
 		To:          to,
 		CC:          cc,
-		BodyText:    bodyText,
-		BodyHTML:    bodyHTML,
-		Attachments: attachments,
-	})
+		BodyText:    in.BodyText,
+		BodyHTML:    in.BodyHTML,
+		Attachments: in.Attachments,
+	}, ledgerGate(entry, true))
 }
 
-// sendForward is the forward body. Subject Fwd:-prefixed; body
-// passed through unchanged. Phase 8/B — accepts new attachments.
-// Phase 8/C — when include_parent_attachments is set, carries
-// parent attachments over via re-encrypted session keys (no
-// byte-level round-trip).
-func sendForward(ctx mcp.Context, deps Deps, in forwardInput) (*mcp.ToolResult, error) {
+// sendForward is the forward body. Subject Fwd:-prefixed; body is the
+// caller's, plus the quoted original when include_original is set.
+// Phase 8/B — accepts new attachments. Phase 8/C — when
+// include_parent_attachments is set, carries parent attachments over
+// via re-encrypted session keys (no byte-level round-trip); those must
+// match the ones the approval dialog listed.
+func sendForward(ctx mcp.Context, deps Deps, in forwardInput, entry sendApproval, have bool) (*mcp.ToolResult, error) {
 	parent, err := deps.Session.Client.GetMessage(ctx.Std, in.ForwardOf)
 	if err != nil {
 		return mcp.ErrorResult("mail_forward: fetch parent: %v", err), nil
 	}
-	subject := parent.Subject
-	if !strings.HasPrefix(strings.ToLower(subject), "fwd:") {
-		subject = "Fwd: " + subject
+	subject := forwardSubject(parent.Subject)
+
+	bodyText, bodyHTML := in.BodyText, in.BodyHTML
+	if in.IncludeOriginal {
+		quoted, qerr := quotedOriginal(deps, parent)
+		if qerr != nil {
+			return mcp.ErrorResult("mail_forward: include_original: %v", qerr), nil
+		}
+		if bodyHTML != "" {
+			bodyHTML += "<br><br><blockquote>" +
+				strings.ReplaceAll(html.EscapeString(quoted), "\n", "<br>") + "</blockquote>"
+		} else {
+			if bodyText != "" {
+				bodyText += "\n\n"
+			}
+			bodyText += quoted
+		}
 	}
+	gate := ledgerGate(entry, have)
 
 	// Fast path: no parent-attachment carryover. Reuse sendCompose
 	// — identical behavior to the 8/B contract.
 	if !in.IncludeParentAttachments || len(parent.Attachments) == 0 {
+		if in.IncludeParentAttachments && have && len(entry.parentAttachmentIDs) != 0 {
+			return mcp.ErrorResult("mail_forward refused: the original's attachments changed after approval; nothing was sent"), nil
+		}
 		return sendCompose(ctx, deps, "mail_forward", in.ForwardOf, sendInput{
 			Subject:     subject,
 			To:          in.To,
 			CC:          in.CC,
 			BCC:         in.BCC,
-			BodyText:    in.BodyText,
-			BodyHTML:    in.BodyHTML,
+			BodyText:    bodyText,
+			BodyHTML:    bodyHTML,
 			Attachments: in.Attachments,
-		})
+		}, gate)
+	}
+
+	// The parent attachments carried over must be exactly the ones the
+	// dialog listed.
+	ids := make([]string, 0, len(parent.Attachments))
+	for _, a := range parent.Attachments {
+		ids = append(ids, a.ID)
+	}
+	sort.Strings(ids)
+	if !have || !sameStrings(ids, entry.parentAttachmentIDs) {
+		return mcp.ErrorResult("mail_forward refused: the original's attachments don't match what the approval " +
+			"dialog listed; nothing was sent — retry to review them"), nil
 	}
 
 	// Parent-attachment carryover path. Pre-validate the new
 	// attachments first so we fail fast.
-	newDecoded, err := decodeAndValidateAttachments(deps, in.Attachments)
+	newDecoded, err := decodeAttachmentsGated(deps, in.Attachments, gate)
 	if err != nil {
 		return mcp.ErrorResult("mail_forward: %v", err), nil
 	}
@@ -637,7 +830,7 @@ func sendForward(ctx mcp.Context, deps Deps, in forwardInput) (*mcp.ToolResult, 
 		return mcp.ErrorResult("mail_forward: re-encrypt parent attachment keys: %v", err), nil
 	}
 
-	tpl, mimeType, err := buildDraftTemplate(deps, subject, in.To, in.CC, in.BCC, in.BodyText, in.BodyHTML)
+	tpl, mimeType, err := buildDraftTemplate(deps, subject, in.To, in.CC, in.BCC, bodyText, bodyHTML)
 	if err != nil {
 		return nil, mcp.NewError(mcp.CodeInvalidParams, "mail_forward: "+err.Error())
 	}
@@ -681,6 +874,98 @@ func sendForward(ctx mcp.Context, deps Deps, in forwardInput) (*mcp.ToolResult, 
 	}
 
 	return finalizeSend(ctx, deps, "mail_forward", addrKR, draft, tpl, mimeType, allRecipients(in.To, in.CC, in.BCC), merged)
+}
+
+// quotedOriginal renders the standard forwarded-message block: a
+// header block followed by the original's text body (decrypted with
+// the receiving address's keyring).
+func quotedOriginal(deps Deps, parent gpa.Message) (string, error) {
+	if deps.Session == nil {
+		return "", errors.New("no active session")
+	}
+	kr, ok := deps.Session.AddrKRs[parent.AddressID]
+	if !ok || kr == nil {
+		return "", fmt.Errorf("no keyring for address %s", parent.AddressID)
+	}
+	plain, err := parent.Decrypt(kr)
+	if err != nil {
+		return "", fmt.Errorf("decrypt original: %w", err)
+	}
+	return formatQuotedOriginal(parent, string(plain)), nil
+}
+
+// formatQuotedOriginal builds the quote from an already-decrypted body.
+func formatQuotedOriginal(parent gpa.Message, body string) string {
+	var text string
+	switch mt := string(parent.MIMEType); {
+	case strings.HasPrefix(mt, "text/plain"):
+		text = body
+	case strings.HasPrefix(mt, "text/html"):
+		text = htmlToQuoteText(body)
+	default:
+		text = sanitize.Text(body)
+	}
+	text = strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\t' || (r >= 0x20 && r != 0x7f && (r < 0x80 || r > 0x9f)) {
+			return r
+		}
+		return -1
+	}, strings.ReplaceAll(text, "\r\n", "\n"))
+
+	fmtAddr := func(a *mail.Address) string {
+		if a == nil {
+			return ""
+		}
+		if a.Name != "" {
+			return a.Name + " <" + a.Address + ">"
+		}
+		return a.Address
+	}
+	fmtList := func(l []*mail.Address) string {
+		out := make([]string, 0, len(l))
+		for _, a := range l {
+			if s := fmtAddr(a); s != "" {
+				out = append(out, s)
+			}
+		}
+		return strings.Join(out, ", ")
+	}
+	var b strings.Builder
+	b.WriteString("---------- Forwarded message ----------\n")
+	b.WriteString("From: " + fmtAddr(parent.Sender) + "\n")
+	if parent.Time != 0 {
+		b.WriteString("Date: " + time.Unix(parent.Time, 0).Format(time.RFC1123Z) + "\n")
+	}
+	b.WriteString("Subject: " + parent.Subject + "\n")
+	b.WriteString("To: " + fmtList(parent.ToList) + "\n")
+	if cc := fmtList(parent.CCList); cc != "" {
+		b.WriteString("Cc: " + cc + "\n")
+	}
+	b.WriteString("\n")
+	b.WriteString(strings.TrimRight(text, "\n"))
+	return b.String()
+}
+
+var (
+	htmlBreaks    = regexp.MustCompile(`(?i)<\s*(br|/p|/div|/li|/tr|/h[1-6])\s*/?>`)
+	htmlTags      = regexp.MustCompile(`(?s)<[^>]*>`)
+	htmlStyleTags = regexp.MustCompile(`(?is)<(style|script)\b[^>]*>.*?</\s*(style|script)\s*>`)
+	blankRuns     = regexp.MustCompile(`\n{3,}`)
+)
+
+// htmlToQuoteText is a line-preserving HTML → text conversion for the
+// quoted original (sanitize.Text collapses all whitespace, which is
+// right for snippets but mangles a quoted email).
+func htmlToQuoteText(s string) string {
+	s = htmlStyleTags.ReplaceAllString(s, "")
+	s = htmlBreaks.ReplaceAllString(s, "\n")
+	s = htmlTags.ReplaceAllString(s, "")
+	s = html.UnescapeString(s)
+	lines := strings.Split(s, "\n")
+	for i, l := range lines {
+		lines[i] = strings.TrimSpace(l)
+	}
+	return strings.TrimSpace(blankRuns.ReplaceAllString(strings.Join(lines, "\n"), "\n\n"))
 }
 
 // reencryptParentKeyPackets reads each parent attachment's

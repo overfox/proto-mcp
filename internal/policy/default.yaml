@@ -8,10 +8,34 @@
 #
 # decision values: allow | prompt | deny
 #   allow:  handler runs immediately, no UI.
-#   prompt: Touch ID approval required first. If confirm: true,
-#           an NSAlert showing the literal operation details runs
-#           before Touch ID.
+#   prompt: Touch ID approval required first. The Touch ID dialog
+#           itself shows the operation details (recipients, subject,
+#           body excerpt, attachments for sends) — there is a single
+#           dialog; the biometric IS the confirmation.
 #   deny:   handler never runs, audit row outcome=denied.
+#
+# confirm: legacy flag, still accepted and forwarded to the helper,
+# but it no longer adds a second NSAlert (the helper collapsed to a
+# single Touch ID prompt — see helpers/touchid/main.swift). Kept on
+# the high-risk tools below as a marker of intent.
+#
+# Floors (enforced in code; an override violating one is rejected
+# wholesale and the previous policy stays in force):
+#   send floor:        mail_send, mail_send_draft, mail_reply,
+#                      mail_reply_all, mail_forward — never allow,
+#                      ttl must be 0.
+#   destructive floor: mail_trash, mail_move, mail_label,
+#                      labels_delete, folders_delete,
+#                      mail_draft_delete, mail_delete_permanent —
+#                      never allow (prompt with any ttl, or deny).
+#
+# attachment_path_allowlist: absolute directories whose files can be
+# attached by path (attachments[].path) with no extra prompt. Files
+# elsewhere under your home folder or /Volumes can still be attached
+# after a per-file Touch ID approval showing the full path (for
+# drafts) or by being listed in the send dialog (for sends). Secrets
+# (~/.ssh, ~/.aws, keychains, *.pem, id_rsa*, .env*, ...) and hidden
+# paths outside the allowlist are never attachable.
 #
 # ttl: how long an approval is cached before re-prompting. ttl: 0
 # means always re-prompt — appropriate for irreversible operations
@@ -52,9 +76,12 @@ tools:
     ttl: 5m
     description: "Download and decrypt one attachment from a Proton message. Cached locally for 30 days; subsequent calls within the TTL window don't re-prompt."
   # Phase 8/C — writes a file to ~/Downloads. Filesystem side
-  # effect: confirm: true + ttl: 0 means every save re-asks (no
-  # cached approval — the user reads the literal filename before
-  # they approve each save).
+  # effect: ttl: 0 means every save re-asks (no cached approval —
+  # the user reads the literal filename before they approve each
+  # save). Keep Alive suppresses this prompt by owner choice; the
+  # compensating controls are in code: agent/IDE config names and
+  # executable extensions are refused, hidden target dirs are
+  # refused, and saved files get the com.apple.quarantine xattr.
   mail_save_attachment:
     decision: prompt
     confirm: true

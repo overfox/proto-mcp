@@ -59,6 +59,15 @@ type Deps struct {
 	// account email. nil when there is no runtime to unlock (tests,
 	// one-shot CLI paths) — proton_connect then reports that.
 	Connect func(ctx context.Context) (alreadyConnected bool, email string, err error)
+
+	// Approve runs a one-off Touch ID prompt from inside a handler and
+	// returns nil only if the user approved. Used for sub-steps that
+	// policy doesn't gate on their own — today: draft attachments read
+	// from outside attachment_path_allowlist. Wired to
+	// approval.Broker.Approver(), which bypasses policy (so Keep Alive
+	// can't suppress it) and the approval cache. nil → those sub-steps
+	// are refused.
+	Approve func(ctx context.Context, title, body string) error
 }
 
 // All returns every tool registered, in the order the server should

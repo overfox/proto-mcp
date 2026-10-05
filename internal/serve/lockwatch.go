@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/just-an-oldsalt/proto-mcp/internal/approval"
 )
 
 // Phase 7/A — Swift lockwatch helper integration.
@@ -95,6 +97,9 @@ func runLockwatchLoopWith(
 }
 
 func runLockwatchOnce(ctx context.Context, binPath string, lockFn func(reason string), logger *slog.Logger) error {
+	if err := approval.VerifyLockwatchHelper(binPath); err != nil { // pinned hash; fail closed
+		return err
+	}
 	cmd := exec.CommandContext(ctx, binPath)
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {

@@ -32,26 +32,25 @@ func TestAddressesFromJSON(t *testing.T) {
 // per-field sanitization before assembly.
 func TestSendPromptBody_NoNewlineInjection(t *testing.T) {
 	pb := sendPromptBodyWithDeps(Deps{}, "mail_send")
-	_, body := pb(json.RawMessage(`{"to":["real@y.com\nBCC: evil@x.com"],"subject":"hi"}`))
+	_, body := pb(json.RawMessage(`{"to":["real@y.com\nBCC: evil@x.com"],"subject":"hi\nTo: x@y","body_text":"a\nBCC: z@z"}`))
 
-	// The only BCC framework line is the legitimate (empty) one we add.
-	if strings.Contains(body, "\nBCC: evil@x.com") {
-		t.Errorf("newline injection produced a fake BCC line:\n%s", body)
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(line, "BCC:") {
+			t.Errorf("newline injection produced a fake BCC line:\n%s", body)
+		}
+		if strings.HasPrefix(line, "To:") && !strings.Contains(line, "real@y.com") {
+			t.Errorf("injected a second To line:\n%s", body)
+		}
 	}
 	// The evil address still appears — inline on the To line, as data.
 	if !strings.Contains(body, "evil@x.com") {
 		t.Errorf("expected the smuggled address to show inline as data:\n%s", body)
 	}
-	// Exactly one BCC *line* (the framework's empty one); the smuggled
-	// "BCC:" text is inline on the To line (space-separated), not a line.
-	if strings.Count(body, "\nBCC:") != 1 {
-		t.Errorf("expected exactly one framework BCC line, body was:\n%s", body)
-	}
 }
 
-// PROTO-126 — reply / reply-all approval prompts resolve real recipients
-// from the local mirror instead of a generic "original sender" line.
-func TestLookupReplyRecipients(t *testing.T) {
+// The reply dialog resolves the parent from the local mirror when there
+// is no session, and computes reply-all recipients (+ extras).
+func TestLookupReplyParentMirror(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(":memory:")
 	if err != nil {
@@ -71,21 +70,22 @@ func TestLookupReplyRecipients(t *testing.T) {
 	}
 
 	deps := Deps{Store: st}
-
-	reply := lookupReplyRecipients(deps, "msg-1", false)
-	if reply != "To: sender@proton.me" {
-		t.Errorf("reply recipients = %q, want \"To: sender@proton.me\"", reply)
+	p, ok := lookupReplyParent(deps, "msg-1")
+	if !ok || p.Sender != "sender@proton.me" || p.Subject != "hi" {
+		t.Fatalf("lookupReplyParent = %+v ok=%v", p, ok)
 	}
-
-	all := lookupReplyRecipients(deps, "msg-1", true)
-	for _, want := range []string{"sender@proton.me", "me@x.com", "team@x.com", "cc@x.com"} {
-		if !strings.Contains(all, want) {
-			t.Errorf("reply-all recipients %q missing %q", all, want)
-		}
+	to, cc := replyRecipients(p, nil, false, nil, nil)
+	if len(to) != 1 || to[0] != "sender@proton.me" || len(cc) != 0 {
+		t.Errorf("reply: to=%v cc=%v", to, cc)
 	}
-
-	// Unknown message → empty, so the caller falls back.
-	if lookupReplyRecipients(deps, "nope", false) != "" {
-		t.Errorf("expected empty for unknown message")
+	to, cc = replyRecipients(p, []string{"me@x.com"}, true, []string{"boss@y.com", "SENDER@proton.me"}, []string{"extra@z.com"})
+	if strings.Join(to, ",") != "sender@proton.me,boss@y.com" {
+		t.Errorf("reply-all to = %v", to)
+	}
+	if strings.Join(cc, ",") != "team@x.com,cc@x.com,extra@z.com" {
+		t.Errorf("reply-all cc = %v (self must be dropped, extras appended)", cc)
+	}
+	if _, ok := lookupReplyParent(deps, "nope"); ok {
+		t.Errorf("unknown message should not resolve")
 	}
 }
