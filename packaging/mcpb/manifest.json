@@ -2,8 +2,9 @@
   "manifest_version": "0.3",
   "name": "protonmcp",
   "display_name": "Proton Mail (protonmcp)",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "description": "Touch-ID-gated Proton Mail access: read, search, organize, draft, and send via the local protonmcpd daemon.",
+  "long_description": "Touch-ID-gated Proton Mail access via the local protonmcpd daemon. The bundled shim reconnects automatically when the daemon restarts (rebuild, update, crash, or Switch Off/On), so Claude doesn't need to be restarted; requests in flight at that moment return a retryable error.",
   "author": {
     "name": "overfox (fork of just-an-oldsalt/proto-mcp)",
     "url": "https://github.com/overfox/proto-mcp"
