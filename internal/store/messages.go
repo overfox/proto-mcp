@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -37,14 +38,39 @@ type Message struct {
 // same ID. Body fields are preserved across upserts (sync updates touch
 // only envelope columns), so callers can re-run backfill without losing
 // the lazily-decrypted body cache.
+//
+// Thread keys. Proton's metadata API carries no conversation id or
+// References / In-Reply-To headers (go-proton-api's MessageMetadata
+// drops ConversationID), so sync can't group replies by itself. What
+// metadata DOES carry is ExternalID — the message's own RFC 822
+// Message-ID. When the caller passes the default thread id (empty or
+// the Proton id, as ToStoreMessage does), UpsertMessage keys the
+// message by its Message-ID instead. That is exactly the value a
+// reply's References[0] names, so once mail_read decrypts a reply
+// (and SetCachedBody records its References root), root and reply
+// share a thread_id. For the same reason a default thread id never
+// overwrites an existing header-derived one on re-sync; an explicit
+// caller-chosen thread id still does.
 func (s *Store) UpsertMessage(ctx context.Context, m Message) error {
+	defaultThread := m.ThreadID == "" || m.ThreadID == m.ID
+	if defaultThread {
+		if key := ThreadKeyFromRaw(m.RawJSON); key != "" {
+			m.ThreadID = key
+		} else if m.ThreadID == "" {
+			m.ThreadID = m.ID
+		}
+	}
 	const q = `
 INSERT INTO messages (
     id, thread_id, subject, from_address, from_name, to_json, cc_json,
     date, unread, starred, has_attachments, folder, size_bytes, raw_json
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
-    thread_id       = excluded.thread_id,
+    thread_id       = CASE
+                        WHEN ? = 1 AND messages.thread_id NOT IN ('', messages.id)
+                        THEN messages.thread_id
+                        ELSE excluded.thread_id
+                      END,
     subject         = excluded.subject,
     from_address    = excluded.from_address,
     from_name       = excluded.from_name,
@@ -63,11 +89,38 @@ ON CONFLICT(id) DO UPDATE SET
 		m.ToJSON, m.CcJSON, m.Date.Unix(),
 		boolToInt(m.Unread), boolToInt(m.Starred), boolToInt(m.HasAttachments),
 		m.Folder, m.SizeBytes, m.RawJSON,
+		boolToInt(defaultThread),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert message %s: %w", m.ID, err)
 	}
 	return nil
+}
+
+// ThreadKeyFromRaw returns the normalized RFC 822 Message-ID carried
+// as ExternalID in a message's metadata JSON (raw_json), or "" when
+// absent / unparsable. Angle brackets and whitespace are stripped so
+// the key compares equal to References / In-Reply-To values.
+func ThreadKeyFromRaw(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	var meta struct {
+		ExternalID string `json:"ExternalID"`
+	}
+	if err := json.Unmarshal([]byte(raw), &meta); err != nil {
+		return ""
+	}
+	return NormalizeMessageID(meta.ExternalID)
+}
+
+// NormalizeMessageID strips whitespace and one layer of angle
+// brackets: "<abc@x>" → "abc@x".
+func NormalizeMessageID(id string) string {
+	id = strings.TrimSpace(id)
+	id = strings.TrimPrefix(id, "<")
+	id = strings.TrimSuffix(id, ">")
+	return strings.TrimSpace(id)
 }
 
 // GetMessage loads a single message by id. Returns ErrNotFound if absent.
