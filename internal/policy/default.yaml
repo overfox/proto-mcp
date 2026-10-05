@@ -60,6 +60,15 @@ tools:
     confirm: true
     ttl: 0
     description: "Save a decrypted attachment to ~/Downloads with a sanitized filename. Refuses paths outside ~/Downloads. Existing files get a (2), (3), ... suffix."
+  # Archival export: writes a raw RFC 822 .eml (headers, body,
+  # attachments) to ~/Downloads or an allowlisted directory. Same
+  # filesystem-side-effect posture as mail_save_attachment: confirm +
+  # ttl 0 so every export shows the literal destination.
+  mail_export_eml:
+    decision: prompt
+    confirm: true
+    ttl: 0
+    description: "Export a message as a .eml file (full headers + attachments) to ~/Downloads or an allowlisted directory. Never overwrites."
   labels_list:           { decision: allow }
   folders_list:          { decision: allow }
   mail_sync:             { decision: allow }

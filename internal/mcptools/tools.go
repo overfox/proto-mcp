@@ -109,6 +109,8 @@ func All(deps Deps) []mcp.Tool {
 		calendarList(deps),
 		calendarEvents(deps),
 		calendarReadEvent(deps),
+		// Archival / triage additions.
+		mailExportEML(deps),
 	}
 }
 
