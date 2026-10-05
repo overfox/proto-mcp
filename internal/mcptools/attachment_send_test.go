@@ -144,53 +144,6 @@ func TestDecodeAndValidateAttachments_DefaultMIME(t *testing.T) {
 	}
 }
 
-func TestAttachmentsSummary(t *testing.T) {
-	cases := []struct {
-		name string
-		in   []decodedAttachment
-		want string
-	}{
-		{
-			name: "empty",
-			in:   nil,
-			want: "",
-		},
-		{
-			name: "one",
-			in:   []decodedAttachment{{Filename: "report.pdf", Plain: make([]byte, 2400)}},
-			want: "Attachments: report.pdf (2 KB)",
-		},
-		{
-			name: "exactly three",
-			in: []decodedAttachment{
-				{Filename: "a.pdf", Plain: make([]byte, 1024)},
-				{Filename: "b.pdf", Plain: make([]byte, 1024)},
-				{Filename: "c.pdf", Plain: make([]byte, 1024)},
-			},
-			want: "Attachments: a.pdf (1 KB), b.pdf (1 KB), c.pdf (1 KB)",
-		},
-		{
-			name: "more than three truncates",
-			in: []decodedAttachment{
-				{Filename: "a", Plain: make([]byte, 1024)},
-				{Filename: "b", Plain: make([]byte, 1024)},
-				{Filename: "c", Plain: make([]byte, 1024)},
-				{Filename: "d", Plain: make([]byte, 1024)},
-				{Filename: "e", Plain: make([]byte, 1024)},
-			},
-			want: "Attachments: a (1 KB), b (1 KB), c (1 KB) and 2 more",
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := attachmentsSummary(tc.in)
-			if got != tc.want {
-				t.Errorf("attachmentsSummary:\n got  %q\n want %q", got, tc.want)
-			}
-		})
-	}
-}
-
 func TestHumanBytes(t *testing.T) {
 	cases := map[int64]string{
 		0:           "0 B",

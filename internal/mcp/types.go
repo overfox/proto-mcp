@@ -122,8 +122,8 @@ type Tool struct {
 	// populate this; everything else leaves it nil.
 	Recipients func(args json.RawMessage) []string `json:"-"`
 
-	// PromptBody builds the NSAlert title + body shown to the user
-	// when policy says prompt + confirm. Send-family tools should
+	// PromptBody builds the title + body of the Touch ID dialog shown to the user
+	// when policy says prompt. Send-family tools should
 	// populate this with literal recipients + subject so the user
 	// reads exactly what they're approving. nil → middleware uses
 	// the generic "tool was requested with these (redacted) args"

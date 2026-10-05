@@ -316,34 +316,6 @@ func uploadAttachmentsAndCollectKeys(
 	return attKeys, nil
 }
 
-// attachmentsSummary formats a one-line summary for the Touch ID
-// prompt body. Sanitized filenames; sizes in a human-readable form;
-// truncates after 3 with "and N more" suffix beyond.
-//
-// Example outputs:
-//
-//	"Attachments: report.pdf (2.4 MB)"
-//	"Attachments: report.pdf (2.4 MB), photo.jpg (850 KB)"
-//	"Attachments: a.pdf (1 KB), b.pdf (1 KB), c.pdf (1 KB) and 5 more"
-func attachmentsSummary(decoded []decodedAttachment) string {
-	if len(decoded) == 0 {
-		return ""
-	}
-	const max = 3
-	parts := make([]string, 0, max)
-	for i, d := range decoded {
-		if i >= max {
-			break
-		}
-		parts = append(parts, fmt.Sprintf("%s (%s)", d.Filename, humanBytes(int64(len(d.Plain)))))
-	}
-	out := "Attachments: " + strings.Join(parts, ", ")
-	if len(decoded) > max {
-		out += fmt.Sprintf(" and %d more", len(decoded)-max)
-	}
-	return out
-}
-
 // humanBytes formats a byte count as a short human-readable string.
 // Tuned for the Touch ID prompt — not for log lines (no precision).
 func humanBytes(n int64) string {
