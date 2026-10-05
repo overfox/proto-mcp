@@ -179,6 +179,7 @@ func (r *Runtime) Unlock(ctx context.Context) error {
 			Store:   r.Store,
 			Policy:  r.Policy,
 			Connect: r.Connect,
+			Approve: r.Broker.Approver(),
 		}))
 	}
 	r.locked = false
@@ -460,6 +461,7 @@ func Setup(ctx context.Context, cfg SetupConfig) (*Runtime, error) {
 		Store:   st,
 		Policy:  engine,
 		Connect: rt.Connect,
+		Approve: broker.Approver(),
 	}) {
 		srv.Register(tl)
 	}

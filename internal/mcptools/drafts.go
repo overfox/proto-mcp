@@ -1,14 +1,16 @@
 package mcptools
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/mail"
+	"strings"
 	"time"
 
-	gpa "github.com/ProtonMail/go-proton-api"
 	"github.com/ProtonMail/gluon/rfc822"
+	gpa "github.com/ProtonMail/go-proton-api"
 	"github.com/ProtonMail/gopenpgp/v2/crypto"
 
 	"github.com/just-an-oldsalt/proto-mcp/internal/mcp"
@@ -63,6 +65,10 @@ func mailDraftCreate(deps Deps) mcp.Tool {
 			"Body can be plain text (body_text) or HTML (body_html) — HTML is sanitized through the same allowlist " +
 			"as inbound mail before encryption (scripts / iframes / tracking pixels stripped). " +
 			"Optional `attachments` array uploads files to the draft (same shape as mail_send). " +
+			"attachments[].path takes an absolute path on the host Mac anywhere under the user's home folder or /Volumes: " +
+			"files inside attachment_path_allowlist attach silently, any other file first shows a Touch ID prompt " +
+			"with its full path and size (one prompt covers all such files in the call). Paths inside a " +
+			"Cowork/VM sandbox (/sessions/..., /mnt/...) are not host paths. " +
 			"Returns the draft_id which mail_send_draft / mail_draft_update / mail_draft_delete take.",
 		InputSchema: json.RawMessage(`{
 			"type": "object",
@@ -89,7 +95,8 @@ func mailDraftCreate(deps Deps) mcp.Tool {
 					"mail_draft_create: subject and at least one to recipient are required")
 			}
 
-			decoded, err := decodeAndValidateAttachments(deps, in.Attachments)
+			decoded, err := decodeAttachmentsGated(deps, in.Attachments,
+				draftAttachmentGate(ctx.Std, deps, "mail_draft_create", in.Subject, in.To))
 			if err != nil {
 				return mcp.ErrorResult("mail_draft_create: %v", err), nil
 			}
@@ -135,9 +142,11 @@ func mailDraftCreate(deps Deps) mcp.Tool {
 
 func mailDraftUpdate(deps Deps) mcp.Tool {
 	return mcp.Tool{
-		Name:        "mail_draft_update",
+		Name: "mail_draft_update",
 		Description: "Update an existing draft. Any field you don't pass is preserved. body_html still runs through outbound sanitization. " +
-			"Optional `attachments` array uploads ADDITIONAL files (does not replace existing attachments on the draft — for that, mail_draft_delete + mail_draft_create).",
+			"Optional `attachments` array uploads ADDITIONAL files (does not replace existing attachments on the draft — for that, mail_draft_delete + mail_draft_create). " +
+			"Path attachments outside attachment_path_allowlist (anywhere under home or /Volumes) need a Touch ID approval showing the full path; " +
+			"Cowork/VM paths (/sessions/..., /mnt/...) are not host paths.",
 		InputSchema: json.RawMessage(`{
 			"type": "object",
 			"properties": {
@@ -206,7 +215,8 @@ func mailDraftUpdate(deps Deps) mcp.Tool {
 				return nil, mcp.NewError(mcp.CodeInvalidParams, "mail_draft_update: "+err.Error())
 			}
 
-			decoded, err := decodeAndValidateAttachments(deps, in.Attachments)
+			decoded, err := decodeAttachmentsGated(deps, in.Attachments,
+				draftAttachmentGate(ctx.Std, deps, "mail_draft_update", subject, toStrs))
 			if err != nil {
 				return mcp.ErrorResult("mail_draft_update: %v", err), nil
 			}
@@ -338,6 +348,49 @@ func mailDraftList(deps Deps) mcp.Tool {
 			return mcp.StructuredResult(res)
 		},
 	}
+}
+
+// draftAttachmentGate returns the tier-b gate for the draft tools:
+// draft creation/update is policy `allow`, so files from outside
+// attachment_path_allowlist need their own Touch ID approval here. One
+// prompt lists every such file (full resolved path + size) and the
+// draft it's for. It goes straight to the broker (deps.Approve), so
+// Keep Alive — which only acts inside policy.Decide — can't suppress
+// it. No broker → refuse.
+func draftAttachmentGate(ctx context.Context, deps Deps, tool, subject string, to []string) attachmentGate {
+	return func(outside []resolvedAttachmentPath) error {
+		if deps.Approve == nil {
+			return fmt.Errorf("%q is outside attachment_path_allowlist and needs a Touch ID approval, "+
+				"but no approval broker is available", outside[0].Requested)
+		}
+		title, body := outsideAllowlistPrompt(tool, subject, to, outside)
+		if err := deps.Approve(ctx, title, body); err != nil {
+			return fmt.Errorf("attaching files from outside attachment_path_allowlist was not approved: %w", err)
+		}
+		return nil
+	}
+}
+
+// outsideAllowlistPrompt formats the per-call Touch ID prompt for
+// out-of-allowlist path attachments on a draft.
+func outsideAllowlistPrompt(tool, subject string, to []string, outside []resolvedAttachmentPath) (string, string) {
+	var b strings.Builder
+	noun := "file"
+	if len(outside) > 1 {
+		noun = "files"
+	}
+	fmt.Fprintf(&b, "Attach %d %s from outside your attachment allowlist to a draft (%s)", len(outside), noun, tool)
+	if len(to) > 0 {
+		b.WriteString("\nTo: " + joinAddrs(to))
+	}
+	if subject != "" {
+		b.WriteString("\nSubject: " + clipRunes(sanitizeField(subject), 100))
+	}
+	for _, o := range outside {
+		fmt.Fprintf(&b, "\n%s (%s)", sanitizeField(o.Resolved), humanBytes(o.Size))
+	}
+	return mcp.SanitizePromptText("Approve attaching files to "+tool+"?", 120),
+		mcp.SanitizePromptText(b.String(), 4000)
 }
 
 // buildDraftTemplate is the shared body-building path. Handles

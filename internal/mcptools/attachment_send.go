@@ -4,14 +4,11 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"io"
-	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 
-	gpa "github.com/ProtonMail/go-proton-api"
 	"github.com/ProtonMail/gluon/rfc822"
+	gpa "github.com/ProtonMail/go-proton-api"
 	"github.com/ProtonMail/gopenpgp/v2/crypto"
 
 	"github.com/just-an-oldsalt/proto-mcp/internal/sanitize"
@@ -46,10 +43,11 @@ type sendAttachmentInput struct {
 	// Path is the alternative to ContentB64: an absolute path on the
 	// host that the daemon reads directly, so file bytes never travel
 	// through the model's context (Cowork/VM clients can't reliably
-	// inline large base64 into tool args). Refused unless the path
-	// resolves inside the user's attachment_path_allowlist policy —
-	// empty allowlist (the default) disables path attachments
-	// entirely. Exactly one of ContentB64 / Path must be set.
+	// inline large base64 into tool args). Tiered (attachment_paths.go):
+	// inside attachment_path_allowlist → no extra prompt; elsewhere
+	// under $HOME or /Volumes → Touch ID approval showing the full
+	// path; credentials / app state / hidden paths → never. Exactly
+	// one of ContentB64 / Path must be set.
 	Path string `json:"path,omitempty"`
 }
 
@@ -60,6 +58,11 @@ type decodedAttachment struct {
 	Filename string
 	MIMEType string
 	Plain    []byte
+	// SourcePath is the symlink-resolved host path for path
+	// attachments ("" for content_b64).
+	SourcePath string
+	// OutsideAllowlist marks a tier-b path (approved via Touch ID).
+	OutsideAllowlist bool
 }
 
 // attachmentInputSchemaFragment is the JSON-schema chunk every
@@ -74,70 +77,98 @@ const attachmentInputSchemaFragment = `{
             "filename":    {"type": "string", "description": "User-visible name. Required with content_b64; defaults to the basename for path."},
             "mime_type":   {"type": "string"},
             "content_b64": {"type": "string", "description": "Attachment bytes, base64. Use for small files only; prefer path for anything sizable."},
-            "path":        {"type": "string", "description": "Absolute path on the host Mac, read directly by the daemon — no bytes through the model. Must resolve inside the attachment_path_allowlist directories configured in policy.yaml. Exactly one of content_b64 / path."}
+            "path":        {"type": "string", "description": "Absolute path on the host Mac (e.g. /Users/<you>/Desktop/report.pdf), read directly by the daemon — no bytes through the model. Works for any file under the user's home folder or /Volumes: files inside attachment_path_allowlist (policy.yaml) attach silently; anything else triggers a Touch ID prompt showing the full path (for sends it is listed in the send dialog). Credentials and app state (~/.ssh, ~/.aws, keychains, *.pem, *.key, id_rsa*, .env*, ...) and hidden files are never attachable. Paths inside a Cowork/VM sandbox (/sessions/..., /mnt/...) are NOT host paths and will not resolve. Exactly one of content_b64 / path."}
         },
         "additionalProperties": false
     }
 }`
 
-// decodeAndValidateAttachments runs every attachment through:
+// attachmentGate is consulted when a call carries path attachments
+// outside attachment_path_allowlist (tier b, see attachment_paths.go).
+// It returns nil only if every listed file has been approved by the
+// user via Touch ID. nil gate → such files are refused.
+type attachmentGate func(outside []resolvedAttachmentPath) error
+
+// decodeAndValidateAttachments is decodeAttachmentsGated with no gate:
+// path attachments outside attachment_path_allowlist are refused.
+func decodeAndValidateAttachments(deps Deps, atts []sendAttachmentInput) ([]decodedAttachment, error) {
+	return decodeAttachmentsGated(deps, atts, nil)
+}
+
+// decodeAttachmentsGated runs every attachment through:
 //
-//  1. base64 decode of content_b64 → plaintext bytes
+//  1. base64 decode of content_b64, or resolve + classify of path
+//     (symlinks resolved, hard denylist, tiering — no bytes read yet)
 //  2. per-attachment size check against max_attachment_bytes
 //  3. sum-of-bytes check against the same cap (a 100-element list
 //     of 24-MiB attachments would otherwise sneak past the per-item
 //     check)
-//  4. filename sanitization
+//  4. ONE gate call covering every out-of-allowlist path, BEFORE any
+//     of those files is read
+//  5. the reads (O_NOFOLLOW, same-file check, capped)
+//  6. filename sanitization
 //
 // Returns the in-process list ready for upload, or an error that
 // the caller renders as mcp.ErrorResult.
 //
 // The function does NOT touch the network. It's safe to call before
 // CreateDraft / SendDraft so we fail fast.
-func decodeAndValidateAttachments(deps Deps, atts []sendAttachmentInput) ([]decodedAttachment, error) {
+func decodeAttachmentsGated(deps Deps, atts []sendAttachmentInput, gate attachmentGate) ([]decodedAttachment, error) {
 	if len(atts) == 0 {
 		return nil, nil
 	}
 	cap := maxAttachmentBytes(deps)
-	out := make([]decodedAttachment, 0, len(atts))
+	type pending struct {
+		filename string
+		mimeType string
+		plain    []byte                  // content_b64
+		path     *resolvedAttachmentPath // path
+	}
+	items := make([]pending, 0, len(atts))
+	var outside []resolvedAttachmentPath
 	var total int64
 	for i, a := range atts {
 		if a.ContentB64 != "" && a.Path != "" {
 			return nil, fmt.Errorf("attachments[%d]: content_b64 and path are mutually exclusive", i)
 		}
-		var plain []byte
-		filename := a.Filename
+		it := pending{filename: a.Filename, mimeType: a.MIMEType}
+		var size int64
 		switch {
 		case a.Path != "":
-			var err error
-			plain, err = readAllowlistedAttachment(deps, a.Path, cap)
+			r, err := resolveAttachmentPath(deps, a.Path)
 			if err != nil {
 				return nil, fmt.Errorf("attachments[%d]: %w", i, err)
 			}
-			if filename == "" {
-				filename = filepath.Base(a.Path)
+			it.path = &r
+			size = r.Size
+			if it.filename == "" {
+				it.filename = filepath.Base(a.Path)
+			}
+			if r.Tier == tierNeedsApproval {
+				outside = append(outside, r)
 			}
 		case a.ContentB64 != "":
-			if filename == "" {
+			if it.filename == "" {
 				return nil, fmt.Errorf("attachments[%d]: filename is required with content_b64", i)
 			}
-			var err error
-			plain, err = base64.StdEncoding.DecodeString(a.ContentB64)
+			plain, err := base64.StdEncoding.DecodeString(a.ContentB64)
 			if err != nil {
 				return nil, fmt.Errorf("attachments[%d] (%s): content_b64 is not valid base64: %w",
-					i, filename, err)
+					i, it.filename, err)
 			}
+			it.plain = plain
+			size = int64(len(plain))
 		default:
 			return nil, fmt.Errorf("attachments[%d]: one of content_b64 or path is required", i)
 		}
-		if int64(len(plain)) > cap {
+		if size > cap {
 			return nil, fmt.Errorf(
 				"attachments[%d] (%s): %d bytes exceeds max_attachment_bytes (%d). "+
 					"Increase the policy cap in ~/Library/Application Support/protonmcp/policy.yaml to override.",
-				i, filename, len(plain), cap,
+				i, it.filename, size, cap,
 			)
 		}
-		total += int64(len(plain))
+		total += size
 		if total > cap {
 			return nil, fmt.Errorf(
 				"attachments[0..%d]: cumulative %d bytes exceeds max_attachment_bytes (%d) — "+
@@ -145,60 +176,50 @@ func decodeAndValidateAttachments(deps Deps, atts []sendAttachmentInput) ([]deco
 				i, total, cap,
 			)
 		}
-		mt := a.MIMEType
+		items = append(items, it)
+	}
+
+	if len(outside) > 0 {
+		if gate == nil {
+			return nil, fmt.Errorf("%q is outside attachment_path_allowlist and needs a Touch ID approval "+
+				"this call can't show; add its folder to attachment_path_allowlist in policy.yaml", outside[0].Requested)
+		}
+		if err := gate(outside); err != nil {
+			return nil, err
+		}
+	}
+
+	out := make([]decodedAttachment, 0, len(items))
+	total = 0
+	for i, it := range items {
+		plain := it.plain
+		if it.path != nil {
+			var err error
+			plain, err = readResolvedAttachment(*it.path, cap)
+			if err != nil {
+				return nil, fmt.Errorf("attachments[%d]: %w", i, err)
+			}
+		}
+		total += int64(len(plain))
+		if total > cap {
+			return nil, fmt.Errorf("attachments: cumulative %d bytes exceeds max_attachment_bytes (%d)", total, cap)
+		}
+		mt := it.mimeType
 		if mt == "" {
 			mt = "application/octet-stream"
 		}
-		out = append(out, decodedAttachment{
-			Filename: sanitize.Filename(filename),
+		d := decodedAttachment{
+			Filename: sanitize.Filename(it.filename),
 			MIMEType: mt,
 			Plain:    plain,
-		})
+		}
+		if it.path != nil {
+			d.SourcePath = it.path.Resolved
+			d.OutsideAllowlist = it.path.Tier == tierNeedsApproval
+		}
+		out = append(out, d)
 	}
 	return out, nil
-}
-
-// readAllowlistedAttachment reads a path-based attachment after
-// enforcing the attachment_path_allowlist policy. The threat model:
-// a prompt-injected model must not be able to pull arbitrary host
-// files (~/.ssh, keychains, tax returns) into the mailbox. Defenses,
-// in order:
-//
-//  1. Empty allowlist (the shipped default) refuses every path.
-//  2. The path must be absolute and is symlink-resolved
-//     (EvalSymlinks) BEFORE the containment check, so a symlink
-//     planted inside an allowlisted dir can't point outside it.
-//  3. Containment is checked against the symlink-resolved allowlist
-//     dirs via filepath.Rel — string-prefix tricks (/allowed-evil)
-//     don't pass.
-//  4. The open uses O_NOFOLLOW (PROTO-135 pattern) as a TOCTOU
-//     backstop, and the size cap is enforced from Stat before the
-//     read so a huge file can't balloon memory first.
-func readAllowlistedAttachment(deps Deps, p string, cap int64) ([]byte, error) {
-	resolved, err := resolveAllowlisted(deps, p)
-	if err != nil {
-		return nil, err
-	}
-	f, err := os.OpenFile(resolved, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return nil, fmt.Errorf("open %q: %w", p, err)
-	}
-	defer f.Close()
-	st, err := f.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("stat %q: %w", p, err)
-	}
-	if st.IsDir() {
-		return nil, fmt.Errorf("path %q is a directory", p)
-	}
-	if st.Size() > cap {
-		return nil, fmt.Errorf(
-			"%q is %d bytes; exceeds max_attachment_bytes (%d). "+
-				"Increase the policy cap in ~/Library/Application Support/protonmcp/policy.yaml to override.",
-			p, st.Size(), cap,
-		)
-	}
-	return io.ReadAll(f)
 }
 
 // resolveAllowlisted enforces the attachment_path_allowlist policy
