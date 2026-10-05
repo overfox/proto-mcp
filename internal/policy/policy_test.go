@@ -51,8 +51,9 @@ func TestPhase5StubsPresentAsPrompt(t *testing.T) {
 		if d != DecisionPrompt {
 			t.Errorf("%s: decision = %s, want prompt", name, d)
 		}
-		// Send-family must carry confirm:true so the NSAlert + Touch
-		// ID dual prompt fires. Regression-locked.
+		// Send-family keeps confirm:true as the high-risk marker
+		// (the helper no longer shows a second NSAlert for it).
+		// Regression-locked.
 		if name == "mail_send" && !p.Confirm {
 			t.Errorf("mail_send: confirm = false, want true")
 		}

@@ -270,6 +270,9 @@ func (e *Engine) applyOverrideInto(into *document) error {
 	if err := enforceSendFloor(&override); err != nil {
 		return err
 	}
+	if err := enforceDestructiveFloor(&override); err != nil {
+		return err
+	}
 
 	// Shallow merge: per-tool override REPLACES the default block.
 	// Don't deep-merge fields — a user who copies our default and
@@ -331,6 +334,32 @@ func enforceSendFloor(doc *document) error {
 		// cannot panic here.
 		if p.TTLDuration() != 0 {
 			return fmt.Errorf("policy floor: %s ttl must be 0 (every send re-prompts); got %q", name, p.TTL)
+		}
+	}
+	return nil
+}
+
+// destructiveFloorTools remove or rearrange mail the user may not get
+// back easily (trash, move out of view, relabel, delete labels /
+// folders / drafts, permanent delete). A prompt-injected model with
+// these on `allow` could silently bury or destroy evidence of its own
+// actions, so — like the send floor — no override may set them to
+// allow. prompt (with any ttl the user likes) and deny are accepted;
+// a violating override is rejected wholesale.
+var destructiveFloorTools = []string{
+	"mail_trash", "mail_move", "mail_label",
+	"labels_delete", "folders_delete",
+	"mail_draft_delete", "mail_delete_permanent",
+}
+
+func enforceDestructiveFloor(doc *document) error {
+	for _, name := range destructiveFloorTools {
+		p, ok := doc.Tools[name]
+		if !ok {
+			continue
+		}
+		if p.Decision == DecisionAllow {
+			return fmt.Errorf("policy floor: %s cannot be set to allow (destructive; must stay prompt or deny)", name)
 		}
 	}
 	return nil

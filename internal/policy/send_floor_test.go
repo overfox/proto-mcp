@@ -81,16 +81,16 @@ tools:
 func TestSendFloorReloadKeepsPrevious(t *testing.T) {
 	path := writeOverride(t, `
 tools:
-  mail_trash:
+  labels_create:
     decision: allow
 `)
 	e, err := New(context.Background(), path, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	// Sanity: non-send override applied.
-	if d, _ := e.Decide("mail_trash", nil, caller.Caller{}); d != DecisionAllow {
-		t.Fatalf("precondition: mail_trash = %s, want allow", d)
+	// Sanity: non-floor override applied.
+	if d, _ := e.Decide("labels_create", nil, caller.Caller{}); d != DecisionAllow {
+		t.Fatalf("precondition: labels_create = %s, want allow", d)
 	}
 	if err := os.WriteFile(path, []byte(`
 tools:
@@ -106,8 +106,8 @@ tools:
 	if d, _ := e.Decide("mail_send_draft", nil, caller.Caller{}); d != DecisionPrompt {
 		t.Errorf("mail_send_draft after rejected reload: decision = %s, want prompt", d)
 	}
-	if d, _ := e.Decide("mail_trash", nil, caller.Caller{}); d != DecisionAllow {
-		t.Errorf("mail_trash after rejected reload: decision = %s, want allow (previous policy retained)", d)
+	if d, _ := e.Decide("labels_create", nil, caller.Caller{}); d != DecisionAllow {
+		t.Errorf("labels_create after rejected reload: decision = %s, want allow (previous policy retained)", d)
 	}
 }
 
