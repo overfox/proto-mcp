@@ -113,6 +113,7 @@ func All(deps Deps) []mcp.Tool {
 		mailExportEML(deps),
 		mailStar(deps),
 		mailUnstar(deps),
+		mailAttachmentText(deps),
 	}
 }
 
