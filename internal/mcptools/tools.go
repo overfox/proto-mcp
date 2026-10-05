@@ -114,6 +114,7 @@ func All(deps Deps) []mcp.Tool {
 		mailStar(deps),
 		mailUnstar(deps),
 		mailAttachmentText(deps),
+		contactsSearch(deps),
 	}
 }
 

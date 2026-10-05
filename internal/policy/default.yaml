@@ -76,6 +76,9 @@ tools:
     confirm: true
     ttl: 0
     description: "Export a message as a .eml file (full headers + attachments) to ~/Downloads or an allowlisted directory. Never overwrites."
+  # Read-only address-book lookup; returns names + email addresses
+  # only (no phone / postal / notes).
+  contacts_search:       { decision: allow }
   labels_list:           { decision: allow }
   folders_list:          { decision: allow }
   mail_sync:             { decision: allow }
