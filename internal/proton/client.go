@@ -328,6 +328,7 @@ func NewManager(jar http.CookieJar) *gpa.Manager {
 		gpa.WithAppVersion(AppVersion),
 		gpa.WithCookieJar(jar),
 	}
+	opts = append(opts, loggingOption()) // route resty/logrus output through redacting slog (logging.go)
 	if os.Getenv("PROTONMCP_DEBUG") != "" {
 		fmt.Fprintln(os.Stderr,
 			"warning: PROTONMCP_DEBUG=1 — every HTTP request and response "+
