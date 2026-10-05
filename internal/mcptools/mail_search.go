@@ -26,11 +26,14 @@ func mailSearch(deps Deps) mcp.Tool {
 
 	return mcp.Tool{
 		Name: "mail_search",
-		Description: "Full-text + structured search over the local mirror. Query DSL: " +
-			"from:alice  to:bob  subject:\"gear list\"  in:inbox  label:<name-or-id>  " +
-			"before:2026-01-01  after:2025-12-01  has:attachment  " +
-			"plus bare full-text terms (subject + body + sender). " +
-			"All criteria are AND-joined. Date range can also be supplied as " +
+		Description: "Full-text + structured search over the local mirror. Query DSL — criteria: " +
+			"from:x (sender address or name)  to:x  cc:x  subject:\"gear list\"  in:inbox  label:<name-or-id>  " +
+			"is:unread  is:read  is:starred  has:attachment  before:2026-01-01  after:2025-12-01 (aliases until:/since:), " +
+			"plus bare terms or \"quoted phrases\" (full text over subject, sender, recipients, body). " +
+			"Operators: space = AND; OR (upper-case) = either, binding tighter than AND " +
+			"(from:a OR from:b subject:x means (from:a OR from:b) AND subject:x); " +
+			"-x negates any criterion or group (-from:x, -label:y, -(a OR b)); parentheses group. " +
+			"Repeating a prefix ANDs it (from:a from:b needs both). Date range can also be supplied as " +
 			"top-level since / until params (RFC3339 or YYYY-MM-DD). " +
 			"Read-only — does NOT pull fresh data from Proton; " +
 			"call mail_sync first if the user implies they want recent activity.",
