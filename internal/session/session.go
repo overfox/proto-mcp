@@ -97,28 +97,39 @@ func CheckStored() error {
 func AcquireResumeOnly(ctx context.Context) (*Bundle, error) {
 	bundle, err := TryResume(ctx)
 	if err != nil {
-		if errors.Is(err, keystore.ErrNotFound) {
-			return nil, loginRequired(noStoredSessionMsg)
-		}
-		// A transport failure says nothing about the stored session:
-		// resuming behind a captive portal, a downed link, or a
-		// network that blocks Proton used to come back as
-		// ErrLoginRequired, which made protonmcpd exit "cleanly" and
-		// stay dead until a human ran `daemon start`. Classify it
-		// separately so callers can wait the outage out instead.
-		if isNetworkError(err) {
-			return nil, fmt.Errorf("%w: %v", ErrNetworkUnavailable, err)
-		}
-		return nil, loginRequired(
-			"stored session unusable (%v) — run `protonmcp logout && protonmcp login` "+
-				"from a terminal to refresh credentials", err)
+		return nil, classifyResumeFailure(err)
 	}
 	return bundle, nil
 }
 
+// classifyResumeFailure maps a TryResume error onto the sentinels the
+// long-running callers branch on: ErrLoginRequired (only a human can
+// fix it) or ErrNetworkUnavailable (wait and retry).
+func classifyResumeFailure(err error) error {
+	if errors.Is(err, keystore.ErrNotFound) {
+		return loginRequired(noStoredSessionMsg)
+	}
+	// A transport failure says nothing about the stored session:
+	// resuming behind a captive portal, a downed link, or a
+	// network that blocks Proton used to come back as
+	// ErrLoginRequired, which made protonmcpd exit "cleanly" and
+	// stay dead until a human ran `daemon start`. Classify it
+	// separately so callers can wait the outage out instead.
+	//
+	// A server-side "try again later" (429 rate limit, 5xx) is the
+	// same story: the credentials are fine, so wait it out.
+	if isNetworkError(err) || errors.Is(err, protonclient.ErrTransient) {
+		return fmt.Errorf("%w: %v", ErrNetworkUnavailable, err)
+	}
+	return loginRequired(
+		"stored session unusable (%v) — run `protonmcp logout && protonmcp login` "+
+			"from a terminal to refresh credentials", err)
+}
+
 // ErrNetworkUnavailable marks a resume failure caused by the network
-// path to Proton, not by the stored credentials. Callers should
-// retry later rather than demand a re-login.
+// path to Proton (or a transient 429 / 5xx from it), not by the stored
+// credentials. Callers should retry later rather than demand a
+// re-login.
 var ErrNetworkUnavailable = errors.New("proton API unreachable")
 
 // isNetworkError reports whether err is transport-shaped: timeouts,

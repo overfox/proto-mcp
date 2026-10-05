@@ -6,6 +6,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	protonclient "github.com/just-an-oldsalt/proto-mcp/internal/proton"
 )
 
 // idleTracker.run normally ticks every 30s, which is too slow for
@@ -32,7 +34,7 @@ func TestIdleTrackerLocksWhenThresholdExceeded(t *testing.T) {
 	minutesFn := func() int { return 5 } // threshold: 5 min, actual: 10 min
 
 	ctx, cancel := context.WithCancel(context.Background())
-	go tr.run(ctx, minutesFn, lockFn, slog.Default())
+	go tr.run(ctx, minutesFn, nil, lockFn, slog.Default())
 	defer func() { cancel(); tr.close() }()
 
 	// 30-second tick is too slow for tests — manually trigger the
@@ -62,7 +64,7 @@ func TestIdleTrackerSkipsWhenDisabled(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		tr.run(ctx, minutesFn, lockFn, slog.Default())
+		tr.run(ctx, minutesFn, nil, lockFn, slog.Default())
 		close(done)
 	}()
 
@@ -83,4 +85,42 @@ func TestIdleTrackerCloseIdempotent(t *testing.T) {
 	tr := newIdleTracker()
 	tr.close()
 	tr.close() // must not panic
+}
+
+// A locked daemon must not re-run the idle check: the old code logged
+// "idle threshold exceeded" (and re-called Lock) every 30s tick for as
+// long as it stayed locked.
+func TestIdleTrackerCheckSkipsWhileLocked(t *testing.T) {
+	tr := newIdleTracker()
+	tr.lastActivity.Store(time.Now().Add(-10 * time.Minute).UnixNano())
+	var calls atomic.Int32
+	lockFn := func(string) { calls.Add(1) }
+	tr.check(func() int { return 5 }, func() bool { return true }, lockFn, discardLogger())
+	if calls.Load() != 0 {
+		t.Fatal("idle check locked an already-locked daemon")
+	}
+	tr.check(func() int { return 5 }, func() bool { return false }, lockFn, discardLogger())
+	if calls.Load() != 1 {
+		t.Fatalf("idle check did not lock an idle unlocked daemon (calls=%d)", calls.Load())
+	}
+}
+
+// Unlock is activity: the idle clock restarts at unlock, so the daemon
+// doesn't re-lock on the first tick after every unlock.
+func TestUnlockResetsIdleClock(t *testing.T) {
+	tr := newIdleTracker()
+	tr.lastActivity.Store(time.Now().Add(-10 * time.Minute).UnixNano())
+	rt := &Runtime{locked: true, idleTracker: tr}
+	rt.acquireSession = func(context.Context) (SessionBundle, error) {
+		return fakeBundle{sess: &protonclient.Session{}}, nil
+	}
+	if err := rt.Unlock(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var locked atomic.Bool
+	skip := func() bool { l, _ := rt.Locked(); return l }
+	tr.check(func() int { return 5 }, skip, func(string) { locked.Store(true) }, discardLogger())
+	if locked.Load() {
+		t.Fatal("daemon re-locked on the first idle tick after unlock")
+	}
 }

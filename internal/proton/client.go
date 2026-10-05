@@ -16,6 +16,7 @@ import (
 	"os"
 	"regexp"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	gpa "github.com/ProtonMail/go-proton-api"
@@ -200,6 +201,7 @@ type Session struct {
 	OnAuthUpdate func(uid, accessToken, refreshToken string)
 
 	closeOnce sync.Once
+	closed    atomic.Bool
 }
 
 // Tokens returns the current (rotating) access + refresh tokens under
@@ -251,19 +253,34 @@ func (s *Session) PrimaryAddress() (gpa.Address, bool) {
 	return fallback, haveFallback
 }
 
+// ErrSessionClosed is returned by session users that notice the
+// session was closed underneath them (daemon lock, shutdown).
+var ErrSessionClosed = errors.New("proton: session closed")
+
+// Closed reports whether Close / CloseAndRevoke has run. Lock-free.
+func (s *Session) Closed() bool {
+	return s == nil || s.closed.Load()
+}
+
 // Close releases local crypto + HTTP state for the session. It does
 // NOT revoke the session on the Proton server — doing so would kill
 // the refresh token we just stored in the Keychain and force a fresh
 // SRP login on every subcommand. For explicit revoke (logout, or
 // abandoning a partial login), call CloseAndRevoke instead.
 //
+// The Client pointer is deliberately NOT nilled: a goroutine still
+// holding the session (background sync, an in-flight tool) used to
+// dereference the nil and crash the daemon. The closed client drops
+// its tokens, so a late call fails with an API error instead of
+// panicking; callers that can check first use Closed().
+//
 // Idempotent via sync.Once.
 func (s *Session) Close() {
 	s.closeOnce.Do(func() {
+		s.closed.Store(true)
 		s.releaseLocal()
 		if s.Client != nil {
 			s.Client.Close()
-			s.Client = nil
 		}
 	})
 }
@@ -277,13 +294,13 @@ func (s *Session) Close() {
 // Idempotent via sync.Once.
 func (s *Session) CloseAndRevoke() {
 	s.closeOnce.Do(func() {
+		s.closed.Store(true)
 		s.releaseLocal()
 		if s.Client != nil {
 			ctx, cancel := detachedShutdownCtx()
 			defer cancel()
 			_ = s.Client.AuthDelete(ctx)
 			s.Client.Close()
-			s.Client = nil
 		}
 	})
 }

@@ -21,11 +21,15 @@ func runCalendarBackfill(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("calendar-backfill", flag.ContinueOnError)
 	dbPath := fs.String("db", "", "SQLite store path (default: platform-standard data dir)")
 	decrypt := fs.Bool("decrypt", false, "also decrypt every event now (warms full-text search; slower)")
+	force := fs.Bool("force", false, "run even though protonmcpd is running (rotates the daemon's refresh token)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() > 0 {
 		return fmt.Errorf("calendar-backfill takes no positional arguments; got %v", fs.Args())
+	}
+	if err := refuseIfDaemonRunning("calendar-backfill", *force); err != nil {
+		return err
 	}
 
 	path := *dbPath

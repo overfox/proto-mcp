@@ -2,8 +2,12 @@ package session
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/just-an-oldsalt/proto-mcp/internal/keystore"
+	protonclient "github.com/just-an-oldsalt/proto-mcp/internal/proton"
 )
 
 // TestLoginRequiredMatchesSentinel — D44 depends on protonmcpd being
@@ -33,5 +37,22 @@ func TestLoginRequiredKeepsRemediationText(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "boom") {
 		t.Errorf("underlying cause missing from %q", err)
+	}
+}
+
+// 429 / 5xx during resume are transient: AcquireResumeOnly must report
+// ErrNetworkUnavailable (protonmcpd retries) — not ErrLoginRequired
+// (clean exit, daemon dead until a human intervenes).
+func TestClassifyResumeFailure(t *testing.T) {
+	transient := fmt.Errorf("%w: resume get user: 429 Too Many Requests", protonclient.ErrTransient)
+	if err := classifyResumeFailure(transient); !errors.Is(err, ErrNetworkUnavailable) || errors.Is(err, ErrLoginRequired) {
+		t.Errorf("transient: got %v, want ErrNetworkUnavailable only", err)
+	}
+	expired := fmt.Errorf("%w: resume get user: 401", protonclient.ErrSessionExpired)
+	if err := classifyResumeFailure(expired); !errors.Is(err, ErrLoginRequired) {
+		t.Errorf("expired: got %v, want ErrLoginRequired", err)
+	}
+	if err := classifyResumeFailure(keystore.ErrNotFound); !errors.Is(err, ErrLoginRequired) {
+		t.Errorf("not found: got %v, want ErrLoginRequired", err)
 	}
 }

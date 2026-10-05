@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 
 	gpa "github.com/ProtonMail/go-proton-api"
 	"github.com/go-resty/resty/v2"
@@ -112,18 +113,19 @@ func Resume(ctx context.Context, mgr *gpa.Manager, args ResumeArgs) (*Session, e
 	user, err := client.GetUser(ctx)
 	if err != nil {
 		// If the access token had expired AND the auto-refresh failed
-		// (refresh token is dead), the SDK surfaces a 401 / 422 / 400
+		// (refresh token is dead), the SDK surfaces a 401 / 422(10013)
 		// here. Map those to ErrSessionExpired so the CLI clears the
-		// Keychain and re-prompts cleanly.
-		if isAuthExpired(err) {
-			return nil, closeAndWrap("%w: %v", ErrSessionExpired, err)
+		// Keychain and re-prompts cleanly; 429 / 5xx map to ErrTransient
+		// so the daemon waits them out instead.
+		if sentinel := classifyResumeErr(err); sentinel != nil {
+			return nil, closeAndWrap("%w: resume get user: %w", sentinel, err)
 		}
 		return nil, closeAndWrap("resume get user: %w", err)
 	}
 	addrs, err := client.GetAddresses(ctx)
 	if err != nil {
-		if isAuthExpired(err) {
-			return nil, closeAndWrap("%w: %v", ErrSessionExpired, err)
+		if sentinel := classifyResumeErr(err); sentinel != nil {
+			return nil, closeAndWrap("%w: resume get addresses: %w", sentinel, err)
 		}
 		return nil, closeAndWrap("resume get addresses: %w", err)
 	}
@@ -140,30 +142,77 @@ func Resume(ctx context.Context, mgr *gpa.Manager, args ResumeArgs) (*Session, e
 	return sess, nil
 }
 
+// ErrTransient marks a resume failure the server says is temporary
+// (rate limiting, 5xx). The stored credentials are fine; callers should
+// back off and retry instead of wiping the Keychain or demanding a
+// re-login.
+var ErrTransient = errors.New("proton: transient server error")
+
 // isAuthExpired distinguishes "token dead" from other failure modes
-// (network down, server 500, etc.) so callers know whether to wipe
-// the keystore or retry later.
+// (network down, rate limiting, server 500, etc.) so callers know
+// whether to wipe the keystore or retry later.
 //
-// Proton's auth endpoints can signal dead-token in several shapes:
+// Only two shapes mean the stored refresh token is genuinely dead:
 //
-//   - HTTP 401 wrapped as gpa.APIError (classic unauthorized)
-//   - HTTP 422 with Code=10013 ("Invalid refresh token") wrapped as
-//     resty.ResponseError — what /auth/v4/refresh actually returns
-//     when the token has been revoked by an AuthDelete call
+//   - HTTP 401 (classic unauthorized — the auto-refresh-on-401 path
+//     itself failed to recover)
+//   - HTTP 422 with Code=10013 ("Invalid refresh token") — what
+//     /auth/v4/refresh returns once the token was rotated or revoked
 //
-// We treat any 4xx response from the refresh endpoint as "token
-// effectively expired — wipe and re-prompt"; only 5xx and network
-// errors leave the Keychain entry alone so they don't blow it away
-// on a transient outage.
+// Everything else — notably 429 (rate limited) and any other 4xx —
+// used to be lumped in as "expired", and TryResume then DELETED the
+// Keychain entry on a transient throttle, forcing a full re-login.
+// Wiping is irreversible, so we only do it on an unambiguous signal.
 func isAuthExpired(err error) bool {
-	var apiErr *gpa.APIError
-	if errors.As(err, &apiErr) {
-		return apiErr.Status >= 400 && apiErr.Status < 500
+	status, code, ok := responseStatus(err)
+	if !ok {
+		return false
 	}
-	var respErr *resty.ResponseError
-	if errors.As(err, &respErr) && respErr.Response != nil {
-		sc := respErr.Response.StatusCode()
-		return sc >= 400 && sc < 500
+	switch status {
+	case http.StatusUnauthorized:
+		return true
+	case http.StatusUnprocessableEntity:
+		return code == gpa.AuthRefreshTokenInvalid
 	}
 	return false
+}
+
+// isTransient reports a server answer that says "try again later":
+// 429 Too Many Requests or any 5xx.
+func isTransient(err error) bool {
+	status, _, ok := responseStatus(err)
+	if !ok {
+		return false
+	}
+	return status == http.StatusTooManyRequests || status >= 500
+}
+
+// responseStatus digs the HTTP status (and Proton API code, when the
+// body parsed) out of an SDK error chain. go-proton-api surfaces API
+// failures as *gpa.APIError, sometimes behind a *resty.ResponseError;
+// either may be wrapped by fmt.Errorf. ok=false means the error carried
+// no HTTP response (transport failure, local error).
+func responseStatus(err error) (status int, code gpa.Code, ok bool) {
+	var apiErr *gpa.APIError
+	if errors.As(err, &apiErr) && apiErr.Status != 0 {
+		return apiErr.Status, apiErr.Code, true
+	}
+	var respErr *resty.ResponseError
+	if errors.As(err, &respErr) && respErr.Response != nil && respErr.Response.RawResponse != nil {
+		return respErr.Response.StatusCode(), 0, true
+	}
+	return 0, 0, false
+}
+
+// classifyResumeErr maps an SDK error from the resume calls onto the
+// sentinel callers act on: ErrSessionExpired (wipe + re-login),
+// ErrTransient (retry later), or nil (unclassified — surface as-is).
+func classifyResumeErr(err error) error {
+	switch {
+	case isAuthExpired(err):
+		return ErrSessionExpired
+	case isTransient(err):
+		return ErrTransient
+	}
+	return nil
 }

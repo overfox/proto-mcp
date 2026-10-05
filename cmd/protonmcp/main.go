@@ -12,6 +12,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"os/signal"
@@ -81,10 +82,7 @@ func main() {
 			err = runInspect(ctx, args)
 		}
 	case "whoami":
-		err = requireNoArgs("whoami", args)
-		if err == nil {
-			err = runWhoami(ctx)
-		}
+		err = runWhoami(ctx, args)
 	case "backfill":
 		err = runBackfill(ctx, args)
 	case "calendar-backfill":
@@ -140,6 +138,10 @@ Commands:
   backfill   Drain message metadata into the local SQLite mirror. Same
              session-resume behavior as whoami.
              Flags: --db <path>, --yes (skip confirm), --limit <n>.
+             whoami / backfill / calendar-backfill / sync / read (on a
+             cache miss) refuse while protonmcpd is running — their
+             own Keychain resume would rotate the daemon's refresh
+             token. Use the daemon's tools instead, or pass --force.
   calendar-backfill
              Mirror calendars + event metadata into the local store.
              Pass --decrypt to also decrypt every event now (warms
@@ -273,7 +275,19 @@ func collectCredentials(ctx context.Context) (*protonclient.Credentials, error) 
 	return creds, nil
 }
 
-func runWhoami(ctx context.Context) error {
+func runWhoami(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("whoami", flag.ContinueOnError)
+	force := fs.Bool("force", false, "run even though protonmcpd is running (rotates the daemon's refresh token)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := requireNoArgs("whoami", fs.Args()); err != nil {
+		return err
+	}
+	if err := refuseIfDaemonRunning("whoami", *force); err != nil {
+		return err
+	}
+
 	acquireCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 
