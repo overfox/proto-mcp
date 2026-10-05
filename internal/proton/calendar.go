@@ -202,6 +202,10 @@ type CalendarEventDetail struct {
 
 	IsRecurring bool   `json:"recurring"`
 	RRULE       string `json:"rrule,omitempty"`
+	// RecurrenceID is the original start (unix) of the occurrence this
+	// event overrides, when the event is a RECURRENCE-ID exception of a
+	// recurring series; 0 otherwise.
+	RecurrenceID int64 `json:"recurrence_id_unix,omitempty"`
 
 	Attendees []CalendarAttendeeDetail `json:"attendees,omitempty"`
 
@@ -333,10 +337,25 @@ func (s *Session) DecryptCalendarEvent(ctx context.Context, ev gpa.CalendarEvent
 		return nil, err
 	}
 
-	raw, err := decryptSharedPart(calKR, ev.SharedKeyPacket, ev.SharedEvents)
+	texts, err := decryptEventParts(calKR, ev.SharedKeyPacket, ev.SharedEvents)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt event %s: %w", ev.ID, err)
 	}
+	// Attendee list (encrypted to the shared session key) and calendar-
+	// level fields (STATUS/TRANSP, encrypted to the calendar key packet)
+	// live in separate part lists. Best-effort: an unreadable auxiliary
+	// part must not hide the core event.
+	if len(ev.AttendeesEvents) > 0 {
+		if more, aerr := decryptEventParts(calKR, ev.SharedKeyPacket, ev.AttendeesEvents); aerr == nil {
+			texts = append(texts, more...)
+		}
+	}
+	if len(ev.CalendarEvents) > 0 {
+		if more, cerr := decryptEventParts(calKR, ev.CalendarKeyPacket, ev.CalendarEvents); cerr == nil {
+			texts = append(texts, more...)
+		}
+	}
+	raw := joinICalParts(texts)
 
 	fields, err := parseICalEvent(raw)
 	if err != nil {
@@ -344,22 +363,23 @@ func (s *Session) DecryptCalendarEvent(ctx context.Context, ev gpa.CalendarEvent
 	}
 
 	detail := &CalendarEventDetail{
-		EventID:     ev.ID,
-		CalendarID:  ev.CalendarID,
-		UID:         firstNonEmpty(ev.UID, fields.UID),
-		Summary:     fields.Summary,
-		Location:    fields.Location,
-		Description: fields.Description,
-		Organizer:   fields.Organizer,
-		Status:      fields.Status,
-		StartUnix:   ev.StartTime,
-		StartTZ:     ev.StartTimezone,
-		EndUnix:     ev.EndTime,
-		EndTZ:       ev.EndTimezone,
-		AllDay:      bool(ev.FullDay),
-		IsRecurring: fields.IsRecurring,
-		RRULE:       fields.RRULE,
-		RawICal:     raw,
+		EventID:      ev.ID,
+		CalendarID:   ev.CalendarID,
+		UID:          firstNonEmpty(ev.UID, fields.UID),
+		Summary:      fields.Summary,
+		Location:     fields.Location,
+		Description:  fields.Description,
+		Organizer:    fields.Organizer,
+		Status:       fields.Status,
+		StartUnix:    ev.StartTime,
+		StartTZ:      ev.StartTimezone,
+		EndUnix:      ev.EndTime,
+		EndTZ:        ev.EndTimezone,
+		AllDay:       bool(ev.FullDay),
+		IsRecurring:  fields.IsRecurring,
+		RRULE:        fields.RRULE,
+		RecurrenceID: fields.RecurrenceID,
+		RawICal:      raw,
 	}
 	for _, a := range fields.Attendees {
 		detail.Attendees = append(detail.Attendees, CalendarAttendeeDetail(a))
@@ -367,16 +387,31 @@ func (s *Session) DecryptCalendarEvent(ctx context.Context, ev gpa.CalendarEvent
 	return detail, nil
 }
 
-// decryptSharedPart decrypts the SharedEvents iCalendar payload using the
-// calendar keyring and the event's SharedKeyPacket. This replicates
-// CalendarEventPart.Decode's working logic (see the note at the top of
-// the file). Signature verification is intentionally not performed: for
-// shared/invited events the author is a third party whose public key we
-// don't hold, and confidentiality is already guaranteed by decrypting
-// with the calendar key.
+// decryptSharedPart decrypts an event part list (SharedEvents or
+// AttendeesEvents) using the calendar keyring and the key packet, and
+// returns every part's iCalendar text concatenated. Proton splits one
+// VEVENT across parts — a signed-only clear part (UID/DTSTART/RRULE/
+// EXDATE/RECURRENCE-ID …) and an encrypted part (SUMMARY/LOCATION/
+// DESCRIPTION) — so returning only the first part would drop half the
+// event. Each part is a complete VCALENDAR; parseICalEvent merges them.
+//
+// This replicates CalendarEventPart.Decode's working logic (see the note
+// at the top of the file). Signature verification is intentionally not
+// performed: for shared/invited events the author is a third party whose
+// public key we don't hold, and confidentiality is already guaranteed by
+// decrypting with the calendar key.
 func decryptSharedPart(calKR *crypto.KeyRing, keyPacketB64 string, parts []gpa.CalendarEventPart) (string, error) {
+	texts, err := decryptEventParts(calKR, keyPacketB64, parts)
+	if err != nil {
+		return "", err
+	}
+	return joinICalParts(texts), nil
+}
+
+// decryptEventParts returns the plaintext of every non-empty part.
+func decryptEventParts(calKR *crypto.KeyRing, keyPacketB64 string, parts []gpa.CalendarEventPart) ([]string, error) {
 	if len(parts) == 0 {
-		return "", errors.New("event has no shared parts")
+		return nil, errors.New("event has no shared parts")
 	}
 
 	var kp []byte
@@ -384,15 +419,16 @@ func decryptSharedPart(calKR *crypto.KeyRing, keyPacketB64 string, parts []gpa.C
 		var err error
 		kp, err = base64.StdEncoding.DecodeString(keyPacketB64)
 		if err != nil {
-			return "", fmt.Errorf("decode shared key packet: %w", err)
+			return nil, fmt.Errorf("decode shared key packet: %w", err)
 		}
 	}
 
+	var out []string
 	for _, part := range parts {
 		// Clear (unencrypted) part — the data is already plaintext.
 		if part.Type&gpa.CalendarEventTypeEncrypted == 0 {
 			if strings.TrimSpace(part.Data) != "" {
-				return part.Data, nil
+				out = append(out, part.Data)
 			}
 			continue
 		}
@@ -401,24 +437,45 @@ func decryptSharedPart(calKR *crypto.KeyRing, keyPacketB64 string, parts []gpa.C
 		if kp != nil {
 			data, err := base64.StdEncoding.DecodeString(part.Data)
 			if err != nil {
-				return "", fmt.Errorf("decode event data: %w", err)
+				return nil, fmt.Errorf("decode event data: %w", err)
 			}
 			msg = crypto.NewPGPSplitMessage(kp, data).GetPGPMessage()
 		} else {
 			var err error
 			if msg, err = crypto.NewPGPMessageFromArmored(part.Data); err != nil {
-				return "", fmt.Errorf("parse armored event data: %w", err)
+				return nil, fmt.Errorf("parse armored event data: %w", err)
 			}
 		}
 
 		dec, err := calKR.Decrypt(msg, nil, crypto.GetUnixTime())
 		if err != nil {
-			return "", fmt.Errorf("decrypt event part: %w", err)
+			return nil, fmt.Errorf("decrypt event part: %w", err)
 		}
-		return dec.GetString(), nil
+		if txt := dec.GetString(); strings.TrimSpace(txt) != "" {
+			out = append(out, txt)
+		}
 	}
 
-	return "", errors.New("no decryptable shared event part")
+	if len(out) == 0 {
+		return nil, errors.New("no decryptable shared event part")
+	}
+	return out, nil
+}
+
+// joinICalParts concatenates per-part VCALENDAR texts into one stream
+// (each guaranteed newline-terminated). A single part is returned as-is.
+func joinICalParts(texts []string) string {
+	if len(texts) == 1 {
+		return texts[0]
+	}
+	var b strings.Builder
+	for _, t := range texts {
+		b.WriteString(t)
+		if !strings.HasSuffix(t, "\n") {
+			b.WriteString("\r\n")
+		}
+	}
+	return b.String()
 }
 
 func firstNonEmpty(a, b string) string {
