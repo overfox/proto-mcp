@@ -145,6 +145,12 @@ tools:
   mail_mark_unread:
     decision: allow
     description: "Mark messages as unread (reversible)"
+  mail_star:
+    decision: allow
+    description: "Star messages (reversible via mail_unstar)"
+  mail_unstar:
+    decision: allow
+    description: "Unstar messages (reversible via mail_star)"
   mail_trash:
     decision: prompt
     ttl: 5m
