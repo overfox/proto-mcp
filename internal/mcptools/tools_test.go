@@ -20,6 +20,10 @@ import (
 // I was talked into dots; live test surfaced the validation error
 // "FrontendRemoteMcpToolDefinition.name: String should match pattern
 // '^[a-zA-Z0-9_-]{1,64}$'".
+// expectedToolCount is the number of tools All registers. One
+// constant so both count assertions move together.
+const expectedToolCount = 48
+
 var claudeDesktopNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)
 
 // TestToolNamesAreClaudeDesktopCompatible enforces the
@@ -57,8 +61,8 @@ func TestAllToolsBuild(t *testing.T) {
 	defer st.Close()
 
 	tools := All(Deps{Store: st})
-	if len(tools) != 36 {
-		t.Errorf("expected 36 tools, got %d", len(tools))
+	if len(tools) != expectedToolCount {
+		t.Errorf("expected %d tools, got %d", expectedToolCount, len(tools))
 	}
 
 	want := map[string]bool{
@@ -105,6 +109,19 @@ func TestAllToolsBuild(t *testing.T) {
 		"calendar_list":       false,
 		"calendar_events":     false,
 		"calendar_read_event": false,
+		// Archival / triage additions.
+		"mail_export_eml":      false,
+		"mail_star":            false,
+		"mail_unstar":          false,
+		"mail_attachment_text": false,
+		"contacts_search":      false,
+		"mail_digest":          false,
+		"mail_awaiting_reply":  false,
+		"mail_report_spam":     false,
+		"rules_list":           false,
+		"rules_set":            false,
+		"rules_delete":         false,
+		"rules_run":            false,
 	}
 	for _, tl := range tools {
 		if _, ok := want[tl.Name]; !ok {
@@ -150,8 +167,8 @@ func TestAllToolsRegisterIntoServer(t *testing.T) {
 		srv.Register(tl)
 	}
 	got := srv.Tools()
-	if len(got) != 36 {
-		t.Errorf("server registry has %d tools, want 36", len(got))
+	if len(got) != expectedToolCount {
+		t.Errorf("server registry has %d tools, want %d", len(got), expectedToolCount)
 	}
 }
 

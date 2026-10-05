@@ -34,6 +34,7 @@ type messageSummary struct {
 	Date           time.Time `json:"date"`
 	Folder         string    `json:"folder,omitempty"`
 	Unread         bool      `json:"unread,omitempty"`
+	Starred        bool      `json:"starred,omitempty"`
 	HasAttachments bool      `json:"has_attachments,omitempty"`
 	Snippet        string    `json:"snippet,omitempty"`
 }
@@ -163,6 +164,7 @@ func hitToSummary(h store.SearchHit) messageSummary {
 		Folder:         h.Folder,
 		Snippet:        h.Snippet,
 		Unread:         h.Unread,
+		Starred:        h.Starred,
 		HasAttachments: h.HasAttachments,
 	}
 }
@@ -199,6 +201,7 @@ const messageListSchema = `{
 					"date":            {"type": "string"},
 					"folder":          {"type": "string"},
 					"unread":          {"type": "boolean"},
+					"starred":         {"type": "boolean"},
 					"has_attachments": {"type": "boolean"},
 					"snippet":         {"type": "string"}
 				},

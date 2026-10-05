@@ -18,6 +18,7 @@ type SearchHit struct {
 	Folder         string
 	Snippet        string // up to ~200 chars from body_text
 	Unread         bool
+	Starred        bool
 	HasAttachments bool
 }
 
@@ -46,23 +47,25 @@ type ListFilter struct {
 }
 
 // Search runs a query against the local mirror and returns matching
-// rows. The query string uses a small DSL:
+// rows. The query string is the DSL documented in query.go:
 //
-//	from:alice          → from_address LIKE %alice%
-//	to:bob              → to_json LIKE %bob%
-//	subject:gear        → subject LIKE %gear%
+//	from:alice          → from_address OR from_name contains alice
+//	to:bob  cc:carol    → to_json / cc_json contains the value
+//	subject:gear        → subject contains gear
 //	in:inbox            → folder = inbox
-//	before:2026-01-01   → date < ts
-//	after:2025-12-01    → date >= ts
+//	label:<name|id>     → has the label
+//	before:2026-01-01   → date < ts        (alias until:)
+//	after:2025-12-01    → date >= ts       (alias since:)
 //	has:attachment      → has_attachments = 1
-//	bare terms          → messages_fts MATCH (against subject/from/body)
+//	is:unread|read|starred
+//	bare terms          → messages_fts MATCH (subject/from/to/body)
 //
-// Prefixed terms translate to structured WHERE clauses; bare terms
-// feed into the FTS5 MATCH expression. Combine freely; everything
-// AND-joined.
+// combined with implicit AND, upper-case OR (binds tighter than AND),
+// -negation and (grouping). Every leaf compiles to a parameterized SQL
+// fragment.
 //
-// Result ordering: FTS rank if any bare terms were given, otherwise
-// date descending.
+// Result ordering: bm25 rank of the positive full-text terms if any
+// were given, otherwise date descending.
 func (s *Store) Search(ctx context.Context, query string, opts SearchOpts) ([]SearchHit, error) {
 	parsed := parseQuery(query)
 
@@ -81,46 +84,14 @@ func (s *Store) Search(ctx context.Context, query string, opts SearchOpts) ([]Se
 	}
 
 	var (
-		conds  []string
-		args   []any
-		fromFTS bool
+		conds []string
+		args  []any
 	)
 
-	if parsed.fts != "" {
-		// Join messages → messages_fts on message_id. Adding the FTS
-		// table forces SQLite to walk only the matching rows.
-		conds = append(conds, "messages.id IN (SELECT message_id FROM messages_fts WHERE messages_fts MATCH ?)")
-		args = append(args, parsed.fts)
-		fromFTS = true
-	}
-	for col, like := range parsed.likes {
-		conds = append(conds, fmt.Sprintf("messages.%s LIKE ?", col))
-		args = append(args, "%"+like+"%")
-	}
-	if parsed.folder != "" {
-		conds = append(conds, "messages.folder = ?")
-		args = append(args, parsed.folder)
-	}
-	if parsed.hasAttachment {
-		conds = append(conds, "messages.has_attachments = 1")
-	}
-	if parsed.label != "" {
-		// label: accepts a label_id or a case-insensitive label
-		// name; the subquery matches either against the labels
-		// mirror. An unknown value simply matches zero rows.
-		conds = append(conds, `messages.id IN (
-			SELECT message_id FROM message_labels
-			 WHERE label_id = ?
-			    OR label_id IN (SELECT id FROM labels WHERE LOWER(name) = LOWER(?)))`)
-		args = append(args, parsed.label, parsed.label)
-	}
-	if !parsed.before.IsZero() {
-		conds = append(conds, "messages.date < ?")
-		args = append(args, parsed.before.Unix())
-	}
-	if !parsed.after.IsZero() {
-		conds = append(conds, "messages.date >= ?")
-		args = append(args, parsed.after.Unix())
+	cq := compileQuery(parsed)
+	if cq.where != "" {
+		conds = append(conds, cq.where)
+		args = append(args, cq.args...)
 	}
 
 	// Extra structured filter, layered AND. mail.list uses this with
@@ -156,24 +127,35 @@ func (s *Store) Search(ctx context.Context, query string, opts SearchOpts) ([]Se
 	}
 
 	orderBy := "messages.date DESC"
-	if fromFTS {
-		// FTS5 rank exposed via the rowid->bm25 column. Subselect
-		// already filters by MATCH; reorder by joining on rank.
-		orderBy = "(SELECT rank FROM messages_fts WHERE message_id = messages.id) ASC, messages.date DESC"
+	var orderArgs []any
+	if len(cq.rankTerms) > 0 {
+		// bm25 rank of the positive full-text terms (OR-joined so a
+		// row matched via any branch gets a score). Rows matched only
+		// through a structured branch have no rank and sort after the
+		// ranked ones, newest first. The MATCH expression is bound as
+		// a parameter and built only from phrase-quoted terms.
+		orderBy = "rnk IS NULL, rnk ASC, messages.date DESC"
+		orderArgs = append(orderArgs, strings.Join(cq.rankTerms, " OR "))
 	}
 
 	// SECURITY C-8. LIMIT / OFFSET bound as ? parameters rather than
 	// Sprintf'd in — same defense-in-depth as the WHERE clause args.
 	// orderBy is one of two hard-coded literals (the FTS-rank or the
-	// plain date-DESC variants above), NOT user input.
+	// plain date-DESC variants above), NOT user input; where is built
+	// only from fixed fragments (see compileQuery).
+	rankCol := "NULL AS rnk"
+	if len(orderArgs) > 0 {
+		rankCol = "(SELECT rank FROM messages_fts WHERE messages_fts MATCH ? AND message_id = messages.id) AS rnk"
+	}
 	q := fmt.Sprintf(`
 SELECT id, thread_id, subject, from_address, from_name, date, folder, body_text,
-       unread, has_attachments
+       unread, has_attachments, starred, %s
   FROM messages
  WHERE %s
  ORDER BY %s
  LIMIT ? OFFSET ?
-`, where, orderBy)
+`, rankCol, where, orderBy)
+	args = append(orderArgs, args...)
 	args = append(args, opts.Limit, opts.Offset)
 
 	rows, err := s.DB.QueryContext(ctx, q, args...)
@@ -190,13 +172,16 @@ SELECT id, thread_id, subject, from_address, from_name, date, folder, body_text,
 			bodyText *string
 			unread   int
 			hasAtt   int
+			starred  int
+			rank     *float64
 		)
 		if err := rows.Scan(&h.MessageID, &h.ThreadID, &h.Subject,
 			&h.FromAddress, &h.FromName, &dateUnix, &h.Folder, &bodyText,
-			&unread, &hasAtt); err != nil {
+			&unread, &hasAtt, &starred, &rank); err != nil {
 			return nil, fmt.Errorf("search scan: %w", err)
 		}
 		h.Unread = unread != 0
+		h.Starred = starred != 0
 		h.HasAttachments = hasAtt != 0
 		h.Date = time.Unix(dateUnix, 0).UTC()
 		if bodyText != nil {

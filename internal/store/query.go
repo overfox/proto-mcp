@@ -5,136 +5,454 @@ import (
 	"time"
 )
 
-// parsedQuery is the structured form of a user's search input.
-// parseQuery splits a query on whitespace and routes each token to
-// the right field; unknown prefixes (`foo:bar`) and bare terms
-// accumulate into the FTS5 MATCH expression.
-type parsedQuery struct {
-	// likes is a small map of column → LIKE substring. Avoids the
-	// FTS5 path for trivial prefix queries (from:alice) so we don't
-	// pay tokenizer setup cost for what's effectively a substring scan.
-	// Only structured fields go in here: from_address, from_name,
-	// to_json (for to:), subject.
-	likes map[string]string
+// Search DSL v2.
+//
+// A query is a boolean expression over leaf criteria:
+//
+//	from:alice              sender address OR display name contains "alice"
+//	to:bob  cc:carol        recipient lists contain the value
+//	subject:"gear list"     subject contains the (quoted) phrase
+//	in:inbox                folder (in:all / any / all_mail / * = no filter)
+//	label:<name-or-id>      has the label
+//	has:attachment          has attachments
+//	is:unread / is:read / is:starred
+//	before:/until:  after:/since:   YYYY-MM-DD date bounds
+//	bare terms / "quoted phrases"   full-text (subject, sender, recipients, body)
+//
+// Operators:
+//
+//	a b           implicit AND
+//	a OR b        either (upper-case OR only; lower-case "or" is a term)
+//	-a            negation (works on any leaf or group: -from:x, -label:y, -(a OR b))
+//	( ... )       grouping
+//
+// Precedence follows Gmail: OR binds tighter than the implicit AND, so
+// `from:a OR from:b subject:x` means (from:a OR from:b) AND subject:x.
+// Repeated prefixes AND together (`from:a from:b` requires both) —
+// v1 kept only the last one.
+//
+// Every leaf compiles to a fixed SQL fragment with its value bound as a
+// parameter; user input never reaches the SQL text. Full-text leaves
+// are phrase-quoted (SECURITY C-9) so FTS5 operators inside a term are
+// matched literally.
 
-	folder        string
-	label         string // label: value — label_id OR label name, resolved in Search
-	hasAttachment bool
-	before        time.Time
-	after         time.Time
-	fts           string // FTS5 MATCH expression, "" if none
+// queryNode is one node in the parsed expression tree. Exactly one of
+// the shapes is used per kind.
+type queryNode struct {
+	kind     nodeKind
+	children []*queryNode // and / or
+	child    *queryNode   // not
+	leaf     leaf         // leaf
 }
 
-func parseQuery(input string) parsedQuery {
-	p := parsedQuery{likes: map[string]string{}}
-	var ftsTerms []string
+type nodeKind int
 
-	for _, tok := range tokenizeQuery(input) {
-		key, val, hasColon := splitPrefix(tok)
-		if !hasColon {
-			ftsTerms = append(ftsTerms, tok)
+const (
+	nodeAnd nodeKind = iota
+	nodeOr
+	nodeNot
+	nodeLeaf
+)
+
+// leafKind enumerates the criteria a leaf can test.
+type leafKind int
+
+const (
+	leafFTS leafKind = iota
+	leafFrom
+	leafTo
+	leafCc
+	leafSubject
+	leafFolder
+	leafLabel
+	leafHasAttachment
+	leafUnread
+	leafRead
+	leafStarred
+	leafBefore
+	leafAfter
+)
+
+type leaf struct {
+	kind  leafKind
+	value string    // text value (FTS term, LIKE substring, folder, label)
+	date  time.Time // before / after
+}
+
+// Parser limits. Queries come from an LLM tool call; these bound the
+// work (and the SQL size) a pathological query can cause.
+const (
+	maxQueryTokens = 200
+	maxQueryDepth  = 16
+)
+
+// queryToken is one lexical token. quoted tokens are always literal
+// (a quoted "OR" or "-x" is a search term, not an operator).
+type queryToken struct {
+	text   string
+	quoted bool
+	paren  byte // '(' or ')' for grouping tokens, else 0
+}
+
+// parseQuery parses the DSL into an expression tree. Returns nil for
+// an empty query (no criteria). Parsing is lenient by design: unknown
+// prefixes become full-text terms, unparsable dates are dropped,
+// unbalanced parentheses are tolerated.
+func parseQuery(input string) *queryNode {
+	toks := tokenizeQuery(input)
+	if len(toks) > maxQueryTokens {
+		toks = toks[:maxQueryTokens]
+	}
+	p := &queryParser{toks: toks}
+	n := p.parseAnd(0)
+	return simplify(n)
+}
+
+type queryParser struct {
+	toks []queryToken
+	pos  int
+}
+
+func (p *queryParser) peek() (queryToken, bool) {
+	if p.pos >= len(p.toks) {
+		return queryToken{}, false
+	}
+	return p.toks[p.pos], true
+}
+
+func isOr(t queryToken) bool { return !t.quoted && t.paren == 0 && t.text == "OR" }
+
+// parseAnd: or-expr+ until end or a closing paren.
+func (p *queryParser) parseAnd(depth int) *queryNode {
+	and := &queryNode{kind: nodeAnd}
+	for {
+		t, ok := p.peek()
+		if !ok {
+			break
+		}
+		if t.paren == ')' {
+			if depth > 0 {
+				break
+			}
+			p.pos++ // stray ')' at top level: ignore
 			continue
 		}
-		switch strings.ToLower(key) {
-		case "from":
-			// Match either the address or the display name — users
-			// usually type "alice" without remembering which.
-			p.likes["from_address"] = val
-		case "to":
-			// to_json is a JSON array of {name, address}; LIKE
-			// substring matches both the address and the name in
-			// the same pass.
-			p.likes["to_json"] = val
-		case "subject":
-			p.likes["subject"] = val
-		case "in":
-			lower := strings.ToLower(val)
-			// D1/D2: "in:all" is the DSL form of folder="all". Same
-			// LLM intent — list across every folder. Treat as no
-			// folder filter rather than a literal match.
-			switch lower {
-			case "all", "any", "all_mail", "*":
-				// leave p.folder empty → no folder filter
-			default:
-				p.folder = lower
-			}
-		case "label":
-			// Accept either a label_id (exact) or a label NAME
-			// (case-insensitive, resolved against the labels
-			// mirror). Users think in names; the model often only
-			// has ids — support both in one prefix.
-			p.label = val
-		case "has":
-			if strings.EqualFold(val, "attachment") || strings.EqualFold(val, "attachments") {
-				p.hasAttachment = true
-			}
-		case "before", "until":
-			// Defect D3: "until" as an alias for "before". The LLM
-			// reaches for since/until naturally; was previously
-			// falling through to the unknown-prefix path and
-			// becoming a bare FTS term that matched nothing.
-			if t, ok := parseSearchDate(val); ok {
-				p.before = t
-			}
-		case "after", "since":
-			// Defect D3: "since" alias for "after".
-			if t, ok := parseSearchDate(val); ok {
-				p.after = t
-			}
-		default:
-			// Unknown prefix → treat the whole token as a bare FTS5
-			// term so it still counts toward the match. Better UX
-			// than silently dropping; we accept the risk that a
-			// typo'd prefix produces a weird match instead of zero
-			// results.
-			ftsTerms = append(ftsTerms, tok)
+		if isOr(t) {
+			p.pos++ // dangling OR with no left operand: ignore
+			continue
 		}
+		if n := p.parseOr(depth); n != nil {
+			and.children = append(and.children, n)
+		}
+	}
+	return and
+}
+
+// parseOr: unary ("OR" unary)*
+func (p *queryParser) parseOr(depth int) *queryNode {
+	first := p.parseUnary(depth)
+	or := &queryNode{kind: nodeOr}
+	if first != nil {
+		or.children = append(or.children, first)
+	}
+	for {
+		t, ok := p.peek()
+		if !ok || !isOr(t) {
+			break
+		}
+		p.pos++
+		if next := p.parseUnary(depth); next != nil {
+			or.children = append(or.children, next)
+		}
+	}
+	switch len(or.children) {
+	case 0:
+		return nil
+	case 1:
+		return or.children[0]
+	}
+	return or
+}
+
+// parseUnary: "-" unary | "(" and ")" | leaf
+func (p *queryParser) parseUnary(depth int) *queryNode {
+	t, ok := p.peek()
+	if !ok || t.paren == ')' || isOr(t) {
+		return nil
+	}
+	p.pos++
+
+	if t.paren == '(' {
+		if depth >= maxQueryDepth {
+			// Too deep: treat the group's contents as part of the
+			// enclosing expression rather than recursing further.
+			return nil
+		}
+		inner := p.parseAnd(depth + 1)
+		if nt, ok := p.peek(); ok && nt.paren == ')' {
+			p.pos++
+		}
+		return inner
 	}
 
-	if len(ftsTerms) > 0 {
-		// SECURITY C-9. Phrase-wrap every term so FTS5 metachars
-		// (NEAR, ^, *, parentheses, etc.) lose their operator
-		// meaning. Users who write a bare term get a phrase-match
-		// against that token; users who try to write an FTS5
-		// expression get the literal string matched as a phrase.
-		// Defense-in-depth against query-injection-class DoS like
-		// `NEAR/0 "a" "b"` against a large corpus.
-		quoted := make([]string, 0, len(ftsTerms))
-		for _, t := range ftsTerms {
-			quoted = append(quoted, ftsQuote(t))
+	if !t.quoted && strings.HasPrefix(t.text, "-") {
+		rest := strings.TrimPrefix(t.text, "-")
+		var target *queryNode
+		if rest == "" {
+			// "-" followed by a separate token / group: "- (a b)".
+			if depth >= maxQueryDepth {
+				return nil
+			}
+			target = p.parseUnary(depth + 1)
+		} else {
+			target = leafNode(queryToken{text: rest})
 		}
-		// Default to AND across terms (FTS5 implicit).
-		p.fts = strings.Join(quoted, " ")
+		if target == nil {
+			return nil
+		}
+		return &queryNode{kind: nodeNot, child: target}
 	}
-	return p
+	return leafNode(t)
+}
+
+// leafNode maps a single token to a leaf. Returns nil when the token
+// carries no criterion (e.g. an unparsable date, in:all).
+func leafNode(t queryToken) *queryNode {
+	mk := func(l leaf) *queryNode { return &queryNode{kind: nodeLeaf, leaf: l} }
+	if t.quoted {
+		if t.text == "" {
+			return nil
+		}
+		return mk(leaf{kind: leafFTS, value: t.text})
+	}
+	key, val, hasColon := splitPrefix(t.text)
+	if !hasColon {
+		if t.text == "" {
+			return nil
+		}
+		return mk(leaf{kind: leafFTS, value: t.text})
+	}
+	if val == "" {
+		// "from:" with nothing after it — no criterion.
+		return nil
+	}
+	switch strings.ToLower(key) {
+	case "from":
+		return mk(leaf{kind: leafFrom, value: val})
+	case "to":
+		return mk(leaf{kind: leafTo, value: val})
+	case "cc":
+		return mk(leaf{kind: leafCc, value: val})
+	case "subject":
+		return mk(leaf{kind: leafSubject, value: val})
+	case "in":
+		lower := strings.ToLower(val)
+		// D1/D2: "in:all" is the DSL form of folder="all" — no filter.
+		switch lower {
+		case "all", "any", "all_mail", "*":
+			return nil
+		}
+		return mk(leaf{kind: leafFolder, value: lower})
+	case "label":
+		// label_id OR label name (case-insensitive), resolved in SQL.
+		return mk(leaf{kind: leafLabel, value: val})
+	case "has":
+		if strings.EqualFold(val, "attachment") || strings.EqualFold(val, "attachments") {
+			return mk(leaf{kind: leafHasAttachment})
+		}
+	case "is":
+		switch strings.ToLower(val) {
+		case "unread":
+			return mk(leaf{kind: leafUnread})
+		case "read":
+			return mk(leaf{kind: leafRead})
+		case "starred":
+			return mk(leaf{kind: leafStarred})
+		}
+	case "before", "until":
+		// D3: "until" aliases "before".
+		if d, ok := parseSearchDate(val); ok {
+			return mk(leaf{kind: leafBefore, date: d})
+		}
+		return nil
+	case "after", "since":
+		// D3: "since" aliases "after".
+		if d, ok := parseSearchDate(val); ok {
+			return mk(leaf{kind: leafAfter, date: d})
+		}
+		return nil
+	}
+	// Unknown prefix (or unknown has:/is: value) → the whole token is
+	// a full-text term. Better UX than silently dropping.
+	return mk(leaf{kind: leafFTS, value: t.text})
+}
+
+// simplify flattens single-child groups and drops empty ones. Returns
+// nil when nothing is left.
+func simplify(n *queryNode) *queryNode {
+	if n == nil {
+		return nil
+	}
+	switch n.kind {
+	case nodeAnd, nodeOr:
+		kept := n.children[:0]
+		for _, c := range n.children {
+			if c = simplify(c); c != nil {
+				kept = append(kept, c)
+			}
+		}
+		n.children = kept
+		switch len(kept) {
+		case 0:
+			return nil
+		case 1:
+			return kept[0]
+		}
+		return n
+	case nodeNot:
+		n.child = simplify(n.child)
+		if n.child == nil {
+			return nil
+		}
+		return n
+	}
+	return n
+}
+
+// compiledQuery is the SQL form of a parsed query.
+type compiledQuery struct {
+	where string // "" = no criteria
+	args  []any
+	// rankTerms are the phrase-quoted positive full-text terms (not
+	// under a NOT), OR-joined into one MATCH for bm25 ordering.
+	rankTerms []string
+}
+
+// compileQuery turns the tree into a WHERE fragment over `messages`.
+func compileQuery(n *queryNode) compiledQuery {
+	var c compiledQuery
+	if n == nil {
+		return c
+	}
+	c.where = c.compile(n, false)
+	return c
+}
+
+func (c *compiledQuery) compile(n *queryNode, negated bool) string {
+	switch n.kind {
+	case nodeAnd, nodeOr:
+		op := " AND "
+		if n.kind == nodeOr {
+			op = " OR "
+		}
+		parts := make([]string, 0, len(n.children))
+		for _, ch := range n.children {
+			parts = append(parts, c.compile(ch, negated))
+		}
+		return "(" + strings.Join(parts, op) + ")"
+	case nodeNot:
+		return "(NOT " + c.compile(n.child, !negated) + ")"
+	}
+	l := n.leaf
+	switch l.kind {
+	case leafFTS:
+		q := ftsQuote(l.value)
+		if !negated {
+			c.rankTerms = append(c.rankTerms, q)
+		}
+		c.args = append(c.args, q)
+		return "messages.id IN (SELECT message_id FROM messages_fts WHERE messages_fts MATCH ?)"
+	case leafFrom:
+		v := likeContains(l.value)
+		c.args = append(c.args, v, v)
+		return `(COALESCE(messages.from_address, '') LIKE ? ESCAPE '\' OR COALESCE(messages.from_name, '') LIKE ? ESCAPE '\')`
+	case leafTo:
+		c.args = append(c.args, likeContains(l.value))
+		return `COALESCE(messages.to_json, '') LIKE ? ESCAPE '\'`
+	case leafCc:
+		c.args = append(c.args, likeContains(l.value))
+		return `COALESCE(messages.cc_json, '') LIKE ? ESCAPE '\'`
+	case leafSubject:
+		c.args = append(c.args, likeContains(l.value))
+		return `COALESCE(messages.subject, '') LIKE ? ESCAPE '\'`
+	case leafFolder:
+		c.args = append(c.args, l.value)
+		return "COALESCE(messages.folder, '') = ?"
+	case leafLabel:
+		c.args = append(c.args, l.value, l.value)
+		return `messages.id IN (
+			SELECT message_id FROM message_labels
+			 WHERE label_id = ?
+			    OR label_id IN (SELECT id FROM labels WHERE LOWER(name) = LOWER(?)))`
+	case leafHasAttachment:
+		return "messages.has_attachments = 1"
+	case leafUnread:
+		return "messages.unread = 1"
+	case leafRead:
+		return "messages.unread = 0"
+	case leafStarred:
+		return "messages.starred = 1"
+	case leafBefore:
+		c.args = append(c.args, l.date.Unix())
+		return "messages.date < ?"
+	case leafAfter:
+		c.args = append(c.args, l.date.Unix())
+		return "messages.date >= ?"
+	}
+	return "1=1"
+}
+
+// likeContains wraps v for a substring LIKE, escaping the LIKE
+// wildcards so "50%" or "a_b" match literally (paired with
+// ESCAPE '\' in every fragment).
+func likeContains(v string) string {
+	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return "%" + r.Replace(v) + "%"
 }
 
 // ftsQuote wraps a term in FTS5 phrase-form, escaping embedded
 // double-quotes per the FTS5 syntax (a literal " inside a phrase
 // is doubled: "" → ").
+//
+// SECURITY C-9. Phrase-wrapping every term means FTS5 metachars
+// (NEAR, ^, *, parentheses, AND/OR/NOT) lose their operator meaning.
+// Boolean logic is expressed by the DSL and compiled to SQL instead,
+// never passed through to FTS5. Defense-in-depth against query-
+// injection-class DoS like `NEAR/0 "a" "b"` against a large corpus.
 func ftsQuote(term string) string {
 	return `"` + strings.ReplaceAll(term, `"`, `""`) + `"`
 }
 
 // tokenizeQuery splits the input on whitespace, respecting double-
-// quoted phrases as single tokens (`subject:"gear list"` is one
-// token, value `gear list`).
-func tokenizeQuery(input string) []string {
-	var out []string
+// quoted phrases (`subject:"gear list"` is one token, value
+// `gear list`; a standalone "quoted phrase" is a quoted token) and
+// emitting ( and ) outside quotes as grouping tokens.
+func tokenizeQuery(input string) []queryToken {
+	var out []queryToken
 	var cur strings.Builder
 	inQuote := false
+	// quotedWhole tracks whether the current token began with a quote
+	// (a standalone phrase) — prefix:"x" tokens are not "quoted".
+	quotedWhole := false
 	flush := func() {
-		if cur.Len() > 0 {
-			out = append(out, cur.String())
-			cur.Reset()
+		if cur.Len() > 0 || quotedWhole {
+			out = append(out, queryToken{text: cur.String(), quoted: quotedWhole})
 		}
+		cur.Reset()
+		quotedWhole = false
 	}
 	for _, r := range input {
 		switch {
 		case r == '"':
+			if !inQuote && cur.Len() == 0 {
+				quotedWhole = true
+			}
 			inQuote = !inQuote
-		case !inQuote && (r == ' ' || r == '\t' || r == '\n'):
+		case !inQuote && (r == ' ' || r == '\t' || r == '\n' || r == '\r'):
 			flush()
+		case !inQuote && (r == '(' || r == ')'):
+			flush()
+			out = append(out, queryToken{paren: byte(r)})
 		default:
 			cur.WriteRune(r)
 		}

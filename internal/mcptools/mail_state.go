@@ -206,48 +206,56 @@ func mailMove(deps Deps) mcp.Tool {
 			} else {
 				destFriendly = "" // unknown; we don't know the name
 			}
-
-			// Read current state from the mirror to find the source
-			// folder each message must be unlabeled from. Messages in
-			// different folders group into per-source unlabel batches;
-			// rows missing from the mirror fall back to no-unlabel
-			// (sync hadn't run yet).
-			bySource := map[string][]string{}
-			for _, id := range ids {
-				if m, err := deps.Store.GetMessage(ctx.Std, id); err == nil {
-					if srcID, ok := systemFolderToLabelID[m.Folder]; ok && srcID != destLabelID {
-						bySource[srcID] = append(bySource[srcID], id)
-					}
-				}
+			newFolder, warn, err := moveMessages(ctx.Std, deps, ids, destLabelID, destFriendly)
+			if err != nil {
+				return mcp.ErrorResult("mail_move: %v", err), nil
 			}
-
-			if err := deps.Session.Client.LabelMessages(ctx.Std, ids, destLabelID); err != nil {
-				return mcp.ErrorResult("mail_move: label %s: %v", destLabelID, err), nil
-			}
-			var warn string
-			for srcID, srcIDs := range bySource {
-				if err := deps.Session.Client.UnlabelMessages(ctx.Std, srcIDs, srcID); err != nil {
-					// Destination label already applied — the move is
-					// half-done for this group. Surface as warning,
-					// not failure.
-					warn = fmt.Sprintf("warning: failed to unlabel source %s: %v", srcID, err)
-				}
-			}
-
-			// Mirror update.
-			newFolder := destFriendly
-			if newFolder == "" {
-				newFolder = destLabelID // user folder id
-			}
-			if w := updateMessagesFlag(ctx.Std, deps, ids, func(m *store.Message) {
-				m.Folder = newFolder
-			}); warn == "" {
-				warn = w
-			}
-
 			return mcp.StructuredResult(stateActionOK(ids, "moved_to:"+newFolder, warn))
 		},
 	}
+}
+
+// moveMessages applies destLabelID to ids and removes each message's
+// current system-folder label (read from the mirror; messages in
+// different folders group into per-source unlabel batches; rows
+// missing from the mirror fall back to no-unlabel since sync hadn't
+// run yet), then updates the mirror's folder. destFriendly is the
+// system folder name, or "" for a user folder (the mirror then records
+// the label id). Returns the folder value written and a warning for
+// partial failures; err only when the destination label failed.
+func moveMessages(ctx context.Context, deps Deps, ids []string, destLabelID, destFriendly string) (string, string, error) {
+	bySource := map[string][]string{}
+	for _, id := range ids {
+		if m, err := deps.Store.GetMessage(ctx, id); err == nil {
+			if srcID, ok := systemFolderToLabelID[m.Folder]; ok && srcID != destLabelID {
+				bySource[srcID] = append(bySource[srcID], id)
+			}
+		}
+	}
+
+	if err := deps.Session.Client.LabelMessages(ctx, ids, destLabelID); err != nil {
+		return "", "", fmt.Errorf("label %s: %w", destLabelID, err)
+	}
+	var warn string
+	for srcID, srcIDs := range bySource {
+		if err := deps.Session.Client.UnlabelMessages(ctx, srcIDs, srcID); err != nil {
+			// Destination label already applied — the move is
+			// half-done for this group. Surface as warning,
+			// not failure.
+			warn = fmt.Sprintf("warning: failed to unlabel source %s: %v", srcID, err)
+		}
+	}
+
+	newFolder := destFriendly
+	if newFolder == "" {
+		newFolder = destLabelID // user folder id
+	}
+	if w := updateMessagesFlag(ctx, deps, ids, func(m *store.Message) {
+		m.Folder = newFolder
+	}); warn == "" {
+		warn = w
+	}
+	return newFolder, warn, nil
 }
 
 // mailLabel — add or remove a single label from messages. For moves

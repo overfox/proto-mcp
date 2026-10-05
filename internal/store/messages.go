@@ -3,8 +3,10 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -36,14 +38,39 @@ type Message struct {
 // same ID. Body fields are preserved across upserts (sync updates touch
 // only envelope columns), so callers can re-run backfill without losing
 // the lazily-decrypted body cache.
+//
+// Thread keys. Proton's metadata API carries no conversation id or
+// References / In-Reply-To headers (go-proton-api's MessageMetadata
+// drops ConversationID), so sync can't group replies by itself. What
+// metadata DOES carry is ExternalID — the message's own RFC 822
+// Message-ID. When the caller passes the default thread id (empty or
+// the Proton id, as ToStoreMessage does), UpsertMessage keys the
+// message by its Message-ID instead. That is exactly the value a
+// reply's References[0] names, so once mail_read decrypts a reply
+// (and SetCachedBody records its References root), root and reply
+// share a thread_id. For the same reason a default thread id never
+// overwrites an existing header-derived one on re-sync; an explicit
+// caller-chosen thread id still does.
 func (s *Store) UpsertMessage(ctx context.Context, m Message) error {
+	defaultThread := m.ThreadID == "" || m.ThreadID == m.ID
+	if defaultThread {
+		if key := ThreadKeyFromRaw(m.RawJSON); key != "" {
+			m.ThreadID = key
+		} else if m.ThreadID == "" {
+			m.ThreadID = m.ID
+		}
+	}
 	const q = `
 INSERT INTO messages (
     id, thread_id, subject, from_address, from_name, to_json, cc_json,
     date, unread, starred, has_attachments, folder, size_bytes, raw_json
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
-    thread_id       = excluded.thread_id,
+    thread_id       = CASE
+                        WHEN ? = 1 AND messages.thread_id NOT IN ('', messages.id)
+                        THEN messages.thread_id
+                        ELSE excluded.thread_id
+                      END,
     subject         = excluded.subject,
     from_address    = excluded.from_address,
     from_name       = excluded.from_name,
@@ -62,11 +89,38 @@ ON CONFLICT(id) DO UPDATE SET
 		m.ToJSON, m.CcJSON, m.Date.Unix(),
 		boolToInt(m.Unread), boolToInt(m.Starred), boolToInt(m.HasAttachments),
 		m.Folder, m.SizeBytes, m.RawJSON,
+		boolToInt(defaultThread),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert message %s: %w", m.ID, err)
 	}
 	return nil
+}
+
+// ThreadKeyFromRaw returns the normalized RFC 822 Message-ID carried
+// as ExternalID in a message's metadata JSON (raw_json), or "" when
+// absent / unparsable. Angle brackets and whitespace are stripped so
+// the key compares equal to References / In-Reply-To values.
+func ThreadKeyFromRaw(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	var meta struct {
+		ExternalID string `json:"ExternalID"`
+	}
+	if err := json.Unmarshal([]byte(raw), &meta); err != nil {
+		return ""
+	}
+	return NormalizeMessageID(meta.ExternalID)
+}
+
+// NormalizeMessageID strips whitespace and one layer of angle
+// brackets: "<abc@x>" → "abc@x".
+func NormalizeMessageID(id string) string {
+	id = strings.TrimSpace(id)
+	id = strings.TrimPrefix(id, "<")
+	id = strings.TrimSuffix(id, ">")
+	return strings.TrimSpace(id)
 }
 
 // GetMessage loads a single message by id. Returns ErrNotFound if absent.
@@ -306,9 +360,12 @@ func (s *Store) InvalidateBodyCache(ctx context.Context, messageID string) error
 func (s *Store) PurgeOlderThan(ctx context.Context, cutoff time.Time) (int64, error) {
 	res, err := s.DB.ExecContext(ctx, `
 UPDATE messages
-   SET body_text       = NULL,
-       body_html       = NULL,
-       body_cached_at  = NULL
+   SET body_text        = NULL,
+       body_html        = NULL,
+       body_cached_at   = NULL,
+       body_mime_type   = NULL,
+       body_references  = NULL,
+       body_attachments = NULL
  WHERE body_cached_at IS NOT NULL
    AND body_cached_at  < ?
 `, cutoff.Unix())
@@ -393,6 +450,23 @@ type CachedBody struct {
 	// threading from RFC 2822 In-Reply-To / References headers after
 	// the body fetch.
 	ThreadID string
+
+	// MIMEType / References / Attachments ride alongside the body so a
+	// cache-hit read returns the same shape as a fresh fetch. Optional:
+	// nil/empty values are stored as NULL.
+	MIMEType    string
+	References  []string
+	Attachments []AttachmentMeta
+}
+
+// AttachmentMeta is the per-attachment metadata kept with a cached
+// body (never the bytes — those live in attachment_cache).
+type AttachmentMeta struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	MIMEType string `json:"mime_type,omitempty"`
+	Size     int64  `json:"size"`
+	Inline   bool   `json:"inline,omitempty"`
 }
 
 // SetCachedBody writes the decrypted-and-sanitized body for a message.
@@ -402,24 +476,49 @@ func (s *Store) SetCachedBody(ctx context.Context, msgID string, b CachedBody) e
 	if b.CachedAt.IsZero() {
 		b.CachedAt = time.Now().UTC()
 	}
+	refs, err := nullableJSON(b.References, len(b.References) > 0)
+	if err != nil {
+		return fmt.Errorf("set cached body %s: references: %w", msgID, err)
+	}
+	atts, err := nullableJSON(b.Attachments, len(b.Attachments) > 0)
+	if err != nil {
+		return fmt.Errorf("set cached body %s: attachments: %w", msgID, err)
+	}
+	mime := sql.NullString{String: b.MIMEType, Valid: b.MIMEType != ""}
 	if b.ThreadID == "" {
 		_, err := s.DB.ExecContext(ctx,
-			`UPDATE messages SET body_text = ?, body_html = ?, body_cached_at = ? WHERE id = ?`,
-			b.Text, b.HTML, b.CachedAt.Unix(), msgID,
+			`UPDATE messages SET body_text = ?, body_html = ?, body_cached_at = ?,
+			        body_mime_type = ?, body_references = ?, body_attachments = ?
+			  WHERE id = ?`,
+			b.Text, b.HTML, b.CachedAt.Unix(), mime, refs, atts, msgID,
 		)
 		if err != nil {
 			return fmt.Errorf("set cached body %s: %w", msgID, err)
 		}
 		return nil
 	}
-	_, err := s.DB.ExecContext(ctx,
-		`UPDATE messages SET body_text = ?, body_html = ?, body_cached_at = ?, thread_id = ? WHERE id = ?`,
-		b.Text, b.HTML, b.CachedAt.Unix(), b.ThreadID, msgID,
+	_, err = s.DB.ExecContext(ctx,
+		`UPDATE messages SET body_text = ?, body_html = ?, body_cached_at = ?,
+		        body_mime_type = ?, body_references = ?, body_attachments = ?, thread_id = ?
+		  WHERE id = ?`,
+		b.Text, b.HTML, b.CachedAt.Unix(), mime, refs, atts, b.ThreadID, msgID,
 	)
 	if err != nil {
 		return fmt.Errorf("set cached body %s: %w", msgID, err)
 	}
 	return nil
+}
+
+// nullableJSON marshals v, or returns SQL NULL when present is false.
+func nullableJSON(v any, present bool) (sql.NullString, error) {
+	if !present {
+		return sql.NullString{}, nil
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return sql.NullString{}, err
+	}
+	return sql.NullString{String: string(b), Valid: true}, nil
 }
 
 // GetCachedBody returns the cached body for a message, or ErrNotFound
@@ -431,11 +530,15 @@ func (s *Store) GetCachedBody(ctx context.Context, msgID string) (CachedBody, er
 		text     sql.NullString
 		html     sql.NullString
 		cachedAt sql.NullInt64
+		mime     sql.NullString
+		refs     sql.NullString
+		atts     sql.NullString
 	)
 	err := s.DB.QueryRowContext(ctx,
-		`SELECT body_text, body_html, body_cached_at FROM messages WHERE id = ?`,
+		`SELECT body_text, body_html, body_cached_at, body_mime_type, body_references, body_attachments
+		   FROM messages WHERE id = ?`,
 		msgID,
-	).Scan(&text, &html, &cachedAt)
+	).Scan(&text, &html, &cachedAt, &mime, &refs, &atts)
 	if errors.Is(err, sql.ErrNoRows) {
 		return CachedBody{}, ErrNotFound
 	}
@@ -449,7 +552,16 @@ func (s *Store) GetCachedBody(ctx context.Context, msgID string) (CachedBody, er
 	if time.Since(ts) > BodyTTL {
 		return CachedBody{}, ErrNotFound
 	}
-	return CachedBody{Text: text.String, HTML: html.String, CachedAt: ts}, nil
+	out := CachedBody{Text: text.String, HTML: html.String, CachedAt: ts, MIMEType: mime.String}
+	// Metadata decode failures are non-fatal: the body itself is
+	// intact, the caller just loses the optional extras.
+	if refs.Valid {
+		_ = json.Unmarshal([]byte(refs.String), &out.References)
+	}
+	if atts.Valid {
+		_ = json.Unmarshal([]byte(atts.String), &out.Attachments)
+	}
+	return out, nil
 }
 
 func boolToInt(b bool) int {

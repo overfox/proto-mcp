@@ -10,7 +10,15 @@
 //	labels_list              store.labels (type=1)
 //	folders_list             store.labels (type=3)
 //	mail_sync                internal/sync.RunOnce
-//	account_whoami           proton.Session info
+//	account_whoami           proton.Session info (+ cached plan lookup)
+//	mail_export_eml          GetMessage + attachments → gpa.BuildRFC822
+//	mail_attachment_text     attachment cache + pure-Go PDF/DOCX/XLSX text
+//	mail_star / mail_unstar  Starred system label
+//	mail_report_spam         move to Spam
+//	contacts_search          contact-emails index (name + email only)
+//	mail_digest              store.DigestSince, grouped by sender / label
+//	mail_awaiting_reply      store.SentBetween + HasLaterIncoming
+//	rules_*                  local rules engine (rules.go, ApplyAutoRules)
 //
 // Decisions from Phase 3 planning sign-off:
 //
@@ -68,6 +76,12 @@ type Deps struct {
 	// can't suppress it) and the approval cache. nil → those sub-steps
 	// are refused.
 	Approve func(ctx context.Context, title, body string) error
+
+	// RulesPath overrides where the local rules engine keeps its rule
+	// file. Empty (production) means
+	// ~/Library/Application Support/protonmcp/rules.yaml; tests inject
+	// a temp path.
+	RulesPath string
 }
 
 // All returns every tool registered, in the order the server should
@@ -118,6 +132,20 @@ func All(deps Deps) []mcp.Tool {
 		calendarList(deps),
 		calendarEvents(deps),
 		calendarReadEvent(deps),
+		// Archival / triage additions.
+		mailExportEML(deps),
+		mailStar(deps),
+		mailUnstar(deps),
+		mailAttachmentText(deps),
+		contactsSearch(deps),
+		mailDigest(deps),
+		mailAwaitingReply(deps),
+		mailReportSpam(deps),
+		// Local rules engine (see rules.go; ApplyAutoRules for auto rules).
+		rulesList(deps),
+		rulesSet(deps),
+		rulesDelete(deps),
+		rulesRun(deps),
 	}
 }
 

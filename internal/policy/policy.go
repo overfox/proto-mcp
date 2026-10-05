@@ -137,6 +137,13 @@ type document struct {
 var keepAliveSuppressibleTools = map[string]bool{
 	"mail_download_attachment": true,
 	"mail_save_attachment":     true,
+	// .eml export writes one message (with its attachments) to disk —
+	// the same read-and-save shape as mail_save_attachment, given the
+	// same treatment by the owner.
+	"mail_export_eml": true,
+	// Text extraction is read-only attachment access, exactly like
+	// mail_download_attachment.
+	"mail_attachment_text": true,
 }
 
 // DefaultMaxAttachmentBytes is the per-attachment cap when the
