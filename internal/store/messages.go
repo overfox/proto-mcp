@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -306,9 +307,12 @@ func (s *Store) InvalidateBodyCache(ctx context.Context, messageID string) error
 func (s *Store) PurgeOlderThan(ctx context.Context, cutoff time.Time) (int64, error) {
 	res, err := s.DB.ExecContext(ctx, `
 UPDATE messages
-   SET body_text       = NULL,
-       body_html       = NULL,
-       body_cached_at  = NULL
+   SET body_text        = NULL,
+       body_html        = NULL,
+       body_cached_at   = NULL,
+       body_mime_type   = NULL,
+       body_references  = NULL,
+       body_attachments = NULL
  WHERE body_cached_at IS NOT NULL
    AND body_cached_at  < ?
 `, cutoff.Unix())
@@ -393,6 +397,23 @@ type CachedBody struct {
 	// threading from RFC 2822 In-Reply-To / References headers after
 	// the body fetch.
 	ThreadID string
+
+	// MIMEType / References / Attachments ride alongside the body so a
+	// cache-hit read returns the same shape as a fresh fetch. Optional:
+	// nil/empty values are stored as NULL.
+	MIMEType    string
+	References  []string
+	Attachments []AttachmentMeta
+}
+
+// AttachmentMeta is the per-attachment metadata kept with a cached
+// body (never the bytes — those live in attachment_cache).
+type AttachmentMeta struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	MIMEType string `json:"mime_type,omitempty"`
+	Size     int64  `json:"size"`
+	Inline   bool   `json:"inline,omitempty"`
 }
 
 // SetCachedBody writes the decrypted-and-sanitized body for a message.
@@ -402,24 +423,49 @@ func (s *Store) SetCachedBody(ctx context.Context, msgID string, b CachedBody) e
 	if b.CachedAt.IsZero() {
 		b.CachedAt = time.Now().UTC()
 	}
+	refs, err := nullableJSON(b.References, len(b.References) > 0)
+	if err != nil {
+		return fmt.Errorf("set cached body %s: references: %w", msgID, err)
+	}
+	atts, err := nullableJSON(b.Attachments, len(b.Attachments) > 0)
+	if err != nil {
+		return fmt.Errorf("set cached body %s: attachments: %w", msgID, err)
+	}
+	mime := sql.NullString{String: b.MIMEType, Valid: b.MIMEType != ""}
 	if b.ThreadID == "" {
 		_, err := s.DB.ExecContext(ctx,
-			`UPDATE messages SET body_text = ?, body_html = ?, body_cached_at = ? WHERE id = ?`,
-			b.Text, b.HTML, b.CachedAt.Unix(), msgID,
+			`UPDATE messages SET body_text = ?, body_html = ?, body_cached_at = ?,
+			        body_mime_type = ?, body_references = ?, body_attachments = ?
+			  WHERE id = ?`,
+			b.Text, b.HTML, b.CachedAt.Unix(), mime, refs, atts, msgID,
 		)
 		if err != nil {
 			return fmt.Errorf("set cached body %s: %w", msgID, err)
 		}
 		return nil
 	}
-	_, err := s.DB.ExecContext(ctx,
-		`UPDATE messages SET body_text = ?, body_html = ?, body_cached_at = ?, thread_id = ? WHERE id = ?`,
-		b.Text, b.HTML, b.CachedAt.Unix(), b.ThreadID, msgID,
+	_, err = s.DB.ExecContext(ctx,
+		`UPDATE messages SET body_text = ?, body_html = ?, body_cached_at = ?,
+		        body_mime_type = ?, body_references = ?, body_attachments = ?, thread_id = ?
+		  WHERE id = ?`,
+		b.Text, b.HTML, b.CachedAt.Unix(), mime, refs, atts, b.ThreadID, msgID,
 	)
 	if err != nil {
 		return fmt.Errorf("set cached body %s: %w", msgID, err)
 	}
 	return nil
+}
+
+// nullableJSON marshals v, or returns SQL NULL when present is false.
+func nullableJSON(v any, present bool) (sql.NullString, error) {
+	if !present {
+		return sql.NullString{}, nil
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return sql.NullString{}, err
+	}
+	return sql.NullString{String: string(b), Valid: true}, nil
 }
 
 // GetCachedBody returns the cached body for a message, or ErrNotFound
@@ -431,11 +477,15 @@ func (s *Store) GetCachedBody(ctx context.Context, msgID string) (CachedBody, er
 		text     sql.NullString
 		html     sql.NullString
 		cachedAt sql.NullInt64
+		mime     sql.NullString
+		refs     sql.NullString
+		atts     sql.NullString
 	)
 	err := s.DB.QueryRowContext(ctx,
-		`SELECT body_text, body_html, body_cached_at FROM messages WHERE id = ?`,
+		`SELECT body_text, body_html, body_cached_at, body_mime_type, body_references, body_attachments
+		   FROM messages WHERE id = ?`,
 		msgID,
-	).Scan(&text, &html, &cachedAt)
+	).Scan(&text, &html, &cachedAt, &mime, &refs, &atts)
 	if errors.Is(err, sql.ErrNoRows) {
 		return CachedBody{}, ErrNotFound
 	}
@@ -449,7 +499,16 @@ func (s *Store) GetCachedBody(ctx context.Context, msgID string) (CachedBody, er
 	if time.Since(ts) > BodyTTL {
 		return CachedBody{}, ErrNotFound
 	}
-	return CachedBody{Text: text.String, HTML: html.String, CachedAt: ts}, nil
+	out := CachedBody{Text: text.String, HTML: html.String, CachedAt: ts, MIMEType: mime.String}
+	// Metadata decode failures are non-fatal: the body itself is
+	// intact, the caller just loses the optional extras.
+	if refs.Valid {
+		_ = json.Unmarshal([]byte(refs.String), &out.References)
+	}
+	if atts.Valid {
+		_ = json.Unmarshal([]byte(atts.String), &out.Attachments)
+	}
+	return out, nil
 }
 
 func boolToInt(b bool) int {
