@@ -105,8 +105,11 @@ func runServeStdio(ctx context.Context, args []string) error {
 	}
 	defer rt.Close()
 
+	locked, reason := rt.Locked()
 	slog.Info("serve-stdio ready",
-		"email", rt.Session.Email,
+		"email", rt.Email(),
+		"locked", locked,
+		"lock_reason", reason,
 		"tools", len(rt.MCPServer.Tools()),
 	)
 

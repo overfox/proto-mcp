@@ -32,6 +32,7 @@ func runRead(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("read", flag.ContinueOnError)
 	dbPath := fs.String("db", "", "SQLite store path (default: platform-standard data dir)")
 	forceRefresh := fs.Bool("refresh", false, "ignore cached body and re-fetch from Proton")
+	force := fs.Bool("force", false, "fetch even though protonmcpd is running (rotates the daemon's refresh token)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -76,7 +77,12 @@ func runRead(ctx context.Context, args []string) error {
 		}
 	}
 
-	// Cache miss or --refresh — acquire a session and fetch.
+	// Cache miss or --refresh — acquire a session and fetch. Cached
+	// reads above never touch the Keychain, so only this path is
+	// guarded against racing the daemon's refresh token.
+	if err := refuseIfDaemonRunning("read", *force); err != nil {
+		return err
+	}
 	acquireCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 	bundle, err := acquireSession(acquireCtx)
