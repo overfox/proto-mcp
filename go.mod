@@ -6,9 +6,13 @@ require (
 	github.com/ProtonMail/gluon v0.17.1-0.20260225115619-c0f05c033a4a
 	github.com/ProtonMail/go-proton-api v0.4.1-0.20260319112440-799673ddc2db
 	github.com/ProtonMail/gopenpgp/v2 v2.9.0-proton
+	github.com/bradenaw/juniper v0.12.0
 	github.com/emersion/go-ical v0.0.0-20250609112844-439c63cef608
+	github.com/emersion/go-message v0.16.0
+	github.com/emersion/go-vcard v0.0.0-20230331202150-f3d26859ccd3
 	github.com/go-resty/resty/v2 v2.7.0
 	github.com/keybase/go-keychain v0.0.1
+	github.com/ledongthuc/pdf v0.0.0-20260907135840-6c8c28e0e8a0
 	github.com/microcosm-cc/bluemonday v1.0.27
 	github.com/pressly/goose/v3 v3.27.2
 	golang.org/x/sys v0.46.0
@@ -27,15 +31,12 @@ require (
 	github.com/PuerkitoBio/goquery v1.8.1 // indirect
 	github.com/andybalholm/cascadia v1.3.2 // indirect
 	github.com/aymerick/douceur v0.2.0 // indirect
-	github.com/bradenaw/juniper v0.12.0 // indirect
 	github.com/bytedance/sonic v1.9.1 // indirect
 	github.com/chenzhuoyu/base64x v0.0.0-20221115062448-fe3a3abad311 // indirect
 	github.com/cloudflare/circl v1.6.3 // indirect
 	github.com/cronokirby/saferith v0.33.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
-	github.com/emersion/go-message v0.16.0 // indirect
 	github.com/emersion/go-textwrapper v0.0.0-20200911093747-65d896831594 // indirect
-	github.com/emersion/go-vcard v0.0.0-20230331202150-f3d26859ccd3 // indirect
 	github.com/gabriel-vasile/mimetype v1.4.2 // indirect
 	github.com/gin-contrib/sse v0.1.0 // indirect
 	github.com/gin-gonic/gin v1.9.1 // indirect
@@ -47,7 +48,6 @@ require (
 	github.com/gorilla/css v1.0.1 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.4 // indirect
-	github.com/ledongthuc/pdf v0.0.0-20260907135840-6c8c28e0e8a0 // indirect
 	github.com/leodido/go-urn v1.2.4 // indirect
 	github.com/mattn/go-isatty v0.0.21 // indirect
 	github.com/mfridman/interpolate v0.0.2 // indirect

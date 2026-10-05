@@ -10,7 +10,15 @@
 //	labels_list              store.labels (type=1)
 //	folders_list             store.labels (type=3)
 //	mail_sync                internal/sync.RunOnce
-//	account_whoami           proton.Session info
+//	account_whoami           proton.Session info (+ cached plan lookup)
+//	mail_export_eml          GetMessage + attachments → gpa.BuildRFC822
+//	mail_attachment_text     attachment cache + pure-Go PDF/DOCX/XLSX text
+//	mail_star / mail_unstar  Starred system label
+//	mail_report_spam         move to Spam
+//	contacts_search          contact-emails index (name + email only)
+//	mail_digest              store.DigestSince, grouped by sender / label
+//	mail_awaiting_reply      store.SentBetween + HasLaterIncoming
+//	rules_*                  local rules engine (rules.go, ApplyAutoRules)
 //
 // Decisions from Phase 3 planning sign-off:
 //
