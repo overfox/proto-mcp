@@ -168,6 +168,10 @@ tools:
     decision: prompt
     ttl: 5m
     description: "Move a message to trash (reversible via mail_move)"
+  mail_report_spam:
+    decision: prompt
+    ttl: 5m
+    description: "Report messages as spam (moves to Spam; reversible via mail_move)"
   mail_delete_permanent:
     decision: deny
     description: "Permanently delete — opt-in only, override required"
