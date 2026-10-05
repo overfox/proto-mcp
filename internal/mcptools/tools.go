@@ -59,6 +59,12 @@ type Deps struct {
 	// account email. nil when there is no runtime to unlock (tests,
 	// one-shot CLI paths) — proton_connect then reports that.
 	Connect func(ctx context.Context) (alreadyConnected bool, email string, err error)
+
+	// RulesPath overrides where the local rules engine keeps its rule
+	// file. Empty (production) means
+	// ~/Library/Application Support/protonmcp/rules.yaml; tests inject
+	// a temp path.
+	RulesPath string
 }
 
 // All returns every tool registered, in the order the server should
@@ -118,6 +124,11 @@ func All(deps Deps) []mcp.Tool {
 		mailDigest(deps),
 		mailAwaitingReply(deps),
 		mailReportSpam(deps),
+		// Local rules engine (see rules.go; ApplyAutoRules for auto rules).
+		rulesList(deps),
+		rulesSet(deps),
+		rulesDelete(deps),
+		rulesRun(deps),
 	}
 }
 

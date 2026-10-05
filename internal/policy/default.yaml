@@ -176,6 +176,30 @@ tools:
     decision: deny
     description: "Permanently delete — opt-in only, override required"
 
+  # Local rules engine. Rules are standing configuration (they can act
+  # on future mail unattended when auto: true), so creating, changing
+  # or deleting one is confirmed every time. Actions are limited to
+  # label / move (never trash) / star / mark_read in code.
+  rules_list:
+    decision: allow
+    description: "List local mail rules"
+  rules_set:
+    decision: prompt
+    confirm: true
+    ttl: 0
+    description: "Create or replace a local mail rule (query + label/move/star/mark_read actions)"
+  rules_delete:
+    decision: prompt
+    confirm: true
+    ttl: 0
+    description: "Delete a local mail rule"
+  # Runs rules now. dry_run (the default) only reports matches; the
+  # prompt text says whether the call previews or APPLIES.
+  rules_run:
+    decision: prompt
+    ttl: 5m
+    description: "Run local mail rules (dry run by default; dry_run=false applies the actions)"
+
   # Label / folder CRUD.
   labels_create:
     decision: prompt
