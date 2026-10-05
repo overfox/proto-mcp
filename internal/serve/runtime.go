@@ -528,6 +528,7 @@ func Setup(ctx context.Context, cfg SetupConfig) (*Runtime, error) {
 	bgSyncCtx, bgSyncCancel := context.WithCancel(context.Background())
 	rt.bgSyncCancel = bgSyncCancel
 	go rt.runBackgroundSync(bgSyncCtx, logger)
+	go runStagingSweep(bgSyncCtx, logger) // hourly attachment-staging retention sweep (staging_sweep.go)
 
 	return rt, nil
 }
