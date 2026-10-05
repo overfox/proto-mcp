@@ -22,15 +22,29 @@ import (
 // high-water mark rather than the shared event_cursor.
 const calendarMaxEditPrefix = "calendar_max_edit:"
 
+// CalendarRecheckInterval bounds how often a session whose token lacks
+// calendar scope (Proton code 9100) re-probes the event endpoint. Between
+// probes RunCalendarOnce makes no API calls at all.
+const CalendarRecheckInterval = 6 * time.Hour
+
 // CalendarRunResult summarizes a RunCalendarOnce / RunCalendarBackfill pass.
 type CalendarRunResult struct {
 	CalendarsUpserted int
 	CalendarsDeleted  int
+	CalendarsFailed   int // calendars whose events couldn't be fetched/applied this pass
 	EventsUpserted    int
 	EventsDeleted     int
 	EventsDecrypted   int // populated only by RunCalendarBackfill(decrypt=true)
-	Elapsed           time.Duration
+	// Unavailable is true when the session's token lacks calendar scope
+	// (Proton code 9100). The pass is then a quiet no-op and returns a nil
+	// error: the condition is logged once (on transition) and surfaced to
+	// callers by the calendar tools instead.
+	Unavailable bool
+	Elapsed     time.Duration
 }
+
+// nowFunc is swapped in tests.
+var nowFunc = time.Now
 
 // RunCalendarOnce polls every calendar and reconciles the local mirror.
 // It writes envelope (plaintext metadata) only — decryption is deferred
@@ -38,19 +52,37 @@ type CalendarRunResult struct {
 // per-tick cost off the PGP path. Change detection is per-calendar
 // max(LastEditTime); deletions are handled by a full-set reconcile
 // against the live event IDs (the calendar API has no delete cursor).
+//
+// A failure on one calendar is logged and skipped — it does not abort the
+// pass; the per-calendar errors are joined into the returned error after
+// every calendar has been attempted. A token-scope rejection (code 9100)
+// instead marks calendar unavailable for the session (see
+// CalendarRunResult.Unavailable) and stops polling until
+// CalendarRecheckInterval has elapsed.
 func RunCalendarOnce(ctx context.Context, sess *protonclient.Session, st *store.Store) (*CalendarRunResult, error) {
-	start := time.Now()
+	start := nowFunc()
 	res := &CalendarRunResult{}
 
 	if sess == nil || sess.Client == nil {
 		return res, errors.New("calendar sync: session is closed")
 	}
 
+	if !sess.CalendarRecheckDue(start, CalendarRecheckInterval) {
+		res.Unavailable = true
+		return res, nil
+	}
+	wasUnavailable := sess.CalendarUnavailable()
+
 	cals, err := sess.Client.GetCalendars(ctx)
 	if err != nil {
+		if protonclient.IsCalendarScopeError(err) {
+			markCalendarUnavailable(sess, res, start, err)
+			return res, nil
+		}
 		return res, fmt.Errorf("get calendars: %w", err)
 	}
 
+	var calErrs []error
 	liveCalIDs := make([]string, 0, len(cals))
 	for _, c := range cals {
 		if err := ctx.Err(); err != nil {
@@ -65,22 +97,44 @@ func RunCalendarOnce(ctx context.Context, sess *protonclient.Session, st *store.
 
 		events, err := sess.Client.GetAllCalendarEvents(ctx, c.ID, nil)
 		if err != nil {
-			return res, fmt.Errorf("get events for calendar %s: %w", c.ID, err)
+			if protonclient.IsCalendarScopeError(err) {
+				// Token-wide condition: every other calendar would fail
+				// identically, so stop here rather than hammer the API.
+				markCalendarUnavailable(sess, res, start, err)
+				return res, nil
+			}
+			if ctx.Err() != nil {
+				return res, ctx.Err()
+			}
+			res.CalendarsFailed++
+			slog.Warn("calendar sync: skipping calendar", "err", protonclient.RedactLogText(err.Error()))
+			calErrs = append(calErrs, scrubbedErr(fmt.Errorf("get events for calendar %s: %w", c.ID, err)))
+			continue
 		}
 
 		storedMax := readMaxEdit(ctx, st, c.ID)
 		newMax, upserted, deleted, err := applyCalendarEvents(ctx, st, c.ID, events, storedMax)
-		if err != nil {
-			return res, err
-		}
 		res.EventsUpserted += upserted
 		res.EventsDeleted += deleted
+		if err != nil {
+			res.CalendarsFailed++
+			slog.Warn("calendar sync: apply failed", "err", protonclient.RedactLogText(err.Error()))
+			calErrs = append(calErrs, scrubbedErr(fmt.Errorf("apply events for calendar %s: %w", c.ID, err)))
+			continue
+		}
 
 		if newMax > storedMax {
 			if err := st.SetSyncState(ctx, calendarMaxEditPrefix+c.ID, strconv.FormatInt(newMax, 10)); err != nil {
-				return res, fmt.Errorf("save calendar high-water for %s: %w", c.ID, err)
+				calErrs = append(calErrs, scrubbedErr(fmt.Errorf("save calendar high-water for %s: %w", c.ID, err)))
 			}
 		}
+	}
+
+	if wasUnavailable && sess.MarkCalendarAvailable(start) {
+		slog.Info("calendar sync: Proton Calendar is accessible again; resuming event polling")
+	} else if !wasUnavailable {
+		// Record the successful probe time.
+		sess.MarkCalendarAvailable(start)
 	}
 
 	// Reconcile calendars that disappeared server-side (their events
@@ -92,12 +146,44 @@ func RunCalendarOnce(ctx context.Context, sess *protonclient.Session, st *store.
 	res.CalendarsDeleted = deletedCals
 
 	res.Elapsed = time.Since(start)
-	slog.Info("calendar sync",
-		"calendars", res.CalendarsUpserted,
-		"events_upserted", res.EventsUpserted,
-		"events_deleted", res.EventsDeleted,
-		"elapsed_ms", res.Elapsed.Milliseconds())
-	return res, nil
+	if res.EventsUpserted > 0 || res.EventsDeleted > 0 || res.CalendarsDeleted > 0 || res.CalendarsFailed > 0 {
+		slog.Info("calendar sync",
+			"calendars", res.CalendarsUpserted,
+			"calendars_failed", res.CalendarsFailed,
+			"events_upserted", res.EventsUpserted,
+			"events_deleted", res.EventsDeleted,
+			"elapsed_ms", res.Elapsed.Milliseconds())
+	}
+	return res, errors.Join(calErrs...)
+}
+
+// scrubbedError keeps the wrapped chain (errors.Is/As still work) but
+// renders without opaque calendar IDs / API URLs, since callers log
+// Error() verbatim.
+type scrubbedError struct {
+	msg string
+	err error
+}
+
+func (e *scrubbedError) Error() string { return e.msg }
+func (e *scrubbedError) Unwrap() error { return e.err }
+
+func scrubbedErr(err error) error {
+	return &scrubbedError{msg: protonclient.RedactLogText(err.Error()), err: err}
+}
+
+// markCalendarUnavailable flags the session and logs exactly once per
+// available→unavailable transition (not on every 2-minute tick, and not
+// on a failed 6-hourly re-check).
+func markCalendarUnavailable(sess *protonclient.Session, res *CalendarRunResult, now time.Time, cause error) {
+	res.Unavailable = true
+	if sess.MarkCalendarUnavailable(now) {
+		slog.Warn("calendar sync: Proton Calendar is not accessible with this login's token scope "+
+			"(Proton code 9100); calendar tools disabled, re-checking every "+CalendarRecheckInterval.String(),
+			"err", protonclient.RedactLogText(cause.Error()))
+	} else {
+		slog.Debug("calendar sync: re-check still lacks calendar scope", "err", protonclient.RedactLogText(cause.Error()))
+	}
 }
 
 // RunCalendarBackfill seeds the mirror from scratch: it runs the normal
@@ -109,6 +195,9 @@ func RunCalendarOnce(ctx context.Context, sess *protonclient.Session, st *store.
 func RunCalendarBackfill(ctx context.Context, sess *protonclient.Session, st *store.Store, decrypt bool) (*CalendarRunResult, error) {
 	start := time.Now()
 	res, err := RunCalendarOnce(ctx, sess, st)
+	if res != nil && res.Unavailable {
+		return res, protonclient.ErrCalendarUnavailable
+	}
 	if err != nil {
 		return res, err
 	}
@@ -126,7 +215,12 @@ func RunCalendarBackfill(ctx context.Context, sess *protonclient.Session, st *st
 		}
 		events, err := sess.Client.GetAllCalendarEvents(ctx, c.ID, nil)
 		if err != nil {
-			return res, fmt.Errorf("get events for calendar %s: %w", c.ID, err)
+			if protonclient.IsCalendarScopeError(err) {
+				sess.MarkCalendarUnavailable(time.Now())
+				return res, fmt.Errorf("%w: %w", protonclient.ErrCalendarUnavailable, err)
+			}
+			slog.Warn("calendar backfill: skipping calendar", "err", protonclient.RedactLogText(err.Error()))
+			continue
 		}
 		cache := protonclient.NewCalendarKeyCache()
 		for _, ev := range events {

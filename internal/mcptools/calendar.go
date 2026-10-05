@@ -34,6 +34,9 @@ func calendarList(deps Deps) mcp.Tool {
 		InputSchema:  json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`),
 		OutputSchema: json.RawMessage(calendarListSchema),
 		Handler: func(ctx mcp.Context, raw json.RawMessage) (*mcp.ToolResult, error) {
+			if calendarUnavailable(deps) {
+				return calendarUnavailableResult("calendar_list"), nil
+			}
 			cals, err := deps.Store.ListCalendars(ctx.Std)
 			if err != nil {
 				return mcp.ErrorResult("calendar_list: %v", err), nil
@@ -152,6 +155,10 @@ func calendarEvents(deps Deps) mcp.Tool {
 				f.Offset = off
 			}
 
+			if calendarUnavailable(deps) {
+				return calendarUnavailableResult("calendar_events"), nil
+			}
+
 			rows, err := deps.Store.ListCalendarEvents(ctx.Std, f)
 			if err != nil {
 				return mcp.ErrorResult("calendar_events: %v", err), nil
@@ -159,6 +166,9 @@ func calendarEvents(deps Deps) mcp.Tool {
 
 			// Warm any undecrypted rows in this page (best-effort, online).
 			ensureDecrypted(ctx, deps, rows)
+			if calendarUnavailable(deps) {
+				return calendarUnavailableResult("calendar_events"), nil
+			}
 
 			out := calendarEventsResult{Events: make([]calendarSummary, 0, len(rows))}
 			for _, r := range rows {
@@ -205,6 +215,9 @@ func calendarReadEvent(deps Deps) mcp.Tool {
 			if in.EventID == "" {
 				return nil, mcp.NewError(mcp.CodeInvalidParams, "calendar_read_event: event_id is required")
 			}
+			if calendarUnavailable(deps) {
+				return calendarUnavailableResult("calendar_read_event"), nil
+			}
 
 			row, gerr := deps.Store.GetCalendarEvent(ctx.Std, in.EventID)
 			inStore := gerr == nil
@@ -231,6 +244,9 @@ func calendarReadEvent(deps Deps) mcp.Tool {
 
 			detail, err := deps.Session.FetchAndDecryptCalendarEvent(ctx.Std, calID, in.EventID, nil)
 			if err != nil {
+				if protonclient.IsCalendarScopeError(err) {
+					return calendarUnavailableResult("calendar_read_event"), nil
+				}
 				if inStore {
 					return mcp.StructuredResult(detailFromRow(row)) // graceful: return what we have
 				}
@@ -249,6 +265,17 @@ func calendarReadEvent(deps Deps) mcp.Tool {
 
 // ----- shared helpers -----
 
+// calendarUnavailable reports whether the session's token has been seen
+// to lack calendar scope (Proton code 9100). The mirror is then empty or
+// stale, so the tools say so instead of returning silent empty results.
+func calendarUnavailable(deps Deps) bool {
+	return deps.Session != nil && deps.Session.CalendarUnavailable()
+}
+
+func calendarUnavailableResult(tool string) *mcp.ToolResult {
+	return mcp.ErrorResult("%s: %v", tool, protonclient.ErrCalendarUnavailable)
+}
+
 // ensureDecrypted warms undecrypted rows in a page by decrypting them on
 // demand and persisting the result. Best-effort: requires a session, and
 // any per-event failure leaves that row envelope-only rather than failing
@@ -262,13 +289,16 @@ func ensureDecrypted(ctx mcp.Context, deps Deps, rows []store.CalendarEventRow) 
 		if rows[i].Decrypted {
 			continue
 		}
+		if deps.Session.CalendarUnavailable() || ctx.Std.Err() != nil {
+			return // token lacks calendar scope: don't fire one doomed request per row
+		}
 		if cache == nil {
 			cache = protonclient.NewCalendarKeyCache()
 			defer cache.Clear()
 		}
 		detail, err := deps.Session.FetchAndDecryptCalendarEvent(ctx.Std, rows[i].CalendarID, rows[i].ID, cache)
 		if err != nil {
-			slog.Warn("calendar_events: decrypt-on-read failed", "event_id", rows[i].ID, "err", err.Error())
+			slog.Warn("calendar_events: decrypt-on-read failed", "err", protonclient.RedactLogText(err.Error()))
 			continue
 		}
 		if ferr := deps.Store.FillCalendarEventDecrypted(ctx.Std, rows[i].ID, decryptedFromDetail(detail)); ferr != nil {
