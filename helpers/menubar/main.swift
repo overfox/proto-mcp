@@ -4,9 +4,11 @@
 // what the MCP daemon is doing:
 //
 //   🟢  daemon running, session unlocked (Claude has access)
-//   🔵  in use — a tool call landed in the audit log within the last 5 s
+//   🔵  in use — a tool call completed within the last 5 s
+//   🟠  connecting — daemon up but no session yet (starting / offline)
 //   🟡  daemon running but LOCKED (screen-lock / idle / manual lock)
-//   ⚪  daemon not running (crashed or stopped) but launchd job enabled
+//   ⚪  daemon not running (crashed, stopped, or its state file is stale)
+//       but launchd job enabled
 //   🔴  KILL SWITCH engaged — launchd job disabled + booted out; Claude
 //       cannot reach the socket until re-enabled from this menu
 //
@@ -17,12 +19,19 @@
 // biometric.
 //
 // No sockets are opened and no MCP calls are made: state is derived
-// passively from pgrep, `launchctl print-disabled`, the daemon log
-// (locked/unlocked transitions), and the audit log (activity). This
-// keeps the indicator itself out of the audit trail and out of the
-// daemon's peer-cred path.
+// passively from `launchctl print-disabled` and the daemon's state file
+// (state.json — written atomically on every transition plus a 30 s
+// heartbeat). Daemons that predate state.json are still handled by the
+// old heuristics (pgrep + daemon.log transition markers + audit-log
+// growth). This keeps the indicator itself out of the audit trail and
+// out of the daemon's peer-cred path.
+//
+// Signals (Lock Now → SIGUSR1, Connect/Unlock → SIGUSR2) are only sent
+// to a PID whose executable is verified (proc_pidpath) to be the
+// protonmcpd installed next to this helper.
 
 import AppKit
+import Darwin
 import Foundation
 
 let daemonLabel = "zone.dort.protonmcpd"
@@ -31,18 +40,31 @@ let plistPath = "\(home)/Library/LaunchAgents/\(daemonLabel).plist"
 let daemonLogPath = "\(home)/Library/Logs/protonmcp/daemon.log"
 let appSupport = "\(home)/Library/Application Support/protonmcp"
 let auditLogPath = "\(appSupport)/audit.log"
+let statePath = "\(appSupport)/state.json"
 let policyPath = "\(appSupport)/policy.yaml"
 let inUseWindow: TimeInterval = 5.0
+// state.json older than this means the daemon stopped heartbeating
+// (it rewrites the file at least every 30 s while alive).
+let stateStaleAfter: TimeInterval = 90.0
 // idle_lock_minutes value restored when Keep Alive is switched OFF.
 let defaultIdleLockMinutes = 15
 
-// protonmcpCLI is the CLI binary installed next to this helper
-// (make/brew put every product in the same bin dir) — used for
-// `policy reload` after a Keep Alive toggle.
-let protonmcpCLI: String = {
-    let dir = (Bundle.main.executablePath! as NSString).deletingLastPathComponent
-    return dir + "/protonmcp"
+// binDir is the directory this helper's executable really lives in
+// (symlinks resolved — Homebrew links bin/ into the Cellar). make and
+// brew put every product in the same bin dir, so the CLI and the
+// daemon are siblings of this binary.
+let binDir: String = {
+    let exe = URL(fileURLWithPath: Bundle.main.executablePath!).resolvingSymlinksInPath()
+    return exe.deletingLastPathComponent().path
 }()
+
+// protonmcpCLI is the CLI binary installed next to this helper —
+// used for `policy reload` after a Keep Alive toggle.
+let protonmcpCLI = binDir + "/protonmcp"
+
+// expectedDaemonPath is the only executable this helper will signal.
+let expectedDaemonPath = URL(fileURLWithPath: binDir + "/protonmcpd")
+    .resolvingSymlinksInPath().standardizedFileURL.path
 
 // runCmd executes a binary with args and returns (exit code, stdout).
 // Absolute paths only; nothing here interpolates user input into a shell.
@@ -60,9 +82,90 @@ func runCmd(_ path: String, _ args: [String]) -> (Int32, String) {
     return (p.terminationStatus, String(data: data, encoding: .utf8) ?? "")
 }
 
+// executablePath returns the on-disk executable of pid via libproc,
+// or nil if the process is gone / not ours to inspect.
+func executablePath(_ pid: Int32) -> String? {
+    var buf = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN)) // PROC_PIDPATHINFO_MAXSIZE
+    let n = proc_pidpath(pid, &buf, UInt32(buf.count))
+    guard n > 0 else { return nil }
+    return URL(fileURLWithPath: String(cString: buf))
+        .resolvingSymlinksInPath().standardizedFileURL.path
+}
+
+// isOurDaemon: pid is alive AND is the protonmcpd sibling of this
+// helper. Guards against PID reuse and against signalling some other
+// process that happens to be named protonmcpd (another checkout, an
+// old build elsewhere on disk).
+func isOurDaemon(_ pid: Int32) -> Bool {
+    guard pid > 0 else { return false }
+    return executablePath(pid) == expectedDaemonPath
+}
+
+// isLiveDaemon: pid is alive and is *a* protonmcpd (PID-reuse guard
+// for the status display). Looser than isOurDaemon on purpose: a menu
+// bar run from a dev checkout should still show the installed
+// daemon's state; only signalling demands the exact sibling binary.
+func isLiveDaemon(_ pid: Int32) -> Bool {
+    guard pid > 0, kill(pid, 0) == 0 || errno == EPERM else { return false }
+    guard let path = executablePath(pid) else { return false }
+    return (path as NSString).lastPathComponent == "protonmcpd"
+}
+
+// parseRFC3339 accepts timestamps with or without fractional seconds
+// (Go's time.RFC3339Nano drops trailing zeros, so both occur).
+func parseRFC3339(_ s: String) -> Date? {
+    let f = ISO8601DateFormatter()
+    f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let d = f.date(from: s) { return d }
+    f.formatOptions = [.withInternetDateTime]
+    return f.date(from: s)
+}
+
+// DaemonStateFile mirrors state.json:
+// {"state":"starting|connecting|locked|unlocked","reason":"...",
+//  "email":"...","pid":123,"keep_alive":true,"last_tool":"name",
+//  "last_tool_at":"RFC3339","updated_at":"RFC3339"}
+struct DaemonStateFile {
+    var state: String
+    var reason: String
+    var email: String
+    var pid: Int32
+    var keepAlive: Bool
+    var lastTool: String
+    var lastToolAt: Date?
+    var updatedAt: Date?
+
+    // load returns nil when the file is absent (older daemon) or
+    // unparseable.
+    static func load() -> DaemonStateFile? {
+        guard let data = FileManager.default.contents(atPath: statePath),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        return DaemonStateFile(
+            state: obj["state"] as? String ?? "",
+            reason: obj["reason"] as? String ?? "",
+            email: obj["email"] as? String ?? "",
+            pid: (obj["pid"] as? NSNumber)?.int32Value ?? 0,
+            keepAlive: obj["keep_alive"] as? Bool ?? false,
+            lastTool: obj["last_tool"] as? String ?? "",
+            lastToolAt: (obj["last_tool_at"] as? String).flatMap(parseRFC3339),
+            updatedAt: (obj["updated_at"] as? String).flatMap(parseRFC3339))
+    }
+
+    // needsTouchID: the session is waiting on a biometric — plainly
+    // locked, or still connecting because the keys are locked (the
+    // reason says so). SIGUSR2 runs the daemon's Touch ID unlock flow.
+    var needsTouchID: Bool {
+        if state == "locked" { return true }
+        guard state == "connecting" || state == "starting" else { return false }
+        let r = reason.lowercased()
+        return r.contains("lock") || r.contains("touch id")
+    }
+}
+
 enum DaemonState {
     case killSwitched   // 🔴 disabled by the user
-    case notRunning     // ⚪ enabled but no process
+    case notRunning     // ⚪ enabled but no live process / stale state file
     case connecting     // 🟠 process up, session not established (offline / startup)
     case locked         // 🟡 running, session locked
     case inUse          // 🔵 running, unlocked, recent tool call
@@ -95,14 +198,36 @@ final class StatusPoller {
     private(set) var state: DaemonState = .notRunning
     private(set) var lastTool: String = "—"
     private(set) var lastToolAt: String = ""
+    // reason / email from state.json; empty in legacy mode.
+    private(set) var reason: String = ""
+    private(set) var email: String = ""
+    // needsTouchID: show "Connect (Touch ID)…".
+    private(set) var needsTouchID = false
     private var lastAuditSize: UInt64 = 0
     private var activeUntil: Date = .distantPast
 
-    func daemonPID() -> Int32? {
+    private let timeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
+
+    // pgrepPIDs lists every process named protonmcpd. Names are
+    // untrusted — callers verify with isOurDaemon before signalling.
+    func pgrepPIDs() -> [Int32] {
         let (code, out) = runCmd("/usr/bin/pgrep", ["-x", "protonmcpd"])
-        guard code == 0, let pid = Int32(out.split(separator: "\n").first.map(String.init)?
-            .trimmingCharacters(in: .whitespaces) ?? "") else { return nil }
-        return pid
+        guard code == 0 else { return [] }
+        return out.split(separator: "\n").compactMap {
+            Int32($0.trimmingCharacters(in: .whitespaces))
+        }
+    }
+
+    // verifiedDaemonPID returns a PID that is safe to signal: the one
+    // state.json names if it checks out, else a pgrep match that does.
+    // nil means no running process is provably our protonmcpd.
+    func verifiedDaemonPID() -> Int32? {
+        if let pid = DaemonStateFile.load()?.pid, isOurDaemon(pid) { return pid }
+        return pgrepPIDs().first(where: isOurDaemon)
     }
 
     private func isDisabled() -> Bool {
@@ -127,6 +252,42 @@ final class StatusPoller {
         let data = (try? fh.readToEnd()) ?? Data()
         return String(data: data, encoding: .utf8) ?? ""
     }
+
+    // MARK: state.json (current daemons)
+
+    private func pollStateFile(_ sf: DaemonStateFile) {
+        reason = sf.reason
+        email = sf.email
+        if !sf.lastTool.isEmpty {
+            lastTool = sf.lastTool
+            lastToolAt = sf.lastToolAt.map { timeFormatter.string(from: $0) } ?? ""
+        }
+        // Stale: the daemon stopped heartbeating, or the PID it wrote
+        // is gone (crash without a final write) / now belongs to some
+        // other program.
+        let fresh = sf.updatedAt.map { Date().timeIntervalSince($0) < stateStaleAfter } ?? false
+        guard fresh, isLiveDaemon(sf.pid) else {
+            state = .notRunning
+            email = ""
+            needsTouchID = false
+            return
+        }
+        needsTouchID = sf.needsTouchID
+        switch sf.state {
+        case "unlocked":
+            if let at = sf.lastToolAt, Date().timeIntervalSince(at) < inUseWindow {
+                state = .inUse
+            } else {
+                state = .connected
+            }
+        case "locked":
+            state = .locked
+        default: // "starting", "connecting", or anything newer we don't know
+            state = .connecting
+        }
+    }
+
+    // MARK: legacy heuristics (daemons without state.json)
 
     // scanDaemonLog derives (locked, serving) from the daemon log's
     // transition markers; the most recent marker of each kind wins.
@@ -173,14 +334,13 @@ final class StatusPoller {
         }
     }
 
-    func poll() {
+    private func pollLegacy() {
+        reason = ""
+        email = ""
         checkActivity()
-        if isDisabled() {
-            state = .killSwitched
-            return
-        }
-        if daemonPID() == nil {
+        guard !pgrepPIDs().isEmpty else {
             state = .notRunning
+            needsTouchID = false
             return
         }
         let log = scanDaemonLog()
@@ -192,6 +352,20 @@ final class StatusPoller {
             state = .inUse
         } else {
             state = .connected
+        }
+        needsTouchID = state == .locked
+    }
+
+    func poll() {
+        if isDisabled() {
+            state = .killSwitched
+            needsTouchID = false
+            return
+        }
+        if let sf = DaemonStateFile.load() {
+            pollStateFile(sf)
+        } else {
+            pollLegacy()
         }
     }
 }
@@ -214,7 +388,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func refresh() {
         poller.poll()
         statusItem.button?.title = "\(poller.state.emoji)\u{FE0E} ✉︎"
-        statusItem.button?.toolTip = "Proton MCP: \(poller.state.label)"
+        statusItem.button?.toolTip = "Proton MCP: \(statusLabel())"
+    }
+
+    // statusLabel appends the daemon's own reason (state.json) for the
+    // states where it explains something: why it's locked, or what
+    // it's waiting on while connecting.
+    private func statusLabel() -> String {
+        let base = poller.state.label
+        guard poller.state == .locked || poller.state == .connecting,
+              !poller.reason.isEmpty else { return base }
+        return "\(base) — \(poller.reason)"
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
@@ -230,10 +414,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func populate(_ menu: NSMenu) {
-        let status = NSMenuItem(title: "\(poller.state.emoji) Proton MCP — \(poller.state.label)",
+        let status = NSMenuItem(title: "\(poller.state.emoji) Proton MCP — \(statusLabel())",
                                 action: nil, keyEquivalent: "")
         status.isEnabled = false
         menu.addItem(status)
+
+        if !poller.email.isEmpty {
+            let account = NSMenuItem(title: "Account: \(poller.email)", action: nil, keyEquivalent: "")
+            account.isEnabled = false
+            menu.addItem(account)
+        }
 
         let last = NSMenuItem(title: "Last tool: \(poller.lastTool) \(poller.lastToolAt)",
                               action: nil, keyEquivalent: "")
@@ -251,11 +441,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                  action: #selector(switchOff), keyEquivalent: "")
             off.target = self
             menu.addItem(off)
-            if poller.state == .locked {
-                let unlock = NSMenuItem(title: "Unlock (Touch ID)…",
-                                        action: #selector(unlockNow), keyEquivalent: "")
-                unlock.target = self
-                menu.addItem(unlock)
+            if poller.state == .locked || (poller.state == .connecting && poller.needsTouchID) {
+                // One item for both cases: SIGUSR2 runs the daemon's
+                // Touch ID unlock flow, which also completes a connect
+                // that is only waiting on locked keys.
+                let connect = NSMenuItem(title: "Connect (Touch ID)…",
+                                         action: #selector(unlockNow), keyEquivalent: "")
+                connect.target = self
+                menu.addItem(connect)
             } else if poller.state == .connected || poller.state == .inUse {
                 // Lock Now only makes sense with a live session —
                 // .connecting has no keys to zero yet.
@@ -274,7 +467,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         keepAlive.toolTip = "On: Proton stays connected through screen lock, sleep and idle, " +
             "and attachment download/save don't ask for Touch ID. " +
             "Off: the session locks on screen lock, sleep, or \(defaultIdleLockMinutes) min idle. " +
-            "Sending, moving, labeling, trashing and deleting ALWAYS need Touch ID; " +
+            "Keep Alive never removes Touch ID from sending, moving, labeling, trashing or deleting; " +
             "Lock Now and Switch Off always work."
         menu.addItem(keepAlive)
         menu.addItem(.separator())
@@ -291,49 +484,88 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - Keep Alive (idle-timeout toggle)
 
+    // topLevelValue returns the value of an unindented `key:` line in
+    // YAML text, with any trailing `# comment` and CR stripped. Only
+    // top-level lines count: an indented `keep_alive:` belongs to some
+    // nested block and must not be mistaken for the policy flag.
+    static func topLevelValue(_ key: String, in text: String) -> String? {
+        // components(separatedBy:) splits on the \n code unit; Swift's
+        // Character-based split would treat "\r\n" as one grapheme and
+        // never split CRLF files.
+        for raw in text.components(separatedBy: "\n") {
+            let line = raw.hasSuffix("\r") ? String(raw.dropLast()) : raw
+            guard line.hasPrefix("\(key):") else { continue }
+            let rest = String(line.dropFirst(key.count + 1))
+            return stripComment(rest).trimmingCharacters(in: .whitespaces)
+        }
+        return nil
+    }
+
+    // stripComment removes a YAML comment: `#` at the start or after
+    // whitespace (`a#b` is a plain scalar, not a comment).
+    static func stripComment(_ s: String) -> String {
+        var prev: Character = " "
+        for (i, c) in zip(s.indices, s) {
+            if c == "#" && (prev == " " || prev == "\t") {
+                return String(s[..<i])
+            }
+            prev = c
+        }
+        return s
+    }
+
     // keepAliveEnabled reads the keep_alive flag from policy.yaml.
     // Absent / false → OFF (the secure default: attachments prompt
     // and the idle timer runs). The toggle keeps keep_alive and
     // idle_lock_minutes in lockstep, so keep_alive alone is the
-    // authoritative UI state.
+    // authoritative UI state. Accepts the spellings yaml.v3 decodes
+    // into a true bool.
     private func keepAliveEnabled() -> Bool {
-        guard let text = try? String(contentsOfFile: policyPath, encoding: .utf8) else {
+        guard let text = try? String(contentsOfFile: policyPath, encoding: .utf8),
+              let v = AppDelegate.topLevelValue("keep_alive", in: text) else {
             return false
         }
-        for line in text.split(separator: "\n") {
-            let t = line.trimmingCharacters(in: .whitespaces)
-            if t.hasPrefix("keep_alive:") {
-                let v = t.dropFirst("keep_alive:".count).trimmingCharacters(in: .whitespaces)
-                return v == "true"
-            }
-        }
-        return false
+        return ["true", "yes", "on", "y"].contains(v.lowercased())
     }
 
-    // setScalarKey upserts a single `key: value` line in policy.yaml,
-    // preserving every other line (idle_lock_minutes, the attachment
-    // allowlist, etc.). Nested blocks like `tools:` are never touched.
+    // setScalarKey upserts a single top-level `key: value` line in
+    // policy.yaml, preserving every other line byte-for-byte
+    // (idle_lock_minutes, the attachment allowlist, comments, CRLF
+    // endings). Indented lines inside nested blocks like `tools:` are
+    // never matched; a trailing comment on the replaced line is kept.
     private func setScalarKey(_ key: String, _ value: String) {
-        var lines: [String]
-        if let text = try? String(contentsOfFile: policyPath, encoding: .utf8) {
-            lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        } else {
-            lines = []
-        }
-        var replaced = false
-        for i in lines.indices {
-            if lines[i].trimmingCharacters(in: .whitespaces).hasPrefix("\(key):") {
-                lines[i] = "\(key): \(value)"
-                replaced = true
-                break
-            }
-        }
-        if !replaced {
-            lines.append("\(key): \(value)")
-        }
-        let out = lines.joined(separator: "\n")
-        try? out.write(toFile: policyPath, atomically: true, encoding: .utf8)
+        let text = (try? String(contentsOfFile: policyPath, encoding: .utf8)) ?? ""
+        try? AppDelegate.upsertTopLevel(key, value, in: text)
+            .write(toFile: policyPath, atomically: true, encoding: .utf8)
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: policyPath)
+    }
+
+    static func upsertTopLevel(_ key: String, _ value: String, in text: String) -> String {
+        let crlf = text.contains("\r\n")
+        var lines = text.isEmpty ? [] : text.components(separatedBy: "\n")
+        for i in lines.indices {
+            let hasCR = lines[i].hasSuffix("\r")
+            let line = hasCR ? String(lines[i].dropLast()) : lines[i]
+            guard line.hasPrefix("\(key):") else { continue }
+            let rest = String(line.dropFirst(key.count + 1))
+            let stripped = stripComment(rest)
+            let comment = rest.count > stripped.count ? " " + String(rest.dropFirst(stripped.count)) : ""
+            lines[i] = "\(key): \(value)\(comment)" + (hasCR ? "\r" : "")
+            return lines.joined(separator: "\n")
+        }
+        // Not present: append, keeping the file's newline convention
+        // and its trailing newline (split leaves a final "" for it).
+        let newLine = "\(key): \(value)" + (crlf ? "\r" : "")
+        if let lastLine = lines.last, lastLine.isEmpty {
+            lines.insert(newLine, at: lines.count - 1)
+        } else {
+            if let lastLine = lines.last, crlf && !lastLine.hasSuffix("\r") {
+                lines[lines.count - 1] = lastLine + "\r"
+            }
+            lines.append(newLine)
+            lines.append("")
+        }
+        return lines.joined(separator: "\n")
     }
 
     @objc private func toggleKeepAlive() {
@@ -386,13 +618,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func lockNow() {
-        if let pid = poller.daemonPID() { kill(pid, SIGUSR1) }
-        refresh()
+        signalDaemon(SIGUSR1, action: "lock")
     }
 
     @objc private func unlockNow() {
         // SIGUSR2 → daemon runs its Touch ID unlock flow in-process.
-        if let pid = poller.daemonPID() { kill(pid, SIGUSR2) }
+        signalDaemon(SIGUSR2, action: "connect")
+    }
+
+    // signalDaemon sends sig only to a PID verified (proc_pidpath) to
+    // be the protonmcpd next to this helper; anything else — a stale
+    // PID reused by another program, a protonmcpd from some other
+    // install — is refused with an explanation instead of signalled.
+    private func signalDaemon(_ sig: Int32, action: String) {
+        guard let pid = poller.verifiedDaemonPID() else {
+            let alert = NSAlert()
+            alert.messageText = "Couldn't \(action) Proton MCP"
+            alert.informativeText = "No running protonmcpd matches \(expectedDaemonPath), " +
+                "so no signal was sent."
+            alert.alertStyle = .warning
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
+            refresh()
+            return
+        }
+        kill(pid, sig)
         refresh()
     }
 
