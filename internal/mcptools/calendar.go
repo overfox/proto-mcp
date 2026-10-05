@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sort"
+	"time"
 
 	"github.com/just-an-oldsalt/proto-mcp/internal/mcp"
 	protonclient "github.com/just-an-oldsalt/proto-mcp/internal/proton"
@@ -34,6 +36,9 @@ func calendarList(deps Deps) mcp.Tool {
 		InputSchema:  json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`),
 		OutputSchema: json.RawMessage(calendarListSchema),
 		Handler: func(ctx mcp.Context, raw json.RawMessage) (*mcp.ToolResult, error) {
+			if calendarUnavailable(deps) {
+				return calendarUnavailableResult("calendar_list"), nil
+			}
 			cals, err := deps.Store.ListCalendars(ctx.Std)
 			if err != nil {
 				return mcp.ErrorResult("calendar_list: %v", err), nil
@@ -70,6 +75,13 @@ type calendarSummary struct {
 	Status     string `json:"status,omitempty"`
 	Recurring  bool   `json:"recurring,omitempty"`
 	RRULE      string `json:"rrule,omitempty"`
+
+	// Set on expanded occurrences of a recurring series and on
+	// RECURRENCE-ID override events. For an occurrence, start/end are
+	// the occurrence's own times and event_id is the series master.
+	Occurrence       bool   `json:"occurrence,omitempty"`
+	MasterEventID    string `json:"master_event_id,omitempty"`
+	RecurrenceIDUnix int64  `json:"recurrence_id_unix,omitempty"`
 }
 
 type calendarEventsResult struct {
@@ -91,7 +103,10 @@ func calendarEvents(deps Deps) mcp.Tool {
 		Description: "List or search calendar events from the local mirror, filtered by date range, calendar, and/or free-text query. " +
 			"Use from/to (RFC3339 or YYYY-MM-DD) for agenda-style queries like \"this week\". " +
 			"Read-only; served from the local mirror and decrypted on demand. " +
-			"Recurring events are returned once (the master) with recurring=true and the raw rrule — individual occurrences are NOT expanded in v1. " +
+			"When from and/or to is given, recurring events are expanded into individual occurrences inside the window " +
+			"(RRULE/RDATE minus EXDATE, with moved/cancelled single occurrences applied): each occurrence has occurrence=true, " +
+			"its own start_unix/end_unix, master_event_id (pass it to calendar_read_event) and recurrence_id_unix. " +
+			"A window with only from is capped at one year. Without from/to, recurring series are returned once (the master) with the raw rrule. " +
 			"Full-text query matches only events already decrypted (any prior listing or calendar-backfill --decrypt warms this).",
 		InputSchema: json.RawMessage(`{
 			"type": "object",
@@ -152,6 +167,34 @@ func calendarEvents(deps Deps) mcp.Tool {
 				f.Offset = off
 			}
 
+			if calendarUnavailable(deps) {
+				return calendarUnavailableResult("calendar_events"), nil
+			}
+
+			// Windowed query → expand recurring series into occurrences
+			// and paginate over the expanded list.
+			if f.FromUnix != 0 || f.ToUnix != 0 {
+				items, err := expandedCalendarEvents(ctx, deps, f)
+				if err != nil {
+					return mcp.ErrorResult("calendar_events: %v", err), nil
+				}
+				if calendarUnavailable(deps) {
+					return calendarUnavailableResult("calendar_events"), nil
+				}
+				out := calendarEventsResult{Events: []calendarSummary{}}
+				if f.Offset < len(items) {
+					end := f.Offset + limit
+					if end > len(items) {
+						end = len(items)
+					}
+					out.Events = items[f.Offset:end]
+					if end < len(items) {
+						out.NextCursor = encodeCursor(end, qhash)
+					}
+				}
+				return mcp.StructuredResult(out)
+			}
+
 			rows, err := deps.Store.ListCalendarEvents(ctx.Std, f)
 			if err != nil {
 				return mcp.ErrorResult("calendar_events: %v", err), nil
@@ -159,6 +202,9 @@ func calendarEvents(deps Deps) mcp.Tool {
 
 			// Warm any undecrypted rows in this page (best-effort, online).
 			ensureDecrypted(ctx, deps, rows)
+			if calendarUnavailable(deps) {
+				return calendarUnavailableResult("calendar_events"), nil
+			}
 
 			out := calendarEventsResult{Events: make([]calendarSummary, 0, len(rows))}
 			for _, r := range rows {
@@ -205,6 +251,9 @@ func calendarReadEvent(deps Deps) mcp.Tool {
 			if in.EventID == "" {
 				return nil, mcp.NewError(mcp.CodeInvalidParams, "calendar_read_event: event_id is required")
 			}
+			if calendarUnavailable(deps) {
+				return calendarUnavailableResult("calendar_read_event"), nil
+			}
 
 			row, gerr := deps.Store.GetCalendarEvent(ctx.Std, in.EventID)
 			inStore := gerr == nil
@@ -231,6 +280,9 @@ func calendarReadEvent(deps Deps) mcp.Tool {
 
 			detail, err := deps.Session.FetchAndDecryptCalendarEvent(ctx.Std, calID, in.EventID, nil)
 			if err != nil {
+				if protonclient.IsCalendarScopeError(err) {
+					return calendarUnavailableResult("calendar_read_event"), nil
+				}
 				if inStore {
 					return mcp.StructuredResult(detailFromRow(row)) // graceful: return what we have
 				}
@@ -249,11 +301,188 @@ func calendarReadEvent(deps Deps) mcp.Tool {
 
 // ----- shared helpers -----
 
+// calendarUnavailable reports whether the session's token has been seen
+// to lack calendar scope (Proton code 9100). The mirror is then empty or
+// stale, so the tools say so instead of returning silent empty results.
+func calendarUnavailable(deps Deps) bool {
+	return deps.Session != nil && deps.Session.CalendarUnavailable()
+}
+
+func calendarUnavailableResult(tool string) *mcp.ToolResult {
+	return mcp.ErrorResult("%s: %v", tool, protonclient.ErrCalendarUnavailable)
+}
+
+// Recurrence-expansion bounds for calendar_events.
+const (
+	calendarMaxExpansionWindow = 366 * 24 * time.Hour // window cap when only one bound is given
+	calendarMaxWindowRows      = 1000                 // mirror rows scanned per call
+	calendarMaxDecryptPerCall  = 200                  // on-demand decrypts per call (API round-trips)
+	calendarMaxSeriesCands     = 200                  // series that began before the window
+	calendarMaxOccPerSeries    = 1000
+)
+
+// expandedCalendarEvents returns every event/occurrence whose start lies
+// in the filter's window, sorted by start: non-recurring events as-is,
+// recurring masters (including series that began before the window)
+// expanded via protonclient.ExpandOccurrences, and stored RECURRENCE-ID
+// override events annotated with their master and excluded from the
+// master's expansion.
+func expandedCalendarEvents(ctx mcp.Context, deps Deps, f store.CalendarEventFilter) ([]calendarSummary, error) {
+	var from, to time.Time
+	switch {
+	case f.FromUnix != 0 && f.ToUnix != 0:
+		from, to = time.Unix(f.FromUnix, 0), time.Unix(f.ToUnix, 0)
+	case f.ToUnix != 0:
+		to = time.Unix(f.ToUnix, 0)
+		from = to.Add(-calendarMaxExpansionWindow)
+	default:
+		from = time.Unix(f.FromUnix, 0)
+		to = from.Add(calendarMaxExpansionWindow)
+	}
+
+	// 1. Mirror rows starting inside the window.
+	wf := f
+	wf.ToUnix = to.Unix()
+	wf.Limit, wf.Offset = 200, 0
+	var rows []store.CalendarEventRow
+	for len(rows) < calendarMaxWindowRows {
+		page, err := deps.Store.ListCalendarEvents(ctx.Std, wf)
+		if err != nil {
+			return nil, err
+		}
+		rows = append(rows, page...)
+		if len(page) < wf.Limit {
+			break
+		}
+		wf.Offset += len(page)
+	}
+
+	// 2. Series that began before the window may still recur inside it.
+	var cands []store.CalendarEventRow
+	if f.FromUnix != 0 {
+		var err error
+		cands, err = deps.Store.ListCalendarRecurrenceCandidates(ctx.Std, f.CalendarID, f.Query, f.FromUnix, calendarMaxSeriesCands)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// 3. Recurrence lives in the encrypted payload: warm what we can.
+	ensureDecryptedN(ctx, deps, rows, calendarMaxDecryptPerCall)
+	ensureDecryptedN(ctx, deps, cands, calendarMaxDecryptPerCall)
+
+	series := map[string][]store.CalendarEventRow{} // calendar|uid → rows sharing the UID
+	seriesRows := func(r store.CalendarEventRow) []store.CalendarEventRow {
+		k := r.CalendarID + "|" + r.UID
+		if v, ok := series[k]; ok {
+			return v
+		}
+		v, err := deps.Store.ListCalendarEventsByUID(ctx.Std, r.CalendarID, r.UID)
+		if err != nil {
+			slog.Warn("calendar_events: series lookup failed", "err", err.Error())
+		}
+		series[k] = v
+		return v
+	}
+
+	seen := map[string]bool{}
+	var items []calendarSummary
+	expand := func(m store.CalendarEventRow) bool {
+		exclude := map[int64]bool{}
+		for _, sib := range seriesRows(m) {
+			if sib.ID == m.ID {
+				continue
+			}
+			if rid := protonclient.ICalRecurrenceID(sib.RawICal, sib.StartTZ); rid != 0 {
+				exclude[rid] = true
+			}
+		}
+		occ, err := protonclient.ExpandOccurrences(protonclient.ExpansionInput{
+			RawICal:              m.RawICal,
+			StartTZ:              m.StartTZ,
+			AllDay:               m.AllDay,
+			StartUnix:            m.StartUnix,
+			EndUnix:              m.EndUnix,
+			ExcludeRecurrenceIDs: exclude,
+		}, from, to, calendarMaxOccPerSeries)
+		if err != nil {
+			slog.Debug("calendar_events: recurrence expansion failed; returning master", "err", err.Error())
+			return false
+		}
+		for _, o := range occ {
+			s := summaryFromRow(m)
+			s.StartUnix, s.EndUnix = o.StartUnix, o.EndUnix
+			s.Occurrence = true
+			s.MasterEventID = m.ID
+			s.RecurrenceIDUnix = o.RecurrenceID
+			if o.Override {
+				if o.Summary != "" {
+					s.Summary = o.Summary
+				}
+				if o.Location != "" {
+					s.Location = o.Location
+				}
+				if o.Status != "" {
+					s.Status = o.Status
+				}
+			}
+			items = append(items, s)
+		}
+		return true
+	}
+
+	for _, r := range rows {
+		if seen[r.ID] {
+			continue
+		}
+		seen[r.ID] = true
+		if r.IsRecurring && r.RawICal != "" && expand(r) {
+			continue
+		}
+		s := summaryFromRow(r)
+		if rid := protonclient.ICalRecurrenceID(r.RawICal, r.StartTZ); rid != 0 {
+			// A single modified occurrence stored as its own event.
+			s.Recurring = true
+			s.Occurrence = true
+			s.RecurrenceIDUnix = rid
+			for _, sib := range seriesRows(r) {
+				if sib.ID != r.ID && sib.IsRecurring {
+					s.MasterEventID = sib.ID
+					break
+				}
+			}
+		}
+		items = append(items, s)
+	}
+	for _, c := range cands {
+		if seen[c.ID] || !c.IsRecurring || c.RawICal == "" {
+			continue
+		}
+		seen[c.ID] = true
+		expand(c)
+	}
+
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].StartUnix != items[j].StartUnix {
+			return items[i].StartUnix < items[j].StartUnix
+		}
+		return items[i].EventID < items[j].EventID
+	})
+	return items, nil
+}
+
 // ensureDecrypted warms undecrypted rows in a page by decrypting them on
 // demand and persisting the result. Best-effort: requires a session, and
 // any per-event failure leaves that row envelope-only rather than failing
 // the whole call. A shared key cache amortizes the per-calendar unlock.
 func ensureDecrypted(ctx mcp.Context, deps Deps, rows []store.CalendarEventRow) {
+	ensureDecryptedN(ctx, deps, rows, len(rows))
+}
+
+// ensureDecryptedN is ensureDecrypted with a cap on how many events are
+// fetched+decrypted in one call (each is an API round-trip). It stops
+// early once the session is known to lack calendar scope.
+func ensureDecryptedN(ctx mcp.Context, deps Deps, rows []store.CalendarEventRow, budget int) {
 	if deps.Session == nil {
 		return
 	}
@@ -262,13 +491,17 @@ func ensureDecrypted(ctx mcp.Context, deps Deps, rows []store.CalendarEventRow) 
 		if rows[i].Decrypted {
 			continue
 		}
+		if budget <= 0 || deps.Session.CalendarUnavailable() || ctx.Std.Err() != nil {
+			return
+		}
+		budget--
 		if cache == nil {
 			cache = protonclient.NewCalendarKeyCache()
 			defer cache.Clear()
 		}
 		detail, err := deps.Session.FetchAndDecryptCalendarEvent(ctx.Std, rows[i].CalendarID, rows[i].ID, cache)
 		if err != nil {
-			slog.Warn("calendar_events: decrypt-on-read failed", "event_id", rows[i].ID, "err", err.Error())
+			slog.Warn("calendar_events: decrypt-on-read failed", "err", protonclient.RedactLogText(err.Error()))
 			continue
 		}
 		if ferr := deps.Store.FillCalendarEventDecrypted(ctx.Std, rows[i].ID, decryptedFromDetail(detail)); ferr != nil {
@@ -286,6 +519,7 @@ func applyDetailToRow(r *store.CalendarEventRow, d *protonclient.CalendarEventDe
 	r.Status = d.Status
 	r.RRULE = d.RRULE
 	r.IsRecurring = d.IsRecurring
+	r.RawICal = d.RawICal
 	r.Decrypted = true
 }
 
@@ -330,6 +564,7 @@ func detailFromRow(r store.CalendarEventRow) *protonclient.CalendarEventDetail {
 	if r.AttendeesJSON != "" {
 		_ = json.Unmarshal([]byte(r.AttendeesJSON), &d.Attendees)
 	}
+	d.RecurrenceID = protonclient.ICalRecurrenceID(r.RawICal, r.StartTZ)
 	return d
 }
 
@@ -403,7 +638,10 @@ const calendarEventsSchema = `{
 					"all_day":     {"type": "boolean"},
 					"status":      {"type": "string"},
 					"recurring":   {"type": "boolean"},
-					"rrule":       {"type": "string"}
+					"rrule":       {"type": "string"},
+					"occurrence":         {"type": "boolean"},
+					"master_event_id":    {"type": "string"},
+					"recurrence_id_unix": {"type": "integer"}
 				},
 				"required": ["event_id", "calendar_id", "start_unix"]
 			}
@@ -431,6 +669,7 @@ const calendarEventDetailSchema = `{
 		"all_day":     {"type": "boolean"},
 		"recurring":   {"type": "boolean"},
 		"rrule":       {"type": "string"},
+		"recurrence_id_unix": {"type": "integer"},
 		"attendees": {
 			"type": "array",
 			"items": {

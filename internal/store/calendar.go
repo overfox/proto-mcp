@@ -402,3 +402,61 @@ func ftsMatch(query string) string {
 	}
 	return strings.Join(quoted, " ")
 }
+
+// ListCalendarRecurrenceCandidates returns events that START BEFORE
+// beforeUnix and may be recurring masters whose occurrences fall in a
+// later window: rows already known to recur (is_recurring=1) plus rows
+// not yet decrypted (recurrence unknown until decrypted). Used by
+// calendar_events to expand series that began before the requested
+// range. With a Query, only decrypted recurring rows matching the FTS
+// index qualify. Most recent first; capped at limit (default 200).
+func (s *Store) ListCalendarRecurrenceCandidates(ctx context.Context, calendarID, query string, beforeUnix int64, limit int) ([]CalendarEventRow, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	conds := []string{"start_unix < ?"}
+	args := []any{beforeUnix}
+	if calendarID != "" {
+		conds = append(conds, "calendar_id = ?")
+		args = append(args, calendarID)
+	}
+	if m := ftsMatch(query); m != "" {
+		conds = append(conds, "is_recurring = 1",
+			"id IN (SELECT event_id FROM calendar_events_fts WHERE calendar_events_fts MATCH ?)")
+		args = append(args, m)
+	} else {
+		conds = append(conds, "(is_recurring = 1 OR decrypted_at IS NULL)")
+	}
+	q := `SELECT` + calendarEventCols + ` FROM calendar_events WHERE ` + strings.Join(conds, " AND ") +
+		` ORDER BY start_unix DESC LIMIT ?`
+	args = append(args, limit)
+	return s.queryCalendarEvents(ctx, q, args...)
+}
+
+// ListCalendarEventsByUID returns every mirrored event of one calendar
+// sharing an iCal UID — a recurring master plus any RECURRENCE-ID
+// overrides Proton stores as separate events.
+func (s *Store) ListCalendarEventsByUID(ctx context.Context, calendarID, uid string) ([]CalendarEventRow, error) {
+	if uid == "" {
+		return nil, nil
+	}
+	q := `SELECT` + calendarEventCols + ` FROM calendar_events WHERE calendar_id = ? AND uid = ? ORDER BY start_unix ASC`
+	return s.queryCalendarEvents(ctx, q, calendarID, uid)
+}
+
+func (s *Store) queryCalendarEvents(ctx context.Context, q string, args ...any) ([]CalendarEventRow, error) {
+	rows, err := s.DB.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query calendar events: %w", err)
+	}
+	defer rows.Close()
+	var out []CalendarEventRow
+	for rows.Next() {
+		r, err := scanCalendarEventRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}

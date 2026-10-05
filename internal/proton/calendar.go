@@ -5,7 +5,10 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	gpa "github.com/ProtonMail/go-proton-api"
 	"github.com/ProtonMail/gopenpgp/v2/crypto"
@@ -23,6 +26,150 @@ import (
 // (`part.Data = ...`), so the result is discarded and it returns only an
 // error. It is also unused upstream. decryptSharedPart below replicates
 // its body and actually returns the plaintext.
+
+// ----- calendar availability (Proton code 9100) -----
+//
+// Proton access tokens carry a server-assigned scope set (gpa.Auth.Scope,
+// returned by POST /auth/v4 and /auth/v4/refresh — the client cannot
+// request scopes; go-proton-api's AuthReq has no scope field). The scope
+// set is derived from the client identity (x-pm-appversion). proto-mcp
+// identifies as Proton Bridge, a mail-only product, and Bridge-scoped
+// tokens are rejected by the calendar event endpoints with HTTP 403 /
+// Code 9100 "Access token does not have sufficient scope" — even though
+// GET /calendar/v1 (the calendar list) succeeds. There is no unlock /
+// scope-elevation call in go-proton-api that grants calendar scope, so
+// the only correct behavior is to detect the condition, stop hammering
+// the endpoint, and tell the caller plainly.
+//
+// Availability is tracked per login (keyed on the auth UID, which a
+// lock/unlock resume keeps) in-process and is not persisted: a fresh
+// login gets a fresh token and therefore a fresh check, while a screen-
+// lock/unlock cycle doesn't re-trigger the probe-and-warn.
+
+// CalendarScopeCode is Proton's "Access token does not have sufficient
+// scope" API error code.
+const CalendarScopeCode gpa.Code = 9100
+
+// ErrCalendarUnavailable is returned (and surfaced verbatim by the
+// calendar tools) once the session's token has been seen to lack
+// calendar scope.
+var ErrCalendarUnavailable = errors.New("Proton Calendar isn't accessible with this login's token scope (Proton code 9100) — calendar tools unavailable")
+
+// IsCalendarScopeError reports whether err is Proton's insufficient-scope
+// rejection: Code 9100, or an HTTP 403 whose message mentions scope.
+func IsCalendarScopeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrCalendarUnavailable) {
+		return true
+	}
+	var apiErr *gpa.APIError
+	if errors.As(err, &apiErr) && apiErr != nil {
+		if apiErr.Code == CalendarScopeCode {
+			return true
+		}
+		if apiErr.Status == http.StatusForbidden && strings.Contains(strings.ToLower(apiErr.Message), "scope") {
+			return true
+		}
+	}
+	return false
+}
+
+// calendarAccessState is the per-session availability record.
+type calendarAccessState struct {
+	unavailable bool
+	lastCheck   time.Time // last time a pass actually probed the event endpoint
+}
+
+var (
+	calendarAccessMu sync.Mutex
+	calendarAccess   = map[string]calendarAccessState{}
+)
+
+// calendarAccessKey identifies the login a session belongs to: its auth
+// UID, or — for a session without one (tests) — its address.
+func (s *Session) calendarAccessKey() string {
+	if s.UID != "" {
+		return "uid:" + s.UID
+	}
+	return fmt.Sprintf("ptr:%p", s)
+}
+
+// CalendarUnavailable reports whether this session has been marked as
+// lacking calendar scope.
+func (s *Session) CalendarUnavailable() bool {
+	if s == nil {
+		return false
+	}
+	calendarAccessMu.Lock()
+	defer calendarAccessMu.Unlock()
+	return calendarAccess[s.calendarAccessKey()].unavailable
+}
+
+// MarkCalendarUnavailable records that the session's token lacks calendar
+// scope. Returns true only on the available→unavailable transition, so
+// callers can log exactly once.
+func (s *Session) MarkCalendarUnavailable(now time.Time) bool {
+	if s == nil {
+		return false
+	}
+	calendarAccessMu.Lock()
+	defer calendarAccessMu.Unlock()
+	k := s.calendarAccessKey()
+	st := calendarAccess[k]
+	first := !st.unavailable
+	st.unavailable = true
+	st.lastCheck = now
+	calendarAccess[k] = st
+	return first
+}
+
+// MarkCalendarAvailable clears the unavailable flag (e.g. a periodic
+// re-check succeeded). Returns true if the session was previously marked
+// unavailable.
+func (s *Session) MarkCalendarAvailable(now time.Time) bool {
+	if s == nil {
+		return false
+	}
+	calendarAccessMu.Lock()
+	defer calendarAccessMu.Unlock()
+	k := s.calendarAccessKey()
+	st := calendarAccess[k]
+	was := st.unavailable
+	st.unavailable = false
+	st.lastCheck = now
+	calendarAccess[k] = st
+	return was
+}
+
+// CalendarRecheckDue reports whether a session marked unavailable is due
+// for another probe (at most once per interval). Always true for a
+// session that isn't marked unavailable.
+func (s *Session) CalendarRecheckDue(now time.Time, interval time.Duration) bool {
+	if s == nil {
+		return false
+	}
+	calendarAccessMu.Lock()
+	defer calendarAccessMu.Unlock()
+	st := calendarAccess[s.calendarAccessKey()]
+	if !st.unavailable {
+		return true
+	}
+	return now.Sub(st.lastCheck) >= interval
+}
+
+// noteCalendarErr marks the session unavailable when err is a scope
+// rejection and returns ErrCalendarUnavailable wrapped around it, so
+// on-demand reads (calendar_read_event, decrypt-on-read) participate in
+// the same state machine as the background poll.
+func (s *Session) noteCalendarErr(err error) error {
+	if !IsCalendarScopeError(err) {
+		return err
+	}
+	s.MarkCalendarUnavailable(time.Now())
+	return fmt.Errorf("%w: %w", ErrCalendarUnavailable, err)
+}
 
 // CalendarAttendeeDetail is a flattened attendee from the decrypted
 // VEVENT. Attendee emails are NOT in the plaintext event metadata
@@ -55,6 +202,10 @@ type CalendarEventDetail struct {
 
 	IsRecurring bool   `json:"recurring"`
 	RRULE       string `json:"rrule,omitempty"`
+	// RecurrenceID is the original start (unix) of the occurrence this
+	// event overrides, when the event is a RECURRENCE-ID exception of a
+	// recurring series; 0 otherwise.
+	RecurrenceID int64 `json:"recurrence_id_unix,omitempty"`
 
 	Attendees []CalendarAttendeeDetail `json:"attendees,omitempty"`
 
@@ -166,9 +317,12 @@ func (s *Session) FetchAndDecryptCalendarEvent(ctx context.Context, calID, event
 	if s == nil || s.Client == nil {
 		return nil, errors.New("proton: session is closed")
 	}
+	if s.CalendarUnavailable() {
+		return nil, ErrCalendarUnavailable
+	}
 	ev, err := s.Client.GetCalendarEvent(ctx, calID, eventID)
 	if err != nil {
-		return nil, fmt.Errorf("get calendar event %s: %w", eventID, err)
+		return nil, s.noteCalendarErr(fmt.Errorf("get calendar event %s: %w", eventID, err))
 	}
 	return s.DecryptCalendarEvent(ctx, ev, cache)
 }
@@ -183,10 +337,25 @@ func (s *Session) DecryptCalendarEvent(ctx context.Context, ev gpa.CalendarEvent
 		return nil, err
 	}
 
-	raw, err := decryptSharedPart(calKR, ev.SharedKeyPacket, ev.SharedEvents)
+	texts, err := decryptEventParts(calKR, ev.SharedKeyPacket, ev.SharedEvents)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt event %s: %w", ev.ID, err)
 	}
+	// Attendee list (encrypted to the shared session key) and calendar-
+	// level fields (STATUS/TRANSP, encrypted to the calendar key packet)
+	// live in separate part lists. Best-effort: an unreadable auxiliary
+	// part must not hide the core event.
+	if len(ev.AttendeesEvents) > 0 {
+		if more, aerr := decryptEventParts(calKR, ev.SharedKeyPacket, ev.AttendeesEvents); aerr == nil {
+			texts = append(texts, more...)
+		}
+	}
+	if len(ev.CalendarEvents) > 0 {
+		if more, cerr := decryptEventParts(calKR, ev.CalendarKeyPacket, ev.CalendarEvents); cerr == nil {
+			texts = append(texts, more...)
+		}
+	}
+	raw := joinICalParts(texts)
 
 	fields, err := parseICalEvent(raw)
 	if err != nil {
@@ -194,22 +363,23 @@ func (s *Session) DecryptCalendarEvent(ctx context.Context, ev gpa.CalendarEvent
 	}
 
 	detail := &CalendarEventDetail{
-		EventID:     ev.ID,
-		CalendarID:  ev.CalendarID,
-		UID:         firstNonEmpty(ev.UID, fields.UID),
-		Summary:     fields.Summary,
-		Location:    fields.Location,
-		Description: fields.Description,
-		Organizer:   fields.Organizer,
-		Status:      fields.Status,
-		StartUnix:   ev.StartTime,
-		StartTZ:     ev.StartTimezone,
-		EndUnix:     ev.EndTime,
-		EndTZ:       ev.EndTimezone,
-		AllDay:      bool(ev.FullDay),
-		IsRecurring: fields.IsRecurring,
-		RRULE:       fields.RRULE,
-		RawICal:     raw,
+		EventID:      ev.ID,
+		CalendarID:   ev.CalendarID,
+		UID:          firstNonEmpty(ev.UID, fields.UID),
+		Summary:      fields.Summary,
+		Location:     fields.Location,
+		Description:  fields.Description,
+		Organizer:    fields.Organizer,
+		Status:       fields.Status,
+		StartUnix:    ev.StartTime,
+		StartTZ:      ev.StartTimezone,
+		EndUnix:      ev.EndTime,
+		EndTZ:        ev.EndTimezone,
+		AllDay:       bool(ev.FullDay),
+		IsRecurring:  fields.IsRecurring,
+		RRULE:        fields.RRULE,
+		RecurrenceID: fields.RecurrenceID,
+		RawICal:      raw,
 	}
 	for _, a := range fields.Attendees {
 		detail.Attendees = append(detail.Attendees, CalendarAttendeeDetail(a))
@@ -217,16 +387,31 @@ func (s *Session) DecryptCalendarEvent(ctx context.Context, ev gpa.CalendarEvent
 	return detail, nil
 }
 
-// decryptSharedPart decrypts the SharedEvents iCalendar payload using the
-// calendar keyring and the event's SharedKeyPacket. This replicates
-// CalendarEventPart.Decode's working logic (see the note at the top of
-// the file). Signature verification is intentionally not performed: for
-// shared/invited events the author is a third party whose public key we
-// don't hold, and confidentiality is already guaranteed by decrypting
-// with the calendar key.
+// decryptSharedPart decrypts an event part list (SharedEvents or
+// AttendeesEvents) using the calendar keyring and the key packet, and
+// returns every part's iCalendar text concatenated. Proton splits one
+// VEVENT across parts — a signed-only clear part (UID/DTSTART/RRULE/
+// EXDATE/RECURRENCE-ID …) and an encrypted part (SUMMARY/LOCATION/
+// DESCRIPTION) — so returning only the first part would drop half the
+// event. Each part is a complete VCALENDAR; parseICalEvent merges them.
+//
+// This replicates CalendarEventPart.Decode's working logic (see the note
+// at the top of the file). Signature verification is intentionally not
+// performed: for shared/invited events the author is a third party whose
+// public key we don't hold, and confidentiality is already guaranteed by
+// decrypting with the calendar key.
 func decryptSharedPart(calKR *crypto.KeyRing, keyPacketB64 string, parts []gpa.CalendarEventPart) (string, error) {
+	texts, err := decryptEventParts(calKR, keyPacketB64, parts)
+	if err != nil {
+		return "", err
+	}
+	return joinICalParts(texts), nil
+}
+
+// decryptEventParts returns the plaintext of every non-empty part.
+func decryptEventParts(calKR *crypto.KeyRing, keyPacketB64 string, parts []gpa.CalendarEventPart) ([]string, error) {
 	if len(parts) == 0 {
-		return "", errors.New("event has no shared parts")
+		return nil, errors.New("event has no shared parts")
 	}
 
 	var kp []byte
@@ -234,15 +419,16 @@ func decryptSharedPart(calKR *crypto.KeyRing, keyPacketB64 string, parts []gpa.C
 		var err error
 		kp, err = base64.StdEncoding.DecodeString(keyPacketB64)
 		if err != nil {
-			return "", fmt.Errorf("decode shared key packet: %w", err)
+			return nil, fmt.Errorf("decode shared key packet: %w", err)
 		}
 	}
 
+	var out []string
 	for _, part := range parts {
 		// Clear (unencrypted) part — the data is already plaintext.
 		if part.Type&gpa.CalendarEventTypeEncrypted == 0 {
 			if strings.TrimSpace(part.Data) != "" {
-				return part.Data, nil
+				out = append(out, part.Data)
 			}
 			continue
 		}
@@ -251,24 +437,45 @@ func decryptSharedPart(calKR *crypto.KeyRing, keyPacketB64 string, parts []gpa.C
 		if kp != nil {
 			data, err := base64.StdEncoding.DecodeString(part.Data)
 			if err != nil {
-				return "", fmt.Errorf("decode event data: %w", err)
+				return nil, fmt.Errorf("decode event data: %w", err)
 			}
 			msg = crypto.NewPGPSplitMessage(kp, data).GetPGPMessage()
 		} else {
 			var err error
 			if msg, err = crypto.NewPGPMessageFromArmored(part.Data); err != nil {
-				return "", fmt.Errorf("parse armored event data: %w", err)
+				return nil, fmt.Errorf("parse armored event data: %w", err)
 			}
 		}
 
 		dec, err := calKR.Decrypt(msg, nil, crypto.GetUnixTime())
 		if err != nil {
-			return "", fmt.Errorf("decrypt event part: %w", err)
+			return nil, fmt.Errorf("decrypt event part: %w", err)
 		}
-		return dec.GetString(), nil
+		if txt := dec.GetString(); strings.TrimSpace(txt) != "" {
+			out = append(out, txt)
+		}
 	}
 
-	return "", errors.New("no decryptable shared event part")
+	if len(out) == 0 {
+		return nil, errors.New("no decryptable shared event part")
+	}
+	return out, nil
+}
+
+// joinICalParts concatenates per-part VCALENDAR texts into one stream
+// (each guaranteed newline-terminated). A single part is returned as-is.
+func joinICalParts(texts []string) string {
+	if len(texts) == 1 {
+		return texts[0]
+	}
+	var b strings.Builder
+	for _, t := range texts {
+		b.WriteString(t)
+		if !strings.HasSuffix(t, "\n") {
+			b.WriteString("\r\n")
+		}
+	}
+	return b.String()
 }
 
 func firstNonEmpty(a, b string) string {
