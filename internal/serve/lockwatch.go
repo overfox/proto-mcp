@@ -38,7 +38,27 @@ func startLockwatch(binPath string, lockFn func(reason string), logger *slog.Log
 	return cancel
 }
 
+// lockwatchHealthyRun is how long a helper run must last to count as
+// healthy: a crash after that resets the restart backoff to minimum, so
+// one bad stretch weeks ago doesn't leave every later restart at the
+// 30s ceiling (during which screen-lock auto-lock is not armed).
+const lockwatchHealthyRun = 60 * time.Second
+
 func runLockwatchLoop(ctx context.Context, binPath string, lockFn func(reason string), logger *slog.Logger) {
+	runLockwatchLoopWith(ctx, func(ctx context.Context) error {
+		return runLockwatchOnce(ctx, binPath, lockFn, logger)
+	}, logger, time.Now, time.After)
+}
+
+// runLockwatchLoopWith is the restart loop with its clock and runner
+// injectable for tests.
+func runLockwatchLoopWith(
+	ctx context.Context,
+	runOnce func(context.Context) error,
+	logger *slog.Logger,
+	now func() time.Time,
+	after func(time.Duration) <-chan time.Time,
+) {
 	const (
 		minBackoff = 1 * time.Second
 		maxBackoff = 30 * time.Second
@@ -48,9 +68,13 @@ func runLockwatchLoop(ctx context.Context, binPath string, lockFn func(reason st
 		if ctx.Err() != nil {
 			return
 		}
-		err := runLockwatchOnce(ctx, binPath, lockFn, logger)
+		started := now()
+		err := runOnce(ctx)
 		if ctx.Err() != nil {
 			return
+		}
+		if now().Sub(started) >= lockwatchHealthyRun {
+			backoff = minBackoff // healthy run: don't inherit an old crash loop's delay
 		}
 		if err != nil {
 			logger.Warn("lockwatch helper exited; restarting",
@@ -61,7 +85,7 @@ func runLockwatchLoop(ctx context.Context, binPath string, lockFn func(reason st
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(backoff):
+		case <-after(backoff):
 		}
 		backoff *= 2
 		if backoff > maxBackoff {
