@@ -225,15 +225,29 @@ enum MenuBarIcon {
         }
     }
 
-    static func image(state: DaemonState, awake: Bool) -> NSImage {
+    // timerFont is 30% under the menu bar's 13pt system font, so the
+    // countdown reads as a caption to the cup rather than a second label.
+    private static let timerFont = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .medium)
+
+    // image composes envelope (+ state badge), and — when awakeMinutes is
+    // set — the cup and its countdown into one tightly spaced template
+    // image, so the whole group stays together and recolours as one.
+    static func image(state: DaemonState, awakeMinutes: Int? = nil) -> NSImage {
         let env = symbol(envelopeNames(state), envelopeConfig) ?? NSImage()
         let badge = badgeNames(state).flatMap { symbol($0, badgeConfig) }
-        let cup = awake ? symbol(["cup.and.heat.waves.fill", "cup.and.saucer.fill"], cupConfig) : nil
+        let cup = awakeMinutes == nil ? nil : symbol(["cup.and.heat.waves.fill", "cup.and.saucer.fill"], cupConfig)
+        let timer = awakeMinutes.map {
+            NSAttributedString(string: "\($0)m", attributes: [.font: timerFont, .foregroundColor: NSColor.black])
+        }
 
-        let gap: CGFloat = 5
+        let cupGap: CGFloat = 1    // envelope (incl. badge) → cup; the symbol adds its own bearing
+        let timerGap: CGFloat = 1  // cup → countdown
         let badgeOverhang: CGFloat = badge == nil ? 0 : 4.5
         let envW = env.size.width + badgeOverhang
-        let width = envW + (cup.map { gap + $0.size.width } ?? 0)
+        let cupW = cup.map { cupGap + $0.size.width } ?? 0
+        let timerSize = timer?.size() ?? .zero
+        let timerW = timer == nil ? 0 : timerGap + timerSize.width
+        let width = envW + cupW + timerW
         let height = max(18, env.size.height + 2, cup?.size.height ?? 0)
 
         let img = NSImage(size: NSSize(width: ceil(width), height: ceil(height)), flipped: false) { _ in
@@ -256,14 +270,21 @@ enum MenuBarIcon {
                 badge.draw(in: b)
             }
             if let cup {
-                let c = NSRect(x: envW + gap, y: (height - cup.size.height) / 2,
+                let c = NSRect(x: envW + cupGap, y: (height - cup.size.height) / 2,
                                width: cup.size.width, height: cup.size.height)
                 cup.draw(in: c)
+            }
+            if let timer {
+                // Template image: only alpha matters, so black text is
+                // recoloured with the rest of the icon.
+                timer.draw(at: NSPoint(x: envW + cupW + timerGap,
+                                       y: (height - timerSize.height) / 2))
             }
             return true
         }
         img.isTemplate = true
-        img.accessibilityDescription = "Proton MCP: \(state.label)" + (awake ? "; Mac kept awake" : "")
+        img.accessibilityDescription = "Proton MCP: \(state.label)" +
+            (awakeMinutes.map { "; Mac kept awake, \($0) min left" } ?? "")
         return img
     }
 }
@@ -545,20 +566,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         poller.poll()
         caffeine.refresh()
         let awake = caffeine.isActive
-        statusItem.button?.image = MenuBarIcon.image(state: poller.state, awake: awake)
-        if awake {
-            // Time left sits right of the cup. Monospaced digits keep the
-            // item from shifting width as the count ticks down.
-            // Plain title + font (not an attributed title) so the system
-            // colours it for light/dark menu bars and the click highlight.
-            statusItem.button?.font = NSFont.monospacedDigitSystemFont(
-                ofSize: NSFont.systemFontSize, weight: .regular)
-            statusItem.button?.title = " \(caffeineMinutesLeft())m"
-            statusItem.button?.imagePosition = .imageLeft
-        } else {
-            statusItem.button?.title = ""
-            statusItem.button?.imagePosition = .imageOnly
-        }
+        statusItem.button?.title = ""
+        statusItem.button?.image = MenuBarIcon.image(
+            state: poller.state, awakeMinutes: awake ? caffeineMinutesLeft() : nil)
+        statusItem.button?.imagePosition = .imageOnly
         statusItem.button?.toolTip = "Proton MCP: \(statusLabel())" +
             (awake ? "\nMac kept awake — \(caffeineMinutesLeft()) min left" : "")
     }
@@ -598,7 +609,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let status = NSMenuItem(title: "Proton MCP — \(statusLabel())",
                                 action: nil, keyEquivalent: "")
         status.isEnabled = false
-        status.image = MenuBarIcon.image(state: poller.state, awake: false)
+        status.image = MenuBarIcon.image(state: poller.state)
         menu.addItem(status)
 
         if !poller.email.isEmpty {
