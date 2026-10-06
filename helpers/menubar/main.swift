@@ -370,9 +370,91 @@ final class StatusPoller {
     }
 }
 
+// Caffeine runs `caffeinate -d -i -u -t 3600` on demand: hold off display
+// and idle sleep and declare the user active, for one hour. It adopts a
+// matching caffeinate already running (started by an earlier menu bar
+// process, or by hand in a terminal) so the indicator reflects what is
+// actually keeping the Mac awake, and the toggle can stop it.
+final class Caffeine {
+    static let path = "/usr/bin/caffeinate"
+    static let args = ["-d", "-i", "-u", "-t", "3600"]
+    static let duration: TimeInterval = 3600
+
+    // child is set only for an instance this process launched: its pid
+    // stays a zombie until reaped, so liveness must come from
+    // Process.isRunning, not kill(pid, 0).
+    private var child: Process?
+    private var adoptedPID: pid_t?
+    private var startedAt: Date?
+
+    var isActive: Bool {
+        if let child { return child.isRunning }
+        guard let pid = adoptedPID else { return false }
+        return kill(pid, 0) == 0 && executablePath(pid) == Caffeine.path
+    }
+
+    var remaining: TimeInterval {
+        guard isActive, let startedAt else { return 0 }
+        return max(0, Caffeine.duration - Date().timeIntervalSince(startedAt))
+    }
+
+    // refresh drops a finished instance and adopts a running one, so a
+    // caffeinate that times out after its hour flips the indicator off.
+    func refresh() {
+        if let child, !child.isRunning { self.child = nil; startedAt = nil }
+        if let pid = adoptedPID, !(kill(pid, 0) == 0 && executablePath(pid) == Caffeine.path) {
+            adoptedPID = nil; startedAt = nil
+        }
+        if child == nil && adoptedPID == nil { adopt() }
+    }
+
+    private func adopt() {
+        let (code, out) = runCmd("/usr/bin/pgrep", ["-f", "caffeinate " + Caffeine.args.joined(separator: " ") + "$"])
+        guard code == 0 else { return }
+        for line in out.split(separator: "\n") {
+            guard let pid = pid_t(line.trimmingCharacters(in: .whitespaces)),
+                  executablePath(pid) == Caffeine.path else { continue }
+            adoptedPID = pid
+            startedAt = Date().addingTimeInterval(-elapsed(pid))
+            return
+        }
+    }
+
+    // elapsed parses `ps -o etime=` ([[dd-]hh:]mm:ss) for an adopted pid.
+    private func elapsed(_ pid: pid_t) -> TimeInterval {
+        let (_, out) = runCmd("/bin/ps", ["-o", "etime=", "-p", String(pid)])
+        var s = out.trimmingCharacters(in: .whitespacesAndNewlines)
+        var days = 0.0
+        if let dash = s.firstIndex(of: "-") {
+            days = Double(s[..<dash]) ?? 0
+            s = String(s[s.index(after: dash)...])
+        }
+        let parts = s.split(separator: ":").compactMap { Double($0) }
+        let secs = parts.reversed().enumerated().reduce(0.0) { $0 + $1.element * pow(60, Double($1.offset)) }
+        return days * 86400 + secs
+    }
+
+    func start() {
+        guard !isActive else { return }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: Caffeine.path)
+        p.arguments = Caffeine.args
+        do { try p.run() } catch { return }
+        child = p
+        startedAt = Date()
+    }
+
+    func stop() {
+        if let child, child.isRunning { child.terminate(); child.waitUntilExit() }
+        if let pid = adoptedPID, executablePath(pid) == Caffeine.path { kill(pid, SIGTERM) }
+        child = nil; adoptedPID = nil; startedAt = nil
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private let poller = StatusPoller()
+    private let caffeine = Caffeine()
     private var timer: Timer?
 
     func applicationDidFinishLaunching(_ note: Notification) {
@@ -387,8 +469,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func refresh() {
         poller.poll()
-        statusItem.button?.title = "\(poller.state.emoji)\u{FE0E} ✉︎"
-        statusItem.button?.toolTip = "Proton MCP: \(statusLabel())"
+        caffeine.refresh()
+        let awake = caffeine.isActive
+        statusItem.button?.title = "\(poller.state.emoji)\u{FE0E} ✉︎" + (awake ? " ☕\u{FE0E}" : "")
+        statusItem.button?.toolTip = "Proton MCP: \(statusLabel())" +
+            (awake ? "\nMac kept awake — \(caffeineMinutesLeft()) min left" : "")
+    }
+
+    private func caffeineMinutesLeft() -> Int {
+        Int((caffeine.remaining / 60).rounded(.up))
+    }
+
+    @objc private func toggleCaffeine() {
+        if caffeine.isActive { caffeine.stop() } else { caffeine.start() }
+        refresh()
     }
 
     // statusLabel appends the daemon's own reason (state.json) for the
@@ -470,6 +564,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             "Keep Alive never removes Touch ID from sending, moving, labeling, trashing or deleting; " +
             "Lock Now and Switch Off always work."
         menu.addItem(keepAlive)
+
+        let awake = caffeine.isActive
+        let caff = NSMenuItem(title: awake
+                                ? "Keep Mac Awake — \(caffeineMinutesLeft()) min left"
+                                : "Keep Mac Awake (1 hour)",
+                              action: #selector(toggleCaffeine), keyEquivalent: "")
+        caff.target = self
+        caff.state = awake ? .on : .off
+        caff.toolTip = "Runs `caffeinate -d -i -u -t 3600`: the display and Mac stay awake " +
+            "for one hour, then it ends on its own. Click again to stop early. " +
+            "While it runs the screen won't sleep or auto-lock, so Proton won't lock from screen lock either."
+        menu.addItem(caff)
         menu.addItem(.separator())
 
         let audit = NSMenuItem(title: "Open Audit Log",
