@@ -3,14 +3,15 @@
 // Lives in the macOS menu bar (next to the clock) and shows, at a glance,
 // what the MCP daemon is doing:
 //
-//   🟢  daemon running, session unlocked (Claude has access)
-//   🔵  in use — a tool call completed within the last 5 s
-//   🟠  connecting — daemon up but no session yet (starting / offline)
-//   🟡  daemon running but LOCKED (screen-lock / idle / manual lock)
-//   ⚪  daemon not running (crashed, stopped, or its state file is stale)
-//       but launchd job enabled
-//   🔴  KILL SWITCH engaged — launchd job disabled + booted out; Claude
-//       cannot reach the socket until re-enabled from this menu
+//   envelope (filled)           session unlocked — Claude has access
+//   envelope + up/down arrows   in use — a tool call completed within 5 s
+//   envelope + sync arrows      connecting — daemon up, no session yet
+//   envelope + lock             daemon running but LOCKED
+//   dimmed envelope + !         daemon not running (crashed, stopped, or
+//                               its state file is stale), job enabled
+//   dimmed envelope + no-sign   KILL SWITCH engaged — launchd job disabled
+//                               + booted out until re-enabled here
+//   cup (right of envelope)     Keep Mac Awake (caffeinate) is running
 //
 // The kill switch uses `launchctl disable` + `bootout`, so it survives
 // reboots: the daemon will not come back until "Switch On" runs
@@ -164,23 +165,13 @@ struct DaemonStateFile {
 }
 
 enum DaemonState {
-    case killSwitched   // 🔴 disabled by the user
-    case notRunning     // ⚪ enabled but no live process / stale state file
-    case connecting     // 🟠 process up, session not established (offline / startup)
-    case locked         // 🟡 running, session locked
-    case inUse          // 🔵 running, unlocked, recent tool call
-    case connected      // 🟢 running, unlocked, idle
+    case killSwitched   // disabled by the user
+    case notRunning     // enabled but no live process / stale state file
+    case connecting     // process up, session not established (offline / startup)
+    case locked         // running, session locked
+    case inUse          // running, unlocked, recent tool call
+    case connected      // running, unlocked, idle
 
-    var emoji: String {
-        switch self {
-        case .killSwitched: return "🔴"
-        case .notRunning:   return "⚪"
-        case .connecting:   return "🟠"
-        case .locked:       return "🟡"
-        case .inUse:        return "🔵"
-        case .connected:    return "🟢"
-        }
-    }
 
     var label: String {
         switch self {
@@ -191,6 +182,89 @@ enum DaemonState {
         case .inUse:        return "Connected — IN USE"
         case .connected:    return "Connected — logged in"
         }
+    }
+}
+
+// MenuBarIcon draws the status item the way native menu extras do:
+// monochrome SF Symbols composed into one template image, so it follows
+// light/dark menu bars and the selected-item highlight automatically.
+// State is a small badge cut into the envelope's lower-right corner
+// (lock, sync arrows, ...) instead of a coloured dot; Keep Mac Awake
+// adds a cup to the right.
+enum MenuBarIcon {
+    private static let envelopeConfig = NSImage.SymbolConfiguration(pointSize: 15, weight: .regular)
+    private static let badgeConfig = NSImage.SymbolConfiguration(pointSize: 8.5, weight: .bold)
+    private static let cupConfig = NSImage.SymbolConfiguration(pointSize: 14, weight: .regular)
+
+    private static func symbol(_ names: [String], _ config: NSImage.SymbolConfiguration) -> NSImage? {
+        for name in names {
+            if let img = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+                .withSymbolConfiguration(config) {
+                return img
+            }
+        }
+        return nil
+    }
+
+    // Filled envelope = live session; outline = no usable session.
+    private static func envelopeNames(_ state: DaemonState) -> [String] {
+        switch state {
+        case .connected, .inUse: return ["envelope.fill"]
+        default: return ["envelope"]
+        }
+    }
+
+    private static func badgeNames(_ state: DaemonState) -> [String]? {
+        switch state {
+        case .connected:    return nil
+        case .inUse:        return ["arrow.up.arrow.down"]
+        case .locked:       return ["lock.fill"]
+        case .connecting:   return ["arrow.triangle.2.circlepath"]
+        case .notRunning:   return ["exclamationmark"]
+        case .killSwitched: return ["nosign"]
+        }
+    }
+
+    static func image(state: DaemonState, awake: Bool) -> NSImage {
+        let env = symbol(envelopeNames(state), envelopeConfig) ?? NSImage()
+        let badge = badgeNames(state).flatMap { symbol($0, badgeConfig) }
+        let cup = awake ? symbol(["cup.and.heat.waves.fill", "cup.and.saucer.fill"], cupConfig) : nil
+
+        let gap: CGFloat = 5
+        let badgeOverhang: CGFloat = badge == nil ? 0 : 4.5
+        let envW = env.size.width + badgeOverhang
+        let width = envW + (cup.map { gap + $0.size.width } ?? 0)
+        let height = max(18, env.size.height + 2, cup?.size.height ?? 0)
+
+        let img = NSImage(size: NSSize(width: ceil(width), height: ceil(height)), flipped: false) { _ in
+            let envRect = NSRect(x: 0, y: (height - env.size.height) / 2,
+                                 width: env.size.width, height: env.size.height)
+            // Stopped / switched-off states draw the envelope dimmed, the
+            // menu-bar convention for "inactive".
+            let dimmed = state == .notRunning || state == .killSwitched
+            env.draw(in: envRect, from: .zero, operation: .sourceOver, fraction: dimmed ? 0.45 : 1)
+
+            if let badge {
+                let b = NSRect(x: envRect.maxX - badge.size.width + badgeOverhang - 0.5,
+                               y: envRect.minY - 2.5,
+                               width: badge.size.width, height: badge.size.height)
+                // Knock a ring out of the envelope so the badge reads
+                // as separate even though both are one template colour.
+                NSGraphicsContext.current?.compositingOperation = .destinationOut
+                NSBezierPath(ovalIn: b.insetBy(dx: -1.3, dy: -1.3)).fill()
+                NSGraphicsContext.current?.compositingOperation = .sourceOver
+                badge.draw(in: b)
+            }
+            if let cup {
+                let c = NSRect(x: envW + gap, y: (height - cup.size.height) / 2,
+                               width: cup.size.width, height: cup.size.height)
+                cup.draw(in: c)
+            }
+            return true
+        }
+        img.isTemplate = true
+        img.accessibilityDescription = "Proton MCP: \(state.label)" + (awake ? "; Mac kept awake" : "")
+        return img
     }
 }
 
@@ -471,7 +545,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         poller.poll()
         caffeine.refresh()
         let awake = caffeine.isActive
-        statusItem.button?.title = "\(poller.state.emoji)\u{FE0E} ✉︎" + (awake ? " ☕\u{FE0E}" : "")
+        statusItem.button?.title = ""
+        statusItem.button?.image = MenuBarIcon.image(state: poller.state, awake: awake)
+        statusItem.button?.imagePosition = .imageOnly
         statusItem.button?.toolTip = "Proton MCP: \(statusLabel())" +
             (awake ? "\nMac kept awake — \(caffeineMinutesLeft()) min left" : "")
     }
@@ -508,9 +584,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func populate(_ menu: NSMenu) {
-        let status = NSMenuItem(title: "\(poller.state.emoji) Proton MCP — \(statusLabel())",
+        let status = NSMenuItem(title: "Proton MCP — \(statusLabel())",
                                 action: nil, keyEquivalent: "")
         status.isEnabled = false
+        status.image = MenuBarIcon.image(state: poller.state, awake: false)
         menu.addItem(status)
 
         if !poller.email.isEmpty {
