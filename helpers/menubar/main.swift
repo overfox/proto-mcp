@@ -545,9 +545,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         poller.poll()
         caffeine.refresh()
         let awake = caffeine.isActive
-        statusItem.button?.title = ""
         statusItem.button?.image = MenuBarIcon.image(state: poller.state, awake: awake)
-        statusItem.button?.imagePosition = .imageOnly
+        if awake {
+            // Time left sits right of the cup. Monospaced digits keep the
+            // item from shifting width as the count ticks down.
+            // Plain title + font (not an attributed title) so the system
+            // colours it for light/dark menu bars and the click highlight.
+            statusItem.button?.font = NSFont.monospacedDigitSystemFont(
+                ofSize: NSFont.systemFontSize, weight: .regular)
+            statusItem.button?.title = " \(caffeineMinutesLeft())m"
+            statusItem.button?.imagePosition = .imageLeft
+        } else {
+            statusItem.button?.title = ""
+            statusItem.button?.imagePosition = .imageOnly
+        }
         statusItem.button?.toolTip = "Proton MCP: \(statusLabel())" +
             (awake ? "\nMac kept awake — \(caffeineMinutesLeft()) min left" : "")
     }
