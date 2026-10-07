@@ -129,6 +129,9 @@ tools:
   mail_draft_update:
     decision: allow
     description: "Update a draft"
+  mail_draft_reply:
+    decision: allow
+    description: "Create a reply draft in the original's thread (no external effect)"
   mail_draft_delete:
     decision: prompt
     ttl: 5m

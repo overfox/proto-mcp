@@ -107,7 +107,7 @@ func mailSend(deps Deps) mcp.Tool {
 					"mail_send: subject and at least one to recipient are required")
 			}
 			entry, have := sendLedger.take("mail_send", raw)
-			return sendCompose(ctx, deps, "mail_send", "", in, ledgerGate(entry, have))
+			return sendCompose(ctx, deps, "mail_send", "", gpa.ReplyAction, in, ledgerGate(entry, have))
 		},
 	}
 }
@@ -186,7 +186,12 @@ type replyInput struct {
 	BodyText    string                `json:"body_text,omitempty"`
 	BodyHTML    string                `json:"body_html,omitempty"`
 	Attachments []sendAttachmentInput `json:"attachments,omitempty"`
+	// IncludeQuote appends the standard "On <date>, <sender> wrote:"
+	// quote of the original. nil → true.
+	IncludeQuote *bool `json:"include_quote,omitempty"`
 }
+
+func (in replyInput) quote() bool { return in.IncludeQuote == nil || *in.IncludeQuote }
 
 const replyInputSchema = `{
 	"type": "object",
@@ -196,7 +201,8 @@ const replyInputSchema = `{
 		"cc":          {"type": "array", "items": {"type": "string"}, "description": "Additional CC recipients."},
 		"body_text":   {"type": "string"},
 		"body_html":   {"type": "string"},
-		"attachments": ` + attachmentInputSchemaFragment + `
+		"attachments": ` + attachmentInputSchemaFragment + `,
+		"include_quote": {"type": "boolean", "default": true, "description": "Append the quoted original below your text (\"On <date>, <sender> wrote:\" + > lines). Default true."}
 	},
 	"required": ["in_reply_to"],
 	"additionalProperties": false
@@ -220,8 +226,11 @@ func extractReplyRecipients(args json.RawMessage) []string {
 func mailReply(deps Deps) mcp.Tool {
 	return mcp.Tool{
 		Name: "mail_reply",
-		Description: "Reply to a message. IRREVERSIBLE once sent. To = original sender, plus any " +
-			"`extra_to` addresses; optional `cc` adds CC recipients. " +
+		Description: "Reply to a message in its thread. IRREVERSIBLE once sent. To = the original's Reply-To " +
+			"(else its sender; replying to your own sent message goes to its recipients), plus any " +
+			"`extra_to` addresses; optional `cc` adds CC recipients. Threading is kept: the reply is linked to " +
+			"the original (In-Reply-To/References, same Proton conversation) and quotes it unless include_quote is false. " +
+			"To prepare a reply for review instead of sending, use mail_draft_reply. " +
 			"Subject prefixed Re: if not already. Optional `attachments` array attaches " +
 			"new files (does NOT carry over parent attachments — use mail_forward for that)." + sendDialogNote,
 		InputSchema:  json.RawMessage(replyInputSchema),
@@ -236,7 +245,8 @@ func mailReplyAll(deps Deps) mcp.Tool {
 	return mcp.Tool{
 		Name: "mail_reply_all",
 		Description: "Reply-all to a message. IRREVERSIBLE. " +
-			"To = original sender (+ `extra_to`). CC = original To+CC minus your own addresses (+ `cc`). " +
+			"To = original Reply-To / sender (+ `extra_to`). CC = original To+CC minus your own addresses (+ `cc`). " +
+			"Kept in the same thread and quotes the original unless include_quote is false. " +
 			"BCC dropped (BCC by definition not visible to other recipients). " +
 			"Optional `attachments` array — same shape as mail_send." + sendDialogNote,
 		InputSchema:  json.RawMessage(replyInputSchema),
@@ -250,12 +260,14 @@ func mailReplyAll(deps Deps) mcp.Tool {
 // replyParent is the subset of a parent message a reply needs.
 type replyParent struct {
 	Sender  string
+	ReplyTo []string // the original's Reply-To; empty → reply to Sender
 	To, CC  []string
 	Subject string
 }
 
 func replyParentFromMessage(m gpa.Message) replyParent {
-	p := replyParent{To: addressStrings(m.ToList), CC: addressStrings(m.CCList), Subject: m.Subject}
+	p := replyParent{To: addressStrings(m.ToList), CC: addressStrings(m.CCList), Subject: m.Subject,
+		ReplyTo: addressStrings(m.ReplyTos)}
 	if m.Sender != nil {
 		p.Sender = m.Sender.Address
 	}
@@ -305,7 +317,9 @@ func replyRecipients(p replyParent, self []string, replyAll bool, extraTo, extra
 		seen[key] = true
 		*list = append(*list, addr)
 	}
-	add(&to, p.Sender, false)
+	for _, a := range replyPrimary(p, self) {
+		add(&to, a, false)
+	}
 	for _, a := range extraTo {
 		add(&to, a, false)
 	}
@@ -320,11 +334,40 @@ func replyRecipients(p replyParent, self []string, replyAll bool, extraTo, extra
 	return to, cc
 }
 
-func replySubject(s string) string {
-	if !strings.HasPrefix(strings.ToLower(s), "re:") {
-		return "Re: " + s
+// replyPrimary is who a reply is addressed to, the way mail clients do
+// it: the original's Reply-To if it set one (mailing lists, ticket
+// systems, "reply to my other address"), else its sender. Replying to
+// a message you sent yourself continues the conversation with its
+// recipients rather than addressing you.
+func replyPrimary(p replyParent, self []string) []string {
+	if contains(self, strings.ToLower(strings.TrimSpace(p.Sender))) && len(p.To) > 0 {
+		return p.To
 	}
-	return s
+	if len(p.ReplyTo) > 0 {
+		return p.ReplyTo
+	}
+	return []string{p.Sender}
+}
+
+// replyPrefix matches the reply markers clients put on subjects
+// ("Re:", "RE:", "Re[2]:", "AW:", "SV:", "Antw:"), so a reply to a
+// reply doesn't become "Re: Re: …" and threads keep one subject.
+var replyPrefix = regexp.MustCompile(`(?i)^\s*(re|aw|sv|vs|antw|ref)(\[\d+\])?\s*:`)
+
+func replySubject(s string) string {
+	if replyPrefix.MatchString(s) {
+		return strings.TrimSpace(s)
+	}
+	return "Re: " + strings.TrimSpace(s)
+}
+
+// replyAction is the Proton draft action for a reply. It's what makes
+// the server mark the original Replied / Replied-all.
+func replyAction(replyAll bool) gpa.CreateDraftAction {
+	if replyAll {
+		return gpa.ReplyAllAction
+	}
+	return gpa.ReplyAction
 }
 
 func replyPromptBody(deps Deps, tool string, replyAll bool) func(json.RawMessage) (string, string) {
@@ -340,6 +383,9 @@ func replyPromptBody(deps Deps, tool string, replyAll bool) func(json.RawMessage
 			spec.To, spec.CC = replyRecipients(p, selfAddresses(deps), replyAll, in.ExtraTo, in.CC)
 			spec.Subject = replySubject(p.Subject)
 			rec.recipients = recipientSet(spec.To, spec.CC)
+			if in.quote() {
+				spec.BodySuffix = "+ quoted original"
+			}
 		} else {
 			rec.failure = "could not resolve original message " + shortID(in.InReplyTo)
 			spec.Warnings = append(spec.Warnings,
@@ -607,7 +653,7 @@ func sendPromptBodyWithDeps(deps Deps, toolName string) func(json.RawMessage) (s
 // and SendDraft so they ride on the same send call. gate approves
 // out-of-allowlist path attachments (send family: they must have been
 // listed in the approved dialog).
-func sendCompose(ctx mcp.Context, deps Deps, toolName, parentID string, in sendInput, gate attachmentGate) (*mcp.ToolResult, error) {
+func sendCompose(ctx mcp.Context, deps Deps, toolName, parentID string, action gpa.CreateDraftAction, in sendInput, gate attachmentGate) (*mcp.ToolResult, error) {
 	decoded, err := decodeAttachmentsGated(deps, in.Attachments, gate)
 	if err != nil {
 		return mcp.ErrorResult("%s: %v", toolName, err), nil
@@ -623,6 +669,7 @@ func sendCompose(ctx mcp.Context, deps Deps, toolName, parentID string, in sendI
 	createReq := gpa.CreateDraftReq{
 		Message:  tpl,
 		ParentID: parentID,
+		Action:   action,
 	}
 	draft, err := deps.Session.Client.CreateDraft(ctx.Std, addrKR, createReq)
 	if err != nil {
@@ -739,12 +786,18 @@ func sendReply(ctx mcp.Context, deps Deps, toolName string, in replyInput, reply
 			toolName, strings.Join(got, ", "), strings.Join(entry.recipients, ", ")), nil
 	}
 
-	return sendCompose(ctx, deps, toolName, in.InReplyTo, sendInput{
+	bodyText, bodyHTML := in.BodyText, in.BodyHTML
+	if in.quote() {
+		if bodyText, bodyHTML, err = appendReplyQuote(deps, parent, bodyText, bodyHTML); err != nil {
+			return mcp.ErrorResult("%s: quote original: %v", toolName, err), nil
+		}
+	}
+	return sendCompose(ctx, deps, toolName, in.InReplyTo, replyAction(replyAll), sendInput{
 		Subject:     replySubject(p.Subject),
 		To:          to,
 		CC:          cc,
-		BodyText:    in.BodyText,
-		BodyHTML:    in.BodyHTML,
+		BodyText:    bodyText,
+		BodyHTML:    bodyHTML,
 		Attachments: in.Attachments,
 	}, ledgerGate(entry, true))
 }
@@ -786,7 +839,7 @@ func sendForward(ctx mcp.Context, deps Deps, in forwardInput, entry sendApproval
 		if in.IncludeParentAttachments && have && len(entry.parentAttachmentIDs) != 0 {
 			return mcp.ErrorResult("mail_forward refused: the original's attachments changed after approval; nothing was sent"), nil
 		}
-		return sendCompose(ctx, deps, "mail_forward", in.ForwardOf, sendInput{
+		return sendCompose(ctx, deps, "mail_forward", in.ForwardOf, gpa.ForwardAction, sendInput{
 			Subject:     subject,
 			To:          in.To,
 			CC:          in.CC,
@@ -880,6 +933,16 @@ func sendForward(ctx mcp.Context, deps Deps, in forwardInput, entry sendApproval
 // header block followed by the original's text body (decrypted with
 // the receiving address's keyring).
 func quotedOriginal(deps Deps, parent gpa.Message) (string, error) {
+	plain, err := decryptParentBody(deps, parent)
+	if err != nil {
+		return "", err
+	}
+	return formatQuotedOriginal(parent, plain), nil
+}
+
+// decryptParentBody decrypts the original with the keyring of the
+// address that received it.
+func decryptParentBody(deps Deps, parent gpa.Message) (string, error) {
 	if deps.Session == nil {
 		return "", errors.New("no active session")
 	}
@@ -891,11 +954,58 @@ func quotedOriginal(deps Deps, parent gpa.Message) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("decrypt original: %w", err)
 	}
-	return formatQuotedOriginal(parent, string(plain)), nil
+	return string(plain), nil
 }
 
-// formatQuotedOriginal builds the quote from an already-decrypted body.
-func formatQuotedOriginal(parent gpa.Message, body string) string {
+// appendReplyQuote adds the quoted original below the caller's text:
+// "On <date>, <sender> wrote:" + "> " lines for plain text, the same
+// inside a <blockquote> for HTML.
+func appendReplyQuote(deps Deps, parent gpa.Message, bodyText, bodyHTML string) (string, string, error) {
+	body, err := decryptParentBody(deps, parent)
+	if err != nil {
+		return "", "", err
+	}
+	header, text := replyQuoteParts(parent, body)
+	if bodyHTML != "" {
+		bodyHTML += "<br><br><div>" + html.EscapeString(header) + "</div>" +
+			`<blockquote style="margin:0 0 0 .8ex;border-left:1px solid #ccc;padding-left:1ex">` +
+			strings.ReplaceAll(html.EscapeString(text), "\n", "<br>") + "</blockquote>"
+		return bodyText, bodyHTML, nil
+	}
+	if bodyText != "" {
+		bodyText += "\n\n"
+	}
+	lines := strings.Split(text, "\n")
+	for i, l := range lines {
+		if l == "" {
+			lines[i] = ">"
+		} else {
+			lines[i] = "> " + l
+		}
+	}
+	return bodyText + header + "\n" + strings.Join(lines, "\n"), bodyHTML, nil
+}
+
+// replyQuoteParts returns the attribution line and the original's
+// text (control characters stripped) for a reply quote.
+func replyQuoteParts(parent gpa.Message, body string) (header, text string) {
+	who := "someone"
+	if parent.Sender != nil {
+		who = parent.Sender.Address
+		if parent.Sender.Name != "" {
+			who = parent.Sender.Name + " <" + parent.Sender.Address + ">"
+		}
+	}
+	header = who + " wrote:"
+	if parent.Time != 0 {
+		header = "On " + time.Unix(parent.Time, 0).Format("Mon, 2 Jan 2006 at 15:04") + ", " + header
+	}
+	return header, strings.TrimRight(quoteText(parent, body), "\n")
+}
+
+// quoteText converts a decrypted original to line-preserving plain
+// text with control characters removed.
+func quoteText(parent gpa.Message, body string) string {
 	var text string
 	switch mt := string(parent.MIMEType); {
 	case strings.HasPrefix(mt, "text/plain"):
@@ -905,13 +1015,18 @@ func formatQuotedOriginal(parent gpa.Message, body string) string {
 	default:
 		text = sanitize.Text(body)
 	}
-	text = strings.Map(func(r rune) rune {
+	return strings.Map(func(r rune) rune {
 		if r == '\n' || r == '\t' || (r >= 0x20 && r != 0x7f && (r < 0x80 || r > 0x9f)) {
 			return r
 		}
 		return -1
 	}, strings.ReplaceAll(text, "\r\n", "\n"))
+}
 
+// formatQuotedOriginal builds the forward quote from an
+// already-decrypted body.
+func formatQuotedOriginal(parent gpa.Message, body string) string {
+	text := quoteText(parent, body)
 	fmtAddr := func(a *mail.Address) string {
 		if a == nil {
 			return ""

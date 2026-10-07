@@ -118,6 +118,7 @@ func All(deps Deps) []mcp.Tool {
 		mailDraftUpdate(deps),
 		mailDraftDelete(deps),
 		mailDraftList(deps),
+		mailDraftReply(deps),
 		// Phase 5/D — send family (irreversible; per-tool prompt body).
 		mailSend(deps),
 		mailSendDraft(deps),

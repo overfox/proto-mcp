@@ -59,10 +59,13 @@ deny-by-default and Touch-ID gated (see [security.md](./security.md)).
 `folders_create`, `folders_update`, `folders_delete` — full CRUD, with
 colour-palette validation on create/update.
 
-### Drafts (4)
+### Drafts (5)
 
 `mail_draft_create`, `mail_draft_update`, `mail_draft_delete`,
-`mail_draft_list`.
+`mail_draft_list`, and `mail_draft_reply` — a reply draft linked to the
+original (same conversation, In-Reply-To/References set by Proton when
+it's sent), with recipients, `Re:` subject and the quoted original
+filled in. Nothing is sent; send it from Proton or with `mail_send_draft`.
 
 ### Send (5)
 
@@ -70,8 +73,8 @@ colour-palette validation on create/update.
 |---|---|
 | `mail_send` | Compose and send a new message. TTL 0 — always re-prompts. |
 | `mail_send_draft` | Send an existing draft. |
-| `mail_reply` | Reply to the sender. |
-| `mail_reply_all` | Reply to everyone. |
+| `mail_reply` | Reply in the thread: to the Reply-To (else sender; your own sent mail → its recipients), quoting the original unless `include_quote: false`. |
+| `mail_reply_all` | Same, plus the original To+CC minus your addresses; marks the original replied-all. |
 | `mail_forward` | Forward a message (carries attachments). |
 
 ### Attachments (2)
