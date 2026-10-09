@@ -116,7 +116,9 @@ func remoteSetup(ctx context.Context, asJSON bool) error {
 	if err != nil {
 		return err
 	}
-	raw, err := exec.CommandContext(ctx, ts, "status", "--json").Output()
+	sctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	raw, err := exec.CommandContext(sctx, ts, "status", "--json").Output()
+	cancel()
 	if err != nil {
 		return fmt.Errorf("tailscale status failed (is Tailscale running and signed in?): %w", err)
 	}
