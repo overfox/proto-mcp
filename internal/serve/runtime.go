@@ -29,6 +29,7 @@ import (
 	"github.com/just-an-oldsalt/proto-mcp/internal/mcptools"
 	"github.com/just-an-oldsalt/proto-mcp/internal/policy"
 	protonclient "github.com/just-an-oldsalt/proto-mcp/internal/proton"
+	"github.com/just-an-oldsalt/proto-mcp/internal/remote"
 	"github.com/just-an-oldsalt/proto-mcp/internal/store"
 	syncpkg "github.com/just-an-oldsalt/proto-mcp/internal/sync"
 )
@@ -118,6 +119,9 @@ type Runtime struct {
 
 	hupStop   chan struct{}
 	pidUnlink func()
+
+	// remote is Remote mode (nil when not enabled for this process).
+	remote *remote.Service
 }
 
 // Locked reports whether the runtime is currently in the locked
@@ -442,6 +446,12 @@ type SetupConfig struct {
 	// The caller owns its heartbeat (State.Run) and Remove.
 	State *StatePublisher
 
+	// Remote enables Remote mode (internal/remote): the loopback web
+	// app for enrolled devices and the control socket. Only the
+	// long-running daemon sets this; per-session serve-stdio would
+	// fight it for the port.
+	Remote bool
+
 	// Logger overrides slog.Default for runtime-level diagnostics.
 	// Tool handlers and middleware still use slog.Default; this
 	// is just for Setup / Close / HUP messages.
@@ -724,10 +734,40 @@ func Setup(ctx context.Context, cfg SetupConfig) (*Runtime, error) {
 	// Both automatic triggers route through autoLock so Keep Alive can
 	// veto them. Manual locks (SIGUSR1 / `protonmcp lock` / menu Lock
 	// Now) call rt.Lock directly and are never vetoed.
-	autoLock := keepAliveGuard(engine.KeepAlive, rt.Lock, logger)
+	// Remote mode: approvals go to enrolled devices and the session
+	// survives screen lock (see internal/remote).
+	if cfg.Remote {
+		rs, rerr := remote.Load(remotePath(), remote.Hooks{
+			ConnectorState: func() (string, string, string) {
+				locked, reason := rt.Locked()
+				rt.mu.RLock()
+				email := rt.lastEmail
+				rt.mu.RUnlock()
+				if locked {
+					return StateLocked, reason, email
+				}
+				return StateUnlocked, "", email
+			},
+			Lock:       rt.Lock,
+			MacApprove: broker.LocalApprover(),
+			OnChange:   rt.publishState,
+		}, logger)
+		if rerr != nil {
+			logger.Warn("remote mode unavailable", "err", rerr.Error())
+		} else if serr := rs.Serve(); serr != nil {
+			logger.Warn("remote mode listeners failed", "err", serr.Error())
+			rs.Close()
+		} else {
+			rt.remote = rs
+			broker.SetRemote(rs)
+			cfg.State.SetRemote(rs.Active)
+		}
+	}
+	stayAwake := func() bool { return engine.KeepAlive() || rt.remote.Active() }
+	autoLock := keepAliveGuard(stayAwake, rt.Lock, logger)
 	idleSkip := func() bool {
 		locked, _ := rt.Locked()
-		return locked || engine.KeepAlive()
+		return locked || stayAwake()
 	}
 	go rt.idleTracker.run(bgCtx, engine.IdleLockMinutes, idleSkip, autoLock, logger)
 	if lockwatchPath, found := resolveLockwatchPath(); found {
@@ -752,6 +792,13 @@ func Setup(ctx context.Context, cfg SetupConfig) (*Runtime, error) {
 	rt.publishState()
 
 	return rt, nil
+}
+
+// remotePath is remote.json's location ("" on a home-dir failure makes
+// remote.Load fail, which just leaves Remote mode off).
+func remotePath() string {
+	p, _ := remote.DefaultPath()
+	return p
 }
 
 // backgroundSyncInterval / Timeout — the cadence at which the daemon
@@ -934,6 +981,7 @@ func (r *Runtime) Close() {
 	if r.bgSyncCancel != nil {
 		r.bgSyncCancel()
 	}
+	r.remote.Close()
 	if r.lockwatchCancel != nil {
 		r.lockwatchCancel()
 	}

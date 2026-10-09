@@ -37,7 +37,16 @@ import (
 const (
 	SourceTouchID = "touchid"
 	SourceCached  = "cached"
+	SourceRemote  = "remote" // passkey on an enrolled device (Remote mode)
 )
+
+// RemoteRoute is Remote mode (internal/remote). While Active, every
+// approval that would show the Mac's Touch ID prompt is sent to the
+// enrolled devices instead.
+type RemoteRoute interface {
+	Active() bool
+	Approve(ctx context.Context, title, body string) error
+}
 
 // Request is everything the broker needs to drive a prompt. Title
 // and Body are the user-facing strings; the broker passes them
@@ -69,6 +78,17 @@ type Broker struct {
 	helperSHA256 string
 	// uid is the expected helper owner (the daemon's own uid).
 	uid int
+
+	// remote, when set and Active, takes over every prompt.
+	remote RemoteRoute
+}
+
+// SetRemote installs Remote mode routing. Call once during setup,
+// before the broker is shared.
+func (b *Broker) SetRemote(r RemoteRoute) {
+	if b != nil {
+		b.remote = r
+	}
 }
 
 // New constructs a Broker. helperPath should resolve to an
@@ -142,6 +162,21 @@ func (b *Broker) Request(ctx context.Context, r Request) (string, error) {
 // Returns SourceTouchID on exit 0, ErrUserCanceled on exit 1,
 // ErrAuthFailed on exit 2 or any other non-zero exit.
 func (b *Broker) runHelper(ctx context.Context, r Request) (string, error) {
+	if b.remote != nil && b.remote.Active() {
+		body := r.Body
+		if c := r.Caller.String(); c != "" {
+			body += "\n\nRequested by: " + c
+		}
+		if err := b.remote.Approve(ctx, r.Title, body); err != nil {
+			return "", err
+		}
+		return SourceRemote, nil
+	}
+	return b.runLocalHelper(ctx, r)
+}
+
+// runLocalHelper always prompts on the Mac, even in Remote mode.
+func (b *Broker) runLocalHelper(ctx context.Context, r Request) (string, error) {
 	payload, err := json.Marshal(struct {
 		Title   string `json:"title"`
 		Body    string `json:"body"`
@@ -227,6 +262,26 @@ func (b *Broker) Approver() func(ctx context.Context, title, body string) error 
 		}
 		_, err := b.runHelper(ctx, Request{
 			Tool:   "approve_inline",
+			Caller: caller.FromContext(ctx),
+			Policy: policy.ToolPolicy{Decision: policy.DecisionPrompt},
+			Title:  title,
+			Body:   body,
+		})
+		return err
+	}
+}
+
+// LocalApprover is Approver pinned to the Mac's own Touch ID prompt,
+// never routed to Remote mode devices. Used for actions that must be
+// performed in person at the Mac (enrolling a device, turning Remote
+// mode on from the Mac).
+func (b *Broker) LocalApprover() func(ctx context.Context, title, body string) error {
+	return func(ctx context.Context, title, body string) error {
+		if b == nil {
+			return fmt.Errorf("%w: approval broker unavailable", mcperrors.ErrAuthFailed)
+		}
+		_, err := b.runLocalHelper(ctx, Request{
+			Tool:   "approve_local",
 			Caller: caller.FromContext(ctx),
 			Policy: policy.ToolPolicy{Decision: policy.DecisionPrompt},
 			Title:  title,

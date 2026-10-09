@@ -11,6 +11,8 @@
 //                               its state file is stale), job enabled
 //   dimmed envelope + no-sign   KILL SWITCH engaged — launchd job disabled
 //                               + booted out until re-enabled here
+//   phone with waves            Remote mode: approvals go to your phone /
+//                               tablet; screen lock doesn't lock Proton
 //   cup (right of envelope)     Keep Mac Awake (caffeinate) is running
 //
 // The kill switch uses `launchctl disable` + `bootout`, so it survives
@@ -32,6 +34,7 @@
 // protonmcpd installed next to this helper.
 
 import AppKit
+import CoreImage
 import Darwin
 import Foundation
 
@@ -83,6 +86,31 @@ func runCmd(_ path: String, _ args: [String]) -> (Int32, String) {
     return (p.terminationStatus, String(data: data, encoding: .utf8) ?? "")
 }
 
+// runCmdErr is runCmd that also returns stderr (for error messages the
+// CLI prints there). Reads stderr on a background queue so a chatty
+// child can't deadlock on a full pipe.
+func runCmdErr(_ path: String, _ args: [String]) -> (Int32, String, String) {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: path)
+    p.arguments = args
+    let out = Pipe(), err = Pipe()
+    p.standardOutput = out
+    p.standardError = err
+    do { try p.run() } catch { return (127, "", "could not run \(path)") }
+    var errData = Data()
+    let group = DispatchGroup()
+    group.enter()
+    DispatchQueue.global().async {
+        errData = err.fileHandleForReading.readDataToEndOfFile()
+        group.leave()
+    }
+    let outData = out.fileHandleForReading.readDataToEndOfFile()
+    group.wait()
+    p.waitUntilExit()
+    return (p.terminationStatus, String(data: outData, encoding: .utf8) ?? "",
+            String(data: errData, encoding: .utf8) ?? "")
+}
+
 // executablePath returns the on-disk executable of pid via libproc,
 // or nil if the process is gone / not ours to inspect.
 func executablePath(_ pid: Int32) -> String? {
@@ -132,6 +160,7 @@ struct DaemonStateFile {
     var email: String
     var pid: Int32
     var keepAlive: Bool
+    var remote: Bool
     var lastTool: String
     var lastToolAt: Date?
     var updatedAt: Date?
@@ -148,6 +177,7 @@ struct DaemonStateFile {
             email: obj["email"] as? String ?? "",
             pid: (obj["pid"] as? NSNumber)?.int32Value ?? 0,
             keepAlive: obj["keep_alive"] as? Bool ?? false,
+            remote: obj["remote"] as? Bool ?? false,
             lastTool: obj["last_tool"] as? String ?? "",
             lastToolAt: (obj["last_tool_at"] as? String).flatMap(parseRFC3339),
             updatedAt: (obj["updated_at"] as? String).flatMap(parseRFC3339))
@@ -195,6 +225,7 @@ enum MenuBarIcon {
     private static let envelopeConfig = NSImage.SymbolConfiguration(pointSize: 15, weight: .regular)
     private static let badgeConfig = NSImage.SymbolConfiguration(pointSize: 8.5, weight: .bold)
     private static let cupConfig = NSImage.SymbolConfiguration(pointSize: 14, weight: .regular)
+    private static let remoteConfig = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
 
     private static func symbol(_ names: [String], _ config: NSImage.SymbolConfiguration) -> NSImage? {
         for name in names {
@@ -232,9 +263,10 @@ enum MenuBarIcon {
     // image composes envelope (+ state badge), and — when awakeMinutes is
     // set — the cup and its countdown into one tightly spaced template
     // image, so the whole group stays together and recolours as one.
-    static func image(state: DaemonState, awakeMinutes: Int? = nil) -> NSImage {
+    static func image(state: DaemonState, remote: Bool = false, awakeMinutes: Int? = nil) -> NSImage {
         let env = symbol(envelopeNames(state), envelopeConfig) ?? NSImage()
         let badge = badgeNames(state).flatMap { symbol($0, badgeConfig) }
+        let phone = remote ? symbol(["iphone.radiowaves.left.and.right", "iphone"], remoteConfig) : nil
         let cup = awakeMinutes == nil ? nil : symbol(["cup.and.heat.waves.fill", "cup.and.saucer.fill"], cupConfig)
         let timer = awakeMinutes.map {
             NSAttributedString(string: "\($0)m", attributes: [.font: timerFont, .foregroundColor: NSColor.black])
@@ -243,7 +275,8 @@ enum MenuBarIcon {
         let cupGap: CGFloat = 1    // envelope (incl. badge) → cup; the symbol adds its own bearing
         let timerGap: CGFloat = 1  // cup → countdown
         let badgeOverhang: CGFloat = badge == nil ? 0 : 4.5
-        let envW = env.size.width + badgeOverhang
+        let phoneW = phone.map { cupGap + $0.size.width } ?? 0
+        let envW = env.size.width + badgeOverhang + phoneW
         let cupW = cup.map { cupGap + $0.size.width } ?? 0
         let timerSize = timer?.size() ?? .zero
         let timerW = timer == nil ? 0 : timerGap + timerSize.width
@@ -269,6 +302,11 @@ enum MenuBarIcon {
                 NSGraphicsContext.current?.compositingOperation = .sourceOver
                 badge.draw(in: b)
             }
+            if let phone {
+                let p = NSRect(x: env.size.width + badgeOverhang + cupGap, y: (height - phone.size.height) / 2,
+                               width: phone.size.width, height: phone.size.height)
+                phone.draw(in: p)
+            }
             if let cup {
                 let c = NSRect(x: envW + cupGap, y: (height - cup.size.height) / 2,
                                width: cup.size.width, height: cup.size.height)
@@ -284,6 +322,7 @@ enum MenuBarIcon {
         }
         img.isTemplate = true
         img.accessibilityDescription = "Proton MCP: \(state.label)" +
+            (remote ? "; Remote mode on" : "") +
             (awakeMinutes.map { "; Mac kept awake, \($0) min left" } ?? "")
         return img
     }
@@ -298,6 +337,8 @@ final class StatusPoller {
     private(set) var email: String = ""
     // needsTouchID: show "Connect (Touch ID)…".
     private(set) var needsTouchID = false
+    // remote: Remote mode active (state.json).
+    private(set) var remote = false
     private var lastAuditSize: UInt64 = 0
     private var activeUntil: Date = .distantPast
 
@@ -352,6 +393,7 @@ final class StatusPoller {
 
     private func pollStateFile(_ sf: DaemonStateFile) {
         reason = sf.reason
+        remote = sf.remote
         email = sf.email
         if !sf.lastTool.isEmpty {
             lastTool = sf.lastTool
@@ -363,6 +405,7 @@ final class StatusPoller {
         let fresh = sf.updatedAt.map { Date().timeIntervalSince($0) < stateStaleAfter } ?? false
         guard fresh, isLiveDaemon(sf.pid) else {
             state = .notRunning
+            remote = false
             email = ""
             needsTouchID = false
             return
@@ -452,6 +495,7 @@ final class StatusPoller {
     }
 
     func poll() {
+        remote = false
         if isDisabled() {
             state = .killSwitched
             needsTouchID = false
@@ -568,9 +612,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let awake = caffeine.isActive
         statusItem.button?.title = ""
         statusItem.button?.image = MenuBarIcon.image(
-            state: poller.state, awakeMinutes: awake ? caffeineMinutesLeft() : nil)
+            state: poller.state, remote: poller.remote, awakeMinutes: awake ? caffeineMinutesLeft() : nil)
         statusItem.button?.imagePosition = .imageOnly
         statusItem.button?.toolTip = "Proton MCP: \(statusLabel())" +
+            (poller.remote ? "\nRemote mode on — approvals go to your phone" : "") +
             (awake ? "\nMac kept awake — \(caffeineMinutesLeft()) min left" : "")
     }
 
@@ -663,6 +708,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             "Keep Alive never removes Touch ID from sending, moving, labeling, trashing or deleting; " +
             "Lock Now and Switch Off always work."
         menu.addItem(keepAlive)
+        addRemoteItems(menu)
 
         let awake = caffeine.isActive
         let caff = NSMenuItem(title: awake
@@ -787,6 +833,129 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // picks the file up anyway.
         runCmd(protonmcpCLI, ["policy", "reload"])
         refresh()
+    }
+
+    // MARK: - Remote mode
+
+    // remoteStatus asks the daemon (control socket via the CLI). nil when
+    // the daemon isn't running or predates Remote mode.
+    private func remoteStatus() -> [String: Any]? {
+        guard poller.state != .killSwitched && poller.state != .notRunning else { return nil }
+        let (code, out) = runCmd(protonmcpCLI, ["remote", "status", "--json"])
+        guard code == 0, let data = out.data(using: .utf8) else { return nil }
+        return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    }
+
+    private func addRemoteItems(_ menu: NSMenu) {
+        guard let st = remoteStatus() else { return }
+        let configured = st["configured"] as? Bool ?? false
+        let devices = st["devices"] as? [String] ?? []
+        let active = st["active"] as? Bool ?? false
+        if !configured {
+            let setup = NSMenuItem(title: "Set Up Remote Mode…", action: #selector(remoteSetup), keyEquivalent: "")
+            setup.target = self
+            setup.toolTip = "Publishes the approval page on your private Tailscale network. Needs Tailscale signed in."
+            menu.addItem(setup)
+            return
+        }
+        let item = NSMenuItem(title: devices.isEmpty
+                                ? "Remote Mode — add a device first"
+                                : "Remote Mode — approve on \(devices.joined(separator: ", "))",
+                              action: devices.isEmpty ? nil : #selector(toggleRemote), keyEquivalent: "")
+        item.target = self
+        item.state = active ? .on : .off
+        item.isEnabled = !devices.isEmpty
+        item.toolTip = "On: Touch ID approvals go to your enrolled phone/tablet (passkey), and Proton keeps " +
+            "working while the screen is locked (the Mac is kept from sleeping on power). " +
+            "Turning on needs Touch ID here, or a passkey on the device. Turn off any time, here or on the device."
+        menu.addItem(item)
+        let add = NSMenuItem(title: "Add Remote Device…", action: #selector(addRemoteDevice), keyEquivalent: "")
+        add.target = self
+        menu.addItem(add)
+    }
+
+    // runRemote runs `protonmcp remote <args>` off the main thread (the
+    // daemon may be showing Touch ID) and hands back stdout or an error.
+    private func runRemote(_ args: [String], done: @escaping (String?, String?) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let (code, out, err) = runCmdErr(protonmcpCLI, ["remote"] + args)
+            DispatchQueue.main.async {
+                if code == 0 { done(out, nil) } else {
+                    done(nil, err.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                         ? "protonmcp remote \(args.first ?? "") failed (exit \(code))" : err)
+                }
+                self.refresh()
+            }
+        }
+    }
+
+    private func showAlert(_ title: String, _ text: String, style: NSAlert.Style = .warning) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = text
+        alert.alertStyle = style
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
+    }
+
+    @objc private func toggleRemote() {
+        let on = !poller.remote
+        runRemote([on ? "on" : "off", "--json"]) { _, err in
+            if let err { self.showAlert("Couldn't turn Remote mode \(on ? "on" : "off")", err) }
+        }
+    }
+
+    @objc private func remoteSetup() {
+        runRemote(["setup", "--json"]) { out, err in
+            if let err {
+                self.showAlert("Remote mode setup didn't finish", err)
+            } else if out != nil {
+                self.showAlert("Remote mode is set up",
+                               "Next: Add Remote Device… and scan the QR code with your phone.", style: .informational)
+            }
+        }
+    }
+
+    @objc private func addRemoteDevice() {
+        runRemote(["add-device", "--json"]) { out, err in
+            if let err { self.showAlert("Couldn't add a device", err); return }
+            guard let data = out?.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let url = obj["url"] as? String else { return }
+            self.showEnrollQR(url)
+        }
+    }
+
+    private func showEnrollQR(_ url: String) {
+        let alert = NSAlert()
+        alert.messageText = "Scan with your phone or tablet"
+        alert.informativeText = "Open the camera and scan the code (the device must be signed in to Tailscale). " +
+            "Then tap Create passkey and confirm with your fingerprint or face. " +
+            "The code works once and expires in 10 minutes."
+        if let qr = qrImage(url, size: 240) {
+            alert.accessoryView = NSImageView(image: qr)
+            alert.accessoryView?.frame = NSRect(x: 0, y: 0, width: 240, height: 240)
+        }
+        alert.addButton(withTitle: "Done")
+        alert.addButton(withTitle: "Copy Link")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertSecondButtonReturn {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(url, forType: .string)
+        }
+    }
+
+    private func qrImage(_ text: String, size: CGFloat) -> NSImage? {
+        guard let filter = CIFilter(name: "CIQRCodeGenerator") else { return nil }
+        filter.setValue(Data(text.utf8), forKey: "inputMessage")
+        filter.setValue("M", forKey: "inputCorrectionLevel")
+        guard let ci = filter.outputImage else { return nil }
+        let scale = floor(size / ci.extent.width)
+        let scaled = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        let rep = NSCIImageRep(ciImage: scaled)
+        let img = NSImage(size: rep.size)
+        img.addRepresentation(rep)
+        return img
     }
 
     // MARK: - Actions

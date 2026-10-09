@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>Proton MCP Remote</title>
+<style>
+  :root { --bg:#f5f5f7; --card:#fff; --fg:#1d1d1f; --muted:#6e6e73; --line:#d2d2d7;
+          --accent:#6d4aff; --ok:#1f8f4e; --warn:#b25000; --bad:#c62828; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#111114; --card:#1c1c20; --fg:#f2f2f7; --muted:#9a9aa2; --line:#33333a;
+            --accent:#8f75ff; --ok:#4cc483; --warn:#ff9f43; --bad:#ff6b6b; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { max-width:560px; margin:0 auto; padding:16px 16px 48px; }
+  h1 { font-size:20px; margin:8px 0 16px; }
+  h2 { font-size:15px; margin:0 0 8px; color:var(--muted); font-weight:600; text-transform:uppercase; letter-spacing:.04em; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:16px; margin-bottom:14px; }
+  .row { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+  .pill { display:inline-block; padding:2px 10px; border-radius:999px; font-size:13px; font-weight:600; border:1px solid currentColor; }
+  .ok { color:var(--ok); } .warn { color:var(--warn); } .bad { color:var(--bad); } .muted { color:var(--muted); }
+  button { font:inherit; font-weight:600; border-radius:10px; border:1px solid var(--line);
+           background:var(--card); color:var(--fg); padding:12px 14px; min-height:44px; cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.danger { color:var(--bad); }
+  button:disabled { opacity:.5; }
+  .btns { display:flex; gap:10px; flex-wrap:wrap; margin-top:12px; }
+  .btns button { flex:1 1 140px; }
+  pre { white-space:pre-wrap; word-break:break-word; font:14px/1.45 ui-monospace, Menlo, monospace;
+        background:var(--bg); border-radius:10px; padding:12px; margin:10px 0 0; max-height:50vh; overflow:auto; }
+  .approval.hl { border-color:var(--accent); box-shadow:0 0 0 2px var(--accent) inset; }
+  input { font:inherit; width:100%; padding:12px; border-radius:10px; border:1px solid var(--line); background:var(--bg); color:var(--fg); }
+  #msg { min-height:1.5em; margin:0 0 12px; }
+  code { word-break:break-all; }
+  [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Proton MCP Remote</h1>
+  <p id="msg" role="status" aria-live="polite"></p>
+
+  <section id="enroll" class="card" hidden>
+    <h2>Add this device</h2>
+    <p>This device will approve sends and other protected actions with its fingerprint or face.</p>
+    <label for="devname" class="muted">Device name</label>
+    <input id="devname" maxlength="40" autocomplete="off">
+    <div class="btns"><button class="primary" id="enrollBtn">Create passkey</button></div>
+  </section>
+
+
+  <section id="main" hidden>
+    <h2>Waiting for approval</h2>
+    <div id="pending"></div>
+    <p id="none" class="muted">Nothing waiting. This page updates by itself.</p>
+    <div class="card">
+      <h2>Status</h2>
+      <div class="row"><span>Connector</span><span id="conn" class="pill muted">…</span></div>
+      <p id="connNote" class="muted" hidden></p>
+      <div class="row" style="margin-top:10px"><span>Remote mode</span><span id="remote" class="pill muted">…</span></div>
+      <div class="btns">
+        <button id="remoteOn" class="primary" hidden>Turn on (fingerprint)</button>
+        <button id="remoteOff" hidden>Turn off</button>
+        <button id="lockBtn" class="danger">Lock connector</button>
+      </div>
+    </div>
+  </section>
+
+  <section id="ntfy" class="card" hidden>
+    <h2>Alerts</h2>
+    <p>Install the <b>ntfy</b> app, then subscribe to this topic to be alerted when an approval is waiting. Alerts never contain email content.</p>
+    <p>Server: <code id="ntfyServer"></code><br>Topic: <code id="ntfyTopic"></code></p>
+    <div class="btns"><a id="ntfyLink"><button>Subscribe in ntfy</button></a></div>
+  </section>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>

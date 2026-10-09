@@ -109,6 +109,8 @@ func main() {
 		err = runLock(ctx, args)
 	case "unlock":
 		err = runUnlock(ctx, args)
+	case "remote":
+		err = runRemote(ctx, args)
 	case "help", "-h", "--help":
 		usage()
 		return
@@ -166,6 +168,10 @@ Commands:
              talk to the read tools. Don't run by hand; use install
              to register with Claude Desktop instead.
              Flags: --db <path>.
+  remote     Remote mode: approve from your phone/tablet with a passkey
+             while away, and keep working with the screen locked.
+             remote setup | on | off | status | add-device |
+             remove-device <name> | test-notify   (--json for scripts)
   install    Register protonmcp in Claude Desktop and/or Claude Code's
              config so the chosen client launches it as an MCP server.
              Idempotent.

@@ -266,3 +266,46 @@ func TestBrokerInvalidateNilSafe(t *testing.T) {
 		t.Errorf("nil broker Invalidate = %d, want 0", got)
 	}
 }
+
+type fakeRemote struct {
+	active bool
+	err    error
+	calls  int
+	body   string
+}
+
+func (f *fakeRemote) Active() bool { return f.active }
+func (f *fakeRemote) Approve(_ context.Context, _, body string) error {
+	f.calls++
+	f.body = body
+	return f.err
+}
+
+// Remote mode: an active route takes every prompt (a decline is final —
+// no fallback to the Mac); an inactive one leaves the Mac prompt; the
+// LocalApprover never goes remote.
+func TestBrokerRemoteRouting(t *testing.T) {
+	b, err := New(fixtureHelper(t, 1), nil) // Mac prompt would decline
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &fakeRemote{active: true}
+	b.SetRemote(r)
+	req := Request{Tool: "mail_send", Caller: caller.Caller{PID: 7, Binary: "/x/claude"}, Body: "To: a@b.c",
+		Policy: policy.ToolPolicy{Decision: policy.DecisionPrompt}}
+	src, err := b.Request(context.Background(), req)
+	if err != nil || src != SourceRemote || r.calls != 1 || r.body != "To: a@b.c\n\nRequested by: claude (pid 7)" {
+		t.Fatalf("remote approve: src=%q err=%v calls=%d body=%q", src, err, r.calls, r.body)
+	}
+	r.err = mcperrors.ErrUserCanceled
+	if _, err := b.Request(context.Background(), req); !errors.Is(err, mcperrors.ErrUserCanceled) || r.calls != 2 {
+		t.Fatalf("remote decline: err=%v calls=%d", err, r.calls)
+	}
+	if err := b.LocalApprover()(context.Background(), "t", "b"); !errors.Is(err, mcperrors.ErrUserCanceled) || r.calls != 2 {
+		t.Fatalf("LocalApprover went remote or approved: err=%v calls=%d", err, r.calls)
+	}
+	r.active = false
+	if _, err := b.Request(context.Background(), req); !errors.Is(err, mcperrors.ErrUserCanceled) || r.calls != 2 {
+		t.Fatalf("inactive remote should use the Mac helper: err=%v calls=%d", err, r.calls)
+	}
+}

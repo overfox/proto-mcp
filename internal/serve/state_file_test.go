@@ -41,7 +41,7 @@ func TestStatePublisher_SchemaAndPerms(t *testing.T) {
 		t.Errorf("mode = %o, want 600", perm)
 	}
 	m := readState(t, path)
-	want := []string{"state", "reason", "email", "pid", "keep_alive", "last_tool", "last_tool_at", "updated_at"}
+	want := []string{"state", "reason", "email", "pid", "keep_alive", "remote", "last_tool", "last_tool_at", "updated_at"}
 	if len(m) != len(want) {
 		t.Errorf("keys = %v, want exactly %v", m, want)
 	}

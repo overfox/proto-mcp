@@ -41,6 +41,7 @@ type stateDoc struct {
 	Email      string `json:"email"`
 	PID        int    `json:"pid"`
 	KeepAlive  bool   `json:"keep_alive"`
+	Remote     bool   `json:"remote"`
 	LastTool   string `json:"last_tool"`
 	LastToolAt string `json:"last_tool_at"`
 	UpdatedAt  string `json:"updated_at"`
@@ -58,6 +59,7 @@ type StatePublisher struct {
 	doc        stateDoc
 	lastToolAt time.Time
 	keepAlive  func() bool
+	remote     func() bool
 	removed    bool
 
 	kick chan struct{}
@@ -95,6 +97,16 @@ func (p *StatePublisher) SetKeepAlive(fn func() bool) {
 	}
 	p.mu.Lock()
 	p.keepAlive = fn
+	p.mu.Unlock()
+}
+
+// SetRemote installs the Remote mode reader, like SetKeepAlive.
+func (p *StatePublisher) SetRemote(fn func() bool) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.remote = fn
 	p.mu.Unlock()
 }
 
@@ -181,6 +193,9 @@ func (p *StatePublisher) write() {
 	doc := p.doc
 	if p.keepAlive != nil {
 		doc.KeepAlive = p.keepAlive()
+	}
+	if p.remote != nil {
+		doc.Remote = p.remote()
 	}
 	if !p.lastToolAt.IsZero() {
 		doc.LastToolAt = p.lastToolAt.UTC().Format(time.RFC3339)

@@ -203,6 +203,7 @@ func run() error {
 		},
 		SweepBodiesAtStartup: serve.SweepStaleBodies,
 		State:                state,
+		Remote:               true,
 	})
 	if err != nil {
 		// SIGTERM while Setup waited (Touch ID prompt, network retry)
