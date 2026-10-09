@@ -127,7 +127,7 @@ func remoteSetup(ctx context.Context, asJSON bool) error {
 		Self         struct{ DNSName string }
 	}
 	if err := json.Unmarshal(raw, &tsStatus); err != nil {
-		return fmt.Errorf("parse tailscale status: %w", err)
+		return fmt.Errorf("unexpected output from %s status: %q", ts, firstLine(string(raw)))
 	}
 	if tsStatus.BackendState != "Running" {
 		return fmt.Errorf("Tailscale is %q — open the Tailscale app and sign in first", tsStatus.BackendState)
@@ -160,7 +160,17 @@ func remoteSetup(ctx context.Context, asJSON bool) error {
 	return nil
 }
 
+// tailscaleCLI finds a working tailscale CLI. The app's own binary only
+// acts as a CLI when started from a terminal (from the menu bar's
+// launchd environment it prints "The Tailscale GUI failed to start"),
+// so the wrapper the app installs in /usr/local/bin comes first — the
+// menu bar's PATH doesn't include it.
 func tailscaleCLI() (string, error) {
+	for _, p := range []string{"/usr/local/bin/tailscale", "/opt/homebrew/bin/tailscale"} {
+		if _, err := os.Stat(p); err == nil {
+			return p, nil
+		}
+	}
 	if p, err := exec.LookPath("tailscale"); err == nil {
 		return p, nil
 	}
@@ -214,4 +224,15 @@ func remoteCall(ctx context.Context, method, path string, in, out any) error {
 		return json.Unmarshal(data, out)
 	}
 	return nil
+}
+
+func firstLine(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	if len(s) > 200 {
+		s = s[:200]
+	}
+	return s
 }

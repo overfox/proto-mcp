@@ -530,6 +530,61 @@ func Setup(ctx context.Context, cfg SetupConfig) (*Runtime, error) {
 	}
 	gatedAcquire := newStartupGatedAcquire(startupHelperPath, cfg.AcquireSession, logger)
 
+	// Remote mode starts before the session so the control socket and
+	// the device page work while Proton is unreachable or the keys are
+	// locked (setup, enrolment and "Lock" don't need a session). The
+	// runtime doesn't exist yet: hooks resolve it lazily via rtRef.
+	var (
+		rs    *remote.Service
+		rtRef atomic.Pointer[Runtime]
+	)
+	if cfg.Remote {
+		macBroker, berr := approval.New(startupHelperPath, logger)
+		if berr == nil {
+			rs, berr = remote.Load(remotePath(), remote.Hooks{
+				ConnectorState: func() (string, string, string) {
+					rt := rtRef.Load()
+					if rt == nil {
+						return StateConnecting, "starting up — waiting for Proton", ""
+					}
+					locked, reason := rt.Locked()
+					rt.mu.RLock()
+					email := rt.lastEmail
+					rt.mu.RUnlock()
+					if locked {
+						return StateLocked, reason, email
+					}
+					return StateUnlocked, "", email
+				},
+				Lock: func(reason string) {
+					if rt := rtRef.Load(); rt != nil {
+						rt.Lock(reason)
+					}
+				},
+				MacApprove: macBroker.LocalApprover(),
+				OnChange: func() {
+					if rt := rtRef.Load(); rt != nil {
+						rt.publishState()
+					}
+				},
+			}, logger)
+		}
+		if berr == nil {
+			berr = rs.Serve()
+		}
+		if berr != nil {
+			logger.Warn("remote mode unavailable", "err", berr.Error())
+			rs.Close()
+			rs = nil
+		}
+	}
+	setupOK := false
+	defer func() {
+		if !setupOK {
+			rs.Close()
+		}
+	}()
+
 	// Try the gate exactly once, so a normal boot gets exactly one
 	// prompt. A declined / timed-out prompt no longer fails Setup:
 	// exiting non-zero made launchd relaunch the daemon, which
@@ -734,34 +789,13 @@ func Setup(ctx context.Context, cfg SetupConfig) (*Runtime, error) {
 	// Both automatic triggers route through autoLock so Keep Alive can
 	// veto them. Manual locks (SIGUSR1 / `protonmcp lock` / menu Lock
 	// Now) call rt.Lock directly and are never vetoed.
-	// Remote mode: approvals go to enrolled devices and the session
-	// survives screen lock (see internal/remote).
-	if cfg.Remote {
-		rs, rerr := remote.Load(remotePath(), remote.Hooks{
-			ConnectorState: func() (string, string, string) {
-				locked, reason := rt.Locked()
-				rt.mu.RLock()
-				email := rt.lastEmail
-				rt.mu.RUnlock()
-				if locked {
-					return StateLocked, reason, email
-				}
-				return StateUnlocked, "", email
-			},
-			Lock:       rt.Lock,
-			MacApprove: broker.LocalApprover(),
-			OnChange:   rt.publishState,
-		}, logger)
-		if rerr != nil {
-			logger.Warn("remote mode unavailable", "err", rerr.Error())
-		} else if serr := rs.Serve(); serr != nil {
-			logger.Warn("remote mode listeners failed", "err", serr.Error())
-			rs.Close()
-		} else {
-			rt.remote = rs
-			broker.SetRemote(rs)
-			cfg.State.SetRemote(rs.Active)
-		}
+	// Remote mode (started before the session — see above) now gets
+	// the real runtime: prompts route to devices, state is published.
+	if rs != nil {
+		rtRef.Store(rt)
+		rt.remote = rs
+		broker.SetRemote(rs)
+		cfg.State.SetRemote(rs.Active)
 	}
 	stayAwake := func() bool { return engine.KeepAlive() || rt.remote.Active() }
 	autoLock := keepAliveGuard(stayAwake, rt.Lock, logger)
@@ -791,6 +825,7 @@ func Setup(ctx context.Context, cfg SetupConfig) (*Runtime, error) {
 	cfg.State.SetKeepAlive(engine.KeepAlive)
 	rt.publishState()
 
+	setupOK = true
 	return rt, nil
 }
 
