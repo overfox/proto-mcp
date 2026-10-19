@@ -23,6 +23,7 @@ type readResult struct {
 	ThreadID    string           `json:"thread_id,omitempty"`
 	Subject     string           `json:"subject,omitempty"`
 	From        string           `json:"from,omitempty"`
+	FromName    string           `json:"from_name,omitempty"`
 	To          []addressOut     `json:"to,omitempty"`
 	Cc          []addressOut     `json:"cc,omitempty"`
 	Date        string           `json:"date,omitempty"` // RFC 3339, UTC
@@ -35,6 +36,9 @@ type readResult struct {
 	FromCache   bool             `json:"from_cache"`
 	CachedAt    time.Time        `json:"cached_at,omitempty"`
 	References  []string         `json:"references,omitempty"`
+	// UntrustedNotice explains the field fences around from_name,
+	// to/cc names and attachment filenames (M6).
+	UntrustedNotice string `json:"untrusted_notice,omitempty"`
 }
 
 // addressOut is one recipient as the mirror stores it (to_json /
@@ -139,6 +143,7 @@ func readOne(ctx mcp.Context, deps Deps, msgID, format string, refresh bool, max
 			out.References = cached.References
 			out.Attachments = attachmentsOut(cached.Attachments)
 			applyFormatCapped(&out, cached.Text, cached.HTML, format, maxChars)
+			fenceReadFields(&out)
 			return out, nil
 		case err != nil && !errors.Is(err, store.ErrNotFound):
 			return out, err
@@ -203,7 +208,38 @@ func readOne(ctx mcp.Context, deps Deps, msgID, format string, refresh bool, max
 	out.Attachments = attachmentsOut(atts)
 	out.CachedAt = time.Now().UTC()
 	applyFormatCapped(&out, body.Text, body.HTML, format, maxChars)
+	fenceReadFields(&out)
 	return out, nil
+}
+
+// fenceReadFields fences the short sender-controlled fields of a read
+// result — the From display name, To / Cc display names and attachment
+// filenames (M6) — with one per-message nonce, explained in
+// untrusted_notice. Subject and bodies carry their own fences.
+func fenceReadFields(out *readResult) {
+	f := newFieldFence()
+	used := false
+	wrap := func(s string) string {
+		if s == "" {
+			return s
+		}
+		used = true
+		return f.wrap(s)
+	}
+	out.FromName = wrap(out.FromName)
+	for i := range out.To {
+		out.To[i].Name = wrap(out.To[i].Name)
+	}
+	for i := range out.Cc {
+		out.Cc[i].Name = wrap(out.Cc[i].Name)
+	}
+	for i := range out.Attachments {
+		out.Attachments[i].Filename = wrap(out.Attachments[i].Filename)
+		out.Attachments[i].ContentID = wrap(out.Attachments[i].ContentID)
+	}
+	if used {
+		out.UntrustedNotice = f.notice("from_name, to/cc names and attachment filenames")
+	}
 }
 
 // applyEnvelope fills the header-ish fields from the mirror row.
@@ -211,6 +247,7 @@ func applyEnvelope(out *readResult, m store.Message) {
 	out.ThreadID = m.ThreadID
 	out.Subject = wrapUntrustedSubject(m.Subject)
 	out.From = m.FromAddress
+	out.FromName = m.FromName
 	out.To = decodeAddressJSON(m.ToJSON)
 	out.Cc = decodeAddressJSON(m.CcJSON)
 	if !m.Date.IsZero() && m.Date.Unix() > 0 {
@@ -221,6 +258,9 @@ func applyEnvelope(out *readResult, m store.Message) {
 // applyEnvelopeFromAPI fills the envelope from a fetched message when
 // the mirror has no row for it yet.
 func applyEnvelopeFromAPI(out *readResult, m gpa.Message) {
+	if m.Sender != nil {
+		out.FromName = m.Sender.Name
+	}
 	for _, a := range m.ToList {
 		if a != nil {
 			out.To = append(out.To, addressOut{Name: a.Name, Address: a.Address})
@@ -358,6 +398,7 @@ const readResultSchema = `{
 		"thread_id":  {"type": "string"},
 		"subject":    {"type": "string"},
 		"from":       {"type": "string"},
+		"from_name":  {"type": "string", "description": "Sender-controlled; fenced as untrusted (see untrusted_notice)."},
 		"to":         {"type": "array", "items": {"type": "object", "properties": {"name": {"type": "string"}, "address": {"type": "string"}}}},
 		"cc":         {"type": "array", "items": {"type": "object", "properties": {"name": {"type": "string"}, "address": {"type": "string"}}}},
 		"date":       {"type": "string"},
@@ -371,7 +412,8 @@ const readResultSchema = `{
 			"size_bytes": {"type": "integer"}, "inline": {"type": "boolean"}}}},
 		"from_cache": {"type": "boolean"},
 		"cached_at":  {"type": "string"},
-		"references": {"type": "array", "items": {"type": "string"}}
+		"references": {"type": "array", "items": {"type": "string"}},
+		` + untrustedNoticeSchema + `
 	},
 	"required": ["message_id", "from_cache"]
 }`

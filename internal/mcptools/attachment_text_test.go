@@ -206,9 +206,11 @@ func TestMailAttachmentText_FakeServer(t *testing.T) {
 	if res.IsError {
 		t.Fatalf("error: %s", res.Content[0].Text)
 	}
-	if out.Format != "docx" || out.Filename != "spa.docx" || out.Truncated {
+	if out.Format != "docx" || out.Truncated {
 		t.Errorf("result = %+v", out)
 	}
+	// M6: the sender-controlled filename comes fenced.
+	assertFenced(t, "filename", out.Filename, "spa.docx")
 	if !strings.Contains(out.Text, "Share Purchase Agreement") || !strings.HasPrefix(out.Text, (untrustedMarkerPrefix+"BEGIN "+untrustedBodyLabel)) {
 		t.Errorf("text not extracted / not fenced: %q", out.Text)
 	}

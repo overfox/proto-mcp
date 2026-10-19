@@ -32,6 +32,9 @@ func mailAttachmentText(deps Deps) mcp.Tool {
 		Text         string `json:"text"`
 		TotalChars   int    `json:"total_chars"`
 		Truncated    bool   `json:"truncated"`
+		// UntrustedNotice explains the fence around filename (M6);
+		// text carries its own UNTRUSTED EMAIL BODY fence.
+		UntrustedNotice string `json:"untrusted_notice,omitempty"`
 	}
 
 	return mcp.Tool{
@@ -61,7 +64,8 @@ func mailAttachmentText(deps Deps) mcp.Tool {
 				"format":        {"type": "string", "enum": ["pdf", "docx", "xlsx", "html", "csv", "text"]},
 				"text":          {"type": "string"},
 				"total_chars":   {"type": "integer"},
-				"truncated":     {"type": "boolean"}
+				"truncated":     {"type": "boolean"},
+				` + untrustedNoticeSchema + `
 			},
 			"required": ["message_id", "attachment_id", "filename", "format", "text", "total_chars", "truncated"]
 		}`),
@@ -97,18 +101,21 @@ func mailAttachmentText(deps Deps) mcp.Tool {
 			if err != nil {
 				return mcp.ErrorResult("mail_attachment_text: %v", err), nil
 			}
+			// M6: the filename (and the declared MIME type) are
+			// sender-controlled; fence them wherever they're echoed.
+			fence := newFieldFence()
 			format := detectFormat(row.MIMEType, row.Filename, content)
 			if format == "" {
 				return mcp.ErrorResult(
 					"mail_attachment_text: %s (%s) is not a supported type — supported: PDF, DOCX, XLSX, HTML, CSV, plain text. "+
-						"Use mail_save_attachment to open it with another app.",
-					row.Filename, row.MIMEType), nil
+						"Use mail_save_attachment to open it with another app. %s",
+					fence.wrap(row.Filename), fence.wrap(row.MIMEType), fence.notice("The filename and type")), nil
 			}
 			// PDF / DOCX / XLSX are parsed in a resource-limited child
 			// process (attachment_text_extract.go, SECURITY H5).
 			text, total, err := extractTextIsolated(ctx.Std, format, content, maxChars)
 			if err != nil {
-				return mcp.ErrorResult("mail_attachment_text: %s: %v", row.Filename, err), nil
+				return mcp.ErrorResult("mail_attachment_text: %s: %v %s", fence.wrap(row.Filename), err, fence.notice("The filename")), nil
 			}
 			text, cut := truncateRunes(text, maxChars)
 			if total > utf8.RuneCountInString(text) {
@@ -117,12 +124,14 @@ func mailAttachmentText(deps Deps) mcp.Tool {
 			return mcp.StructuredResult(result{
 				MessageID:    in.MessageID,
 				AttachmentID: in.AttachmentID,
-				Filename:     row.Filename,
+				Filename:     fence.wrap(row.Filename),
 				MIMEType:     row.MIMEType,
 				Format:       format,
 				Text:         wrapUntrustedBody(text),
 				TotalChars:   total,
 				Truncated:    cut,
+				UntrustedNotice: fence.notice("filename") +
+					" The extracted text is fenced separately as UNTRUSTED EMAIL BODY.",
 			})
 		},
 	}

@@ -82,8 +82,11 @@ func TestCalendarEventsTool_RangeAndDecryptedFields(t *testing.T) {
 	if len(out.Events) != 1 || out.Events[0].EventID != "ev-1" {
 		t.Fatalf("range result = %+v", out.Events)
 	}
-	if out.Events[0].Summary != "Standup" || out.Events[0].Location != "Zoom" {
-		t.Errorf("decrypted summary not surfaced: %+v", out.Events[0])
+	// M6: surfaced, but fenced as sender-controlled.
+	assertFenced(t, "summary", out.Events[0].Summary, "Standup")
+	assertFenced(t, "location", out.Events[0].Location, "Zoom")
+	if out.UntrustedNotice == "" {
+		t.Error("fenced fields without untrusted_notice")
 	}
 }
 
@@ -126,15 +129,32 @@ func TestCalendarReadEventTool_CacheHit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	detail, ok := res.StructuredContent.(*protonclient.CalendarEventDetail)
+	out, ok := res.StructuredContent.(calendarEventDetailOut)
 	if !ok {
 		t.Fatalf("result type = %T", res.StructuredContent)
 	}
-	if detail.Summary != "Review" || detail.Description != "quarterly" {
-		t.Errorf("detail = %+v", detail)
-	}
+	var detail *protonclient.CalendarEventDetail = out.CalendarEventDetail
+	// M6: sender-controlled text comes fenced.
+	assertFenced(t, "summary", detail.Summary, "Review")
+	assertFenced(t, "description", detail.Description, "quarterly")
 	if len(detail.Attendees) != 1 || detail.Attendees[0].Email != "bob@example.com" {
 		t.Errorf("attendees not decoded from JSON: %+v", detail.Attendees)
+	} else {
+		assertFenced(t, "attendee name", detail.Attendees[0].Name, "Bob")
+	}
+	if out.UntrustedNotice == "" {
+		t.Error("missing untrusted_notice")
+	}
+	// The mirror keeps the raw values (fencing is output-only).
+	row, err := st.GetCalendarEvent(ctx, "ev-1")
+	if err != nil || row.Summary != "Review" {
+		t.Errorf("mirror row = %+v, %v", row, err)
+	}
+	// The wire shape is still the flat event object.
+	b, _ := json.Marshal(out)
+	var flat map[string]any
+	if err := json.Unmarshal(b, &flat); err != nil || flat["event_id"] != "ev-1" || flat["untrusted_notice"] == nil {
+		t.Errorf("wire shape = %s", b)
 	}
 }
 

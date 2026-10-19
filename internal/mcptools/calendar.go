@@ -87,6 +87,65 @@ type calendarSummary struct {
 type calendarEventsResult struct {
 	Events     []calendarSummary `json:"events"`
 	NextCursor string            `json:"next_cursor,omitempty"`
+	// UntrustedNotice explains the fences around summary / location /
+	// organizer (M6).
+	UntrustedNotice string `json:"untrusted_notice,omitempty"`
+}
+
+// fenced returns r with each event's sender-controlled fields —
+// summary, location, organizer (an invite's CN can be any text) —
+// fenced as untrusted (M6). Applied at output time only; the mirror
+// keeps raw values.
+func (r calendarEventsResult) fenced() calendarEventsResult {
+	f := newFieldFence()
+	events := make([]calendarSummary, len(r.Events))
+	used := false
+	for i, e := range r.Events {
+		if e.Summary != "" || e.Location != "" || e.Organizer != "" {
+			used = true
+		}
+		e.Summary = f.wrap(e.Summary)
+		e.Location = f.wrap(e.Location)
+		e.Organizer = f.wrap(e.Organizer)
+		events[i] = e
+	}
+	r.Events = events
+	if used {
+		r.UntrustedNotice = f.notice("Event summary, location and organizer")
+	}
+	return r
+}
+
+// calendarEventDetailOut is calendar_read_event's wire shape: the
+// detail with its sender-controlled fields fenced, plus the notice.
+type calendarEventDetailOut struct {
+	*protonclient.CalendarEventDetail
+	UntrustedNotice string `json:"untrusted_notice,omitempty"`
+}
+
+// fencedEventDetail copies d with summary, location, description,
+// organizer, attendee names and the raw iCalendar text (which repeats
+// all of them) fenced as untrusted (M6). d itself (cached in the
+// mirror by the caller) is not modified.
+func fencedEventDetail(d *protonclient.CalendarEventDetail) calendarEventDetailOut {
+	f := newFieldFence()
+	c := *d
+	c.Summary = f.wrap(c.Summary)
+	c.Location = f.wrap(c.Location)
+	c.Description = f.wrap(c.Description)
+	c.Organizer = f.wrap(c.Organizer)
+	c.RawICal = f.wrap(c.RawICal)
+	if len(d.Attendees) > 0 {
+		c.Attendees = make([]protonclient.CalendarAttendeeDetail, len(d.Attendees))
+		for i, a := range d.Attendees {
+			a.Name = f.wrap(a.Name)
+			c.Attendees[i] = a
+		}
+	}
+	return calendarEventDetailOut{
+		CalendarEventDetail: &c,
+		UntrustedNotice:     f.notice("summary, location, description, organizer, attendee names and raw_ical"),
+	}
 }
 
 func calendarEvents(deps Deps) mcp.Tool {
@@ -192,7 +251,7 @@ func calendarEvents(deps Deps) mcp.Tool {
 						out.NextCursor = encodeCursor(end, qhash)
 					}
 				}
-				return mcp.StructuredResult(out)
+				return mcp.StructuredResult(out.fenced())
 			}
 
 			rows, err := deps.Store.ListCalendarEvents(ctx.Std, f)
@@ -213,7 +272,7 @@ func calendarEvents(deps Deps) mcp.Tool {
 			if len(rows) >= limit {
 				out.NextCursor = encodeCursor(f.Offset+len(rows), qhash)
 			}
-			return mcp.StructuredResult(out)
+			return mcp.StructuredResult(out.fenced())
 		},
 	}
 }
@@ -260,7 +319,7 @@ func calendarReadEvent(deps Deps) mcp.Tool {
 
 			// Cache hit.
 			if inStore && row.Decrypted && !in.Refresh {
-				return mcp.StructuredResult(detailFromRow(row))
+				return mcp.StructuredResult(fencedEventDetail(detailFromRow(row)))
 			}
 
 			calID := in.CalendarID
@@ -273,7 +332,7 @@ func calendarReadEvent(deps Deps) mcp.Tool {
 
 			if deps.Session == nil {
 				if inStore {
-					return mcp.StructuredResult(detailFromRow(row)) // envelope-only fallback
+					return mcp.StructuredResult(fencedEventDetail(detailFromRow(row))) // envelope-only fallback
 				}
 				return mcp.ErrorResult("calendar_read_event: session not available"), nil
 			}
@@ -284,7 +343,7 @@ func calendarReadEvent(deps Deps) mcp.Tool {
 					return calendarUnavailableResult("calendar_read_event"), nil
 				}
 				if inStore {
-					return mcp.StructuredResult(detailFromRow(row)) // graceful: return what we have
+					return mcp.StructuredResult(fencedEventDetail(detailFromRow(row))) // graceful: return what we have
 				}
 				return mcp.ErrorResult("calendar_read_event: %v", err), nil
 			}
@@ -294,7 +353,7 @@ func calendarReadEvent(deps Deps) mcp.Tool {
 					slog.Warn("calendar_read_event: cache fill failed", "event_id", in.EventID, "err", ferr.Error())
 				}
 			}
-			return mcp.StructuredResult(detail)
+			return mcp.StructuredResult(fencedEventDetail(detail))
 		},
 	}
 }
@@ -646,7 +705,8 @@ const calendarEventsSchema = `{
 				"required": ["event_id", "calendar_id", "start_unix"]
 			}
 		},
-		"next_cursor": {"type": "string"}
+		"next_cursor": {"type": "string"},
+		` + untrustedNoticeSchema + `
 	},
 	"required": ["events"]
 }`
@@ -682,7 +742,8 @@ const calendarEventDetailSchema = `{
 				}
 			}
 		},
-		"raw_ical": {"type": "string"}
+		"raw_ical": {"type": "string"},
+		` + untrustedNoticeSchema + `
 	},
 	"required": ["event_id", "calendar_id", "start_unix"]
 }`
