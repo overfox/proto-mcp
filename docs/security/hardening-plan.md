@@ -65,8 +65,8 @@ ACL (needs a provisioned, Developer-ID-signed .app — H1/H3 full fix).
 - [x] WS0 toolchain
 - [x] WS-A Remote mode trust (merged 6f29dd7)
 - [x] WS-B Mail actions & dialogs (merged 5f79e2c)
-- [ ] WS-C Files, parsers, data at rest
+- [x] WS-C Files, parsers, data at rest (merged)
 - [x] WS-D Gates, CLI, policy, daemon (merged 22abff7)
-- [ ] Merge + full test + govulncheck
+- [x] Merge + full test + govulncheck (0 vulnerabilities)
 - [ ] Deploy + live re-probe
 - [ ] Verification review

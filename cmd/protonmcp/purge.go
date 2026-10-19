@@ -164,12 +164,10 @@ func sweepBodiesAtStartup(ctx context.Context, st *store.Store) (int64, error) {
 	if err != nil {
 		return n, err
 	}
-	if attN, attErr := st.PurgeAttachmentsOlderThan(ctx, cutoff); attErr == nil && attN > 0 {
-		// Best-effort — the body sweep is already reported via the
-		// caller's stats; attachment counts roll into the same log line
-		// via slog if anything else cares.
-		_ = attN
-	}
+	// Decrypted attachments: the shorter attachment retention plus the
+	// size cap (same sweep the daemon runs). Best-effort — the body
+	// sweep is what the caller reports.
+	_, _ = st.SweepAttachmentCache(ctx, time.Now(), store.DefaultAttachmentRetention, store.DefaultAttachmentCacheMaxBytes)
 	// PROTO-135 — best-effort sweep of the on-disk staging plaintext at
 	// the same retention cutoff.
 	_, _ = mcptools.SweepStagingOlderThan(cutoff)
