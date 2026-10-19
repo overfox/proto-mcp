@@ -166,9 +166,17 @@ func Load(path string, hooks Hooks, logger *slog.Logger) (*Service, error) {
 	}
 	s.cfg.Devices = kept
 	if len(kept) == 0 {
-		s.cfg.Enabled = false
 		s.cfg.OwnerLogin = ""
 	}
+	// Remote mode always starts OFF. remote.json is user-writable, so an
+	// "enabled" flag read from disk would let any local process switch
+	// off screen-lock / sleep / idle auto-lock (Active() feeds the
+	// Keep Alive guard) without Touch ID or a passkey. Turning it on is
+	// only ever done in-process: Mac Touch ID (/on) or a device passkey.
+	if s.cfg.Enabled {
+		logger.Info("remote: mode starts off after a daemon restart — turn it on from the menu bar or an enrolled device")
+	}
+	s.cfg.Enabled = false
 	if s.cfg.Origin != "" {
 		u, perr := parseOrigin(s.cfg.Origin)
 		if perr != nil || u.Port() != strconv.Itoa(s.cfg.Port) {
@@ -180,9 +188,6 @@ func Load(path string, hooks Hooks, logger *slog.Logger) (*Service, error) {
 	}
 	if err := saveConfig(path, s.cfg); err != nil {
 		return nil, err
-	}
-	if s.activeLocked() {
-		s.startAwake()
 	}
 	go s.pruneLoop()
 	return s, nil

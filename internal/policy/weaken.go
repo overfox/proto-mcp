@@ -94,6 +94,12 @@ func computeWeakenings(base, merged document) []string {
 		} else if m.Decision == DecisionPrompt && b.Decision == DecisionPrompt && m.TTLDuration() > b.TTLDuration() {
 			out = append(out, fmt.Sprintf("%s: ttl %s → %s", label, ttlLabel(b.TTL), ttlLabel(m.TTL)))
 		}
+		// rate_limit: any change to a limit the defaults set counts —
+		// dropping or relaxing it loosens enforcement (middleware
+		// applies it); a tighter one is a false positive we accept.
+		if b.RateLimit != "" && !strings.EqualFold(strings.TrimSpace(m.RateLimit), strings.TrimSpace(b.RateLimit)) {
+			out = append(out, fmt.Sprintf("%s: rate_limit %q → %q", label, b.RateLimit, promptSafe(m.RateLimit)))
+		}
 		if len(b.AllowedRecipients) > 0 {
 			if len(m.AllowedRecipients) == 0 {
 				out = append(out, label+": allowed_recipients removed")

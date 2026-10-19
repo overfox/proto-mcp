@@ -644,6 +644,11 @@ func TestC1_TamperedConfigCannotApproveFromMac(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer s.Close()
+			// Load never arms Remote mode from disk; arm it as the real
+			// owner would, so the forged credential is tested on its own.
+			if err := s.SetEnabled(true, "test"); err != nil {
+				t.Fatal(err)
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
 			res := make(chan error, 1)
@@ -1034,5 +1039,24 @@ func TestCleanName(t *testing.T) {
 	}
 	if cleanName("​") != "Device" {
 		t.Error("empty name not defaulted")
+	}
+}
+
+// A remote.json that says enabled (written by anyone) never makes Remote
+// mode active on load: that would veto auto-lock without Touch ID.
+func TestLoadNeverStartsEnabled(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "remote.json")
+	cfg := Config{Enabled: true, Origin: "https://mac.tail1234.ts.net:8443", Port: 8443,
+		Devices: []Device{{Name: "x", NodeID: "nJunk", Login: "a@b", Cred: webauthn.Credential{ID: []byte{1}}}}}
+	if err := saveConfig(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Load(path, Hooks{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if s.Active() || s.Status().Enabled {
+		t.Fatalf("forged enabled remote.json made Remote mode active: %+v", s.Status())
 	}
 }
