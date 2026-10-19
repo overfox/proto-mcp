@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	gpa "github.com/ProtonMail/go-proton-api"
 
@@ -83,14 +84,28 @@ func (in stateIDsInput) resolveIDs(toolName string) ([]string, *mcp.Error) {
 const stateIDsSchemaProps = `"message_id":  {"type": "string", "description": "Single message. Exactly one of message_id / message_ids."},
 				"message_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 500, "description": "Batch form: apply the action to every listed message in one call (one approval)."}`
 
-// batchPromptNoun renders "message <subject>" for a single id or
-// "N messages (first: <subject>)" for a batch — the Touch ID prompt
-// must convey scale without listing 500 subjects.
+// batchPromptListMax is how many messages a batch dialog names before
+// collapsing the rest into "…and N more".
+const batchPromptListMax = 5
+
+// batchPromptNoun renders "message '<subject>' from <sender>" for a
+// single id, or "N messages: '<s1>' from <a1>; …; …and K more" for a
+// batch — the Touch ID prompt names up to batchPromptListMax messages
+// (subjects and senders sanitized and clipped) so the user can tell
+// what a destructive batch touches without listing 500 subjects.
 func batchPromptNoun(deps Deps, ids []string) string {
 	if len(ids) == 1 {
-		return "message " + lookupSubject(deps, ids[0])
+		return "message " + lookupSubjectSender(deps, ids[0])
 	}
-	return fmt.Sprintf("%d messages (first: %s)", len(ids), lookupSubject(deps, ids[0]))
+	n := min(len(ids), batchPromptListMax)
+	parts := make([]string, 0, n+1)
+	for _, id := range ids[:n] {
+		parts = append(parts, lookupSubjectSender(deps, id))
+	}
+	if rest := len(ids) - n; rest > 0 {
+		parts = append(parts, fmt.Sprintf("…and %d more", rest))
+	}
+	return fmt.Sprintf("%d messages: %s", len(ids), strings.Join(parts, "; "))
 }
 
 // mailMarkRead — clear the Unread flag.
@@ -329,15 +344,20 @@ func mailLabel(deps Deps) mcp.Tool {
 	}
 }
 
-// mailTrash — move to trash. Reversible by mail_move back to the
-// original folder while the message still exists in trash. (Proton
-// has a separate "permanent delete" verb gated as deny by default —
-// see mail_delete_permanent in 5/D.)
+// mailTrash — move to Trash. Reversible by mail_move back to the
+// original folder while the message is still in Trash.
+//
+// SECURITY H7: this is a label operation (LabelMessages with
+// TrashLabel — see trashMessages), NOT Client.DeleteMessage —
+// PUT /mail/v4/messages/delete is Proton's PERMANENT delete, which
+// would contradict the "reversible" approval dialog. Permanent
+// deletion stays a separate verb (mail_delete_permanent), denied by
+// default.
 func mailTrash(deps Deps) mcp.Tool {
 	return mcp.Tool{
 		Name: "mail_trash",
 		Description: "Move one message (message_id) or a batch (message_ids) to Trash — a batch is one call and one approval. " +
-			"Reversible — call mail_move with the original folder. " +
+			"The messages stay in Trash (not permanently deleted); reversible — call mail_move with the original folder. " +
 			"For permanent deletion see mail_delete_permanent (gated as deny by default).",
 		InputSchema: json.RawMessage(`{
 			"type": "object",
@@ -360,9 +380,7 @@ func mailTrash(deps Deps) mcp.Tool {
 			if merr != nil {
 				return nil, merr
 			}
-			// Proton's DeleteMessage moves to Trash (recoverable);
-			// the true permanent delete is a different endpoint.
-			if err := deps.Session.Client.DeleteMessage(ctx.Std, ids...); err != nil {
+			if err := trashMessages(ctx.Std, deps, ids); err != nil {
 				return mcp.ErrorResult("mail_trash: %v", err), nil
 			}
 			warn := updateMessagesFlag(ctx.Std, deps, ids, func(m *store.Message) {
@@ -371,6 +389,19 @@ func mailTrash(deps Deps) mcp.Tool {
 			return mcp.StructuredResult(stateActionOK(ids, "trashed", warn))
 		},
 	}
+}
+
+// trashMessages moves ids to Trash by applying the Trash label.
+// Trash is an exclusive system folder: labeling into it removes the
+// previous folder server-side, and the message (body, attachments)
+// keeps existing until Trash is emptied — unlike Client.DeleteMessage
+// (PUT /mail/v4/messages/delete), which deletes permanently. Shared by
+// mail_trash and mail_draft_delete.
+func trashMessages(ctx context.Context, deps Deps, ids []string) error {
+	if deps.Session == nil || deps.Session.Client == nil {
+		return errors.New("no active session")
+	}
+	return deps.Session.Client.LabelMessages(ctx, ids, gpa.TrashLabel)
 }
 
 // stateActionResult is the shared output shape for the five state

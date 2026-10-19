@@ -254,7 +254,9 @@ func mailDraftDelete(deps Deps) mcp.Tool {
 	}
 	return mcp.Tool{
 		Name:        "mail_draft_delete",
-		Description: "Delete a draft. This is a Proton DeleteMessage on the draft, which trashes it (recoverable from Trash).",
+		Description: "Delete a draft by moving it to Trash (not a permanent delete — it stays recoverable from Trash " +
+			"until Trash is emptied; move it back with mail_move destination=\"drafts\"). " +
+			"`deleted: true` means it was moved to Trash.",
 		InputSchema: json.RawMessage(`{
 			"type": "object",
 			"properties": {"draft_id": {"type": "string"}},
@@ -274,7 +276,7 @@ func mailDraftDelete(deps Deps) mcp.Tool {
 			_ = json.Unmarshal(raw, &in)
 			subj := lookupSubject(deps, in.DraftID)
 			title := mcp.SanitizePromptText("Approve mail_draft_delete?", 120)
-			body := "delete draft " + subj + " (moves to Trash; recoverable)"
+			body := "move draft " + subj + " to Trash (recoverable from Trash; not a permanent delete)"
 			return title, mcp.SanitizePromptText(body, 4000)
 		},
 		Handler: func(ctx mcp.Context, raw json.RawMessage) (*mcp.ToolResult, error) {
@@ -285,10 +287,13 @@ func mailDraftDelete(deps Deps) mcp.Tool {
 			if in.DraftID == "" {
 				return nil, mcp.NewError(mcp.CodeInvalidParams, "mail_draft_delete: draft_id is required")
 			}
-			if err := deps.Session.Client.DeleteMessage(ctx.Std, in.DraftID); err != nil {
+			// SECURITY H7: Client.DeleteMessage is Proton's PERMANENT
+			// delete; the dialog promises "recoverable", so label the
+			// draft into Trash instead (same path as mail_trash).
+			if err := trashMessages(ctx.Std, deps, []string{in.DraftID}); err != nil {
 				return mcp.ErrorResult("mail_draft_delete: %v", err), nil
 			}
-			_ = deps.Store.DeleteMessage(ctx.Std, in.DraftID)
+			_ = updateMessageFlag(ctx.Std, deps, in.DraftID, func(m *store.Message) { m.Folder = "trash" })
 			return mcp.StructuredResult(map[string]any{
 				"draft_id": in.DraftID,
 				"deleted":  true,
