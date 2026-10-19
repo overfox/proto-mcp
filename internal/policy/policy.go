@@ -29,6 +29,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -162,6 +163,17 @@ type Engine struct {
 	doc      document
 	override string // path to the user override, "" if none/unreadable
 
+	// gate approves an override that loosens the embedded defaults
+	// (SECURITY H6). nil → weakenings are applied unchecked (tests and
+	// the read-only CLI paths; the daemon always installs one).
+	gate Gate
+	// weakenings lists how the policy in force is looser than the
+	// embedded defaults (nil when it isn't). overrideErr is why the
+	// override file is NOT in force at startup (nil when it is or
+	// there is none). Both guarded by mu.
+	weakenings  []string
+	overrideErr error
+
 	logger *slog.Logger
 }
 
@@ -172,23 +184,57 @@ type Engine struct {
 // Returns an error only if the embedded default.yaml fails to parse
 // — that's our own code, treat as a build-time bug. User override
 // failures are logged at Warn level and the default proceeds.
+//
+// New installs no weakening gate: an override that loosens the
+// defaults is applied as long as it passes the floors and hard limits.
+// Long-running servers use NewWithGate.
 func New(ctx context.Context, overridePath string, logger *slog.Logger) (*Engine, error) {
+	return NewWithGate(ctx, overridePath, logger, nil)
+}
+
+// NewWithGate is New with a weakening gate (SECURITY H6): an override
+// that loosens anything vs the embedded defaults takes effect only if
+// gate approves it. A refused override leaves the embedded defaults in
+// force (the reason is logged and reported by OverrideError).
+func NewWithGate(ctx context.Context, overridePath string, logger *slog.Logger, gate Gate) (*Engine, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	e := &Engine{override: overridePath, logger: logger}
+	e := &Engine{override: overridePath, logger: logger, gate: gate}
 	doc, err := parseDocument(defaultYAML)
 	if err != nil {
 		return nil, fmt.Errorf("parse embedded default policy: %w", err)
 	}
 	e.doc = doc
 	if overridePath != "" {
-		if err := e.applyOverride(); err != nil {
-			logger.Warn("policy override unreadable; using defaults only",
+		ws, err := e.applyOverrideInto(ctx, &e.doc)
+		if err != nil {
+			// applyOverrideInto validates + gates before it mutates, so
+			// e.doc is still the pristine embedded default here.
+			e.overrideErr = err
+			logger.Warn("policy override not applied; using embedded defaults only",
 				"path", overridePath, "err", err.Error())
+		} else {
+			e.weakenings = ws
 		}
 	}
 	return e, nil
+}
+
+// Weakenings returns how the policy in force is looser than the
+// embedded defaults (empty when it isn't). Copy.
+func (e *Engine) Weakenings() []string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return append([]string(nil), e.weakenings...)
+}
+
+// OverrideError reports why the override file was not applied at
+// startup (nil when it was, or when there is none).
+func (e *Engine) OverrideError() error {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.overrideErr
 }
 
 // Decide returns the policy entry for the given tool name + args +
@@ -227,6 +273,14 @@ func (e *Engine) Decide(tool string, _ []byte, _ Caller) (Decision, *ToolPolicy)
 // SIGHUP handler calls this. So does the `protonmcp policy reload`
 // CLI subcommand via the PID file in this package's pidfile.go.
 func (e *Engine) Reload() error {
+	return e.ReloadContext(context.Background())
+}
+
+// ReloadContext is Reload with a context bounding the weakening
+// approval prompt (if the gate needs one). A declined / failed
+// approval returns an error wrapping ErrWeakeningNotApproved and keeps
+// the previous policy.
+func (e *Engine) ReloadContext(ctx context.Context) error {
 	if e.override == "" {
 		return errors.New("policy: no override path configured")
 	}
@@ -238,49 +292,97 @@ func (e *Engine) Reload() error {
 		return fmt.Errorf("re-parse embedded default: %w", err)
 	}
 
-	if err := e.applyOverrideInto(&base); err != nil {
+	ws, err := e.applyOverrideInto(ctx, &base)
+	if err != nil {
 		return err
 	}
 
 	e.mu.Lock()
 	e.doc = base
+	e.weakenings = ws
+	e.overrideErr = nil
 	e.mu.Unlock()
 	return nil
 }
 
-// applyOverride is the New()-time version: loads override into the
-// engine's current doc. applyOverrideInto is the Reload() version
-// that operates on a candidate doc and only commits on success.
-func (e *Engine) applyOverride() error {
-	return e.applyOverrideInto(&e.doc)
-}
-
-func (e *Engine) applyOverrideInto(into *document) error {
-	data, err := os.ReadFile(e.override)
+// readOverride reads + validates the override file: parse, floors and
+// hard limits. Returns (nil doc, nil) when there is no file.
+func readOverride(path string) (*document, []byte, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil // no override file is fine
+			return nil, nil, nil // no override file is fine
 		}
-		return fmt.Errorf("read override: %w", err)
+		return nil, nil, fmt.Errorf("read override: %w", err)
 	}
 	override, err := parseDocument(data)
 	if err != nil {
-		return fmt.Errorf("parse override: %w", err)
+		return nil, nil, fmt.Errorf("parse override: %w", err)
 	}
-
-	// Enforce the send floor on the override BEFORE merging: into is
-	// mutated in place (New()'s path merges straight into e.doc), so a
-	// post-merge rejection would leave the weakened entries applied.
 	// Override entries replace default blocks wholesale, and the
-	// embedded defaults already satisfy the floor, so validating just
+	// embedded defaults already satisfy the floors, so validating just
 	// the override's own entries covers the merged result.
 	if err := enforceSendFloor(&override); err != nil {
-		return err
+		return nil, nil, err
 	}
 	if err := enforceDestructiveFloor(&override); err != nil {
-		return err
+		return nil, nil, err
 	}
+	if err := enforceHardLimits(&override); err != nil {
+		return nil, nil, err
+	}
+	return &override, data, nil
+}
 
+// AnalyzeOverride validates the override at path like the engine does
+// and reports how it would loosen the embedded defaults, plus the
+// content hash a weakening approval is bound to. For `policy show` /
+// `policy validate`. A missing file returns (nil, "", nil).
+func AnalyzeOverride(path string) (weakenings []string, contentHash string, err error) {
+	override, data, err := readOverride(path)
+	if err != nil || override == nil {
+		return nil, "", err
+	}
+	base, err := parseDocument(defaultYAML)
+	if err != nil {
+		return nil, "", err
+	}
+	merged, _ := parseDocument(defaultYAML)
+	mergeOverride(&merged, override)
+	return computeWeakenings(base, merged), ContentHash(data), nil
+}
+
+// applyOverrideInto validates the override, computes its weakenings
+// vs the embedded defaults, runs the weakening gate, and only then
+// merges it into `into` — every rejection happens BEFORE `into` is
+// mutated (NewWithGate merges straight into e.doc). Returns the
+// weakenings now in force.
+func (e *Engine) applyOverrideInto(ctx context.Context, into *document) ([]string, error) {
+	override, data, err := readOverride(e.override)
+	if err != nil || override == nil {
+		return nil, err
+	}
+	base, err := parseDocument(defaultYAML)
+	if err != nil {
+		return nil, fmt.Errorf("re-parse embedded default: %w", err)
+	}
+	merged, _ := parseDocument(defaultYAML)
+	mergeOverride(&merged, override)
+	ws := computeWeakenings(base, merged)
+	if len(ws) > 0 && e.gate != nil {
+		if err := e.gate(ctx, ws, ContentHash(data)); err != nil {
+			if !errors.Is(err, ErrWeakeningNotApproved) {
+				err = fmt.Errorf("%w: %w", ErrWeakeningNotApproved, err)
+			}
+			return nil, err
+		}
+	}
+	mergeOverride(into, override)
+	return ws, nil
+}
+
+// mergeOverride applies a validated override onto into.
+func mergeOverride(into *document, override *document) {
 	// Shallow merge: per-tool override REPLACES the default block.
 	// Don't deep-merge fields — a user who copies our default and
 	// forgets to carry over `confirm: true` would silently weaken
@@ -315,7 +417,6 @@ func (e *Engine) applyOverrideInto(into *document) error {
 	if override.KeepAlive {
 		into.KeepAlive = true
 	}
-	return nil
 }
 
 // sendFloorTools may never be weakened below prompt-with-zero-TTL:
@@ -351,12 +452,92 @@ func enforceSendFloor(doc *document) error {
 // folders / drafts, permanent delete). A prompt-injected model with
 // these on `allow` could silently bury or destroy evidence of its own
 // actions, so — like the send floor — no override may set them to
-// allow. prompt (with any ttl the user likes) and deny are accepted;
-// a violating override is rejected wholesale.
+// allow. prompt (ttl at most maxDestructiveTTL — see enforceHardLimits)
+// and deny are accepted; a violating override is rejected wholesale.
+//
+// H6 extended it to standing configuration that acts on mail later
+// (rules_set / rules_run / rules_delete) and to spam reporting, which
+// moves mail out of view and trains Proton's filter.
 var destructiveFloorTools = []string{
 	"mail_trash", "mail_move", "mail_label",
 	"labels_delete", "folders_delete",
 	"mail_draft_delete", "mail_delete_permanent",
+	"rules_set", "rules_run", "rules_delete",
+	"mail_report_spam",
+}
+
+// maxDestructiveTTL caps the approval-cache TTL of every destructive
+// floor tool. One approval must not cover a year of silent trashing
+// (the assessment's hostile policy set ttl: 8760h).
+const maxDestructiveTTL = 15 * time.Minute
+
+// homeDir is os.UserHomeDir, a var for tests.
+var homeDir = os.UserHomeDir
+
+// enforceHardLimits rejects (wholesale, like the floors) override
+// settings no Touch ID approval can make acceptable (SECURITY H6):
+//
+//   - defaults: allow — every unknown / future tool would run unprompted;
+//   - a destructive-floor tool with ttl > 15m;
+//   - an attachment_path_allowlist entry that is "/", $HOME itself,
+//     /Users, /Volumes, or any ancestor of $HOME (the daemon would read
+//     any user file on a model's say-so).
+func enforceHardLimits(doc *document) error {
+	if doc.Defaults.Decision == DecisionAllow {
+		return errors.New("policy limit: defaults cannot be allow (unknown tools must stay denied or prompt)")
+	}
+	for _, name := range destructiveFloorTools {
+		p, ok := doc.Tools[name]
+		if !ok {
+			continue
+		}
+		if p.TTLDuration() > maxDestructiveTTL {
+			return fmt.Errorf("policy limit: %s ttl %q exceeds %s (destructive tool)", name, p.TTL, maxDestructiveTTL)
+		}
+	}
+	home, _ := homeDir()
+	for _, dir := range doc.AttachmentPathAllowlist {
+		if reason := tooBroadAllowlistEntry(dir, home); reason != "" {
+			return fmt.Errorf("policy limit: attachment_path_allowlist entry %q is %s", dir, reason)
+		}
+	}
+	return nil
+}
+
+// tooBroadAllowlistEntry returns why dir may not be an allowlist entry
+// ("" if it may). Checks both the lexical path and, when it exists, its
+// symlink-resolved form; comparisons are case-insensitive (APFS default).
+func tooBroadAllowlistEntry(dir, home string) string {
+	forms := []string{filepath.Clean(dir)}
+	if r, err := filepath.EvalSymlinks(dir); err == nil {
+		forms = append(forms, filepath.Clean(r))
+	}
+	var homes []string
+	if home != "" {
+		homes = append(homes, filepath.Clean(home))
+		if r, err := filepath.EvalSymlinks(home); err == nil {
+			homes = append(homes, filepath.Clean(r))
+		}
+	}
+	for _, d := range forms {
+		ld := strings.ToLower(d)
+		switch ld {
+		case "/":
+			return "the filesystem root"
+		case "/users", "/volumes", "/private/var/users":
+			return "a top-level user/volume directory"
+		}
+		for _, h := range homes {
+			lh := strings.ToLower(h)
+			if ld == lh {
+				return "your home directory"
+			}
+			if strings.HasPrefix(lh, ld+"/") {
+				return "an ancestor of your home directory"
+			}
+		}
+	}
+	return ""
 }
 
 func enforceDestructiveFloor(doc *document) error {
@@ -386,22 +567,49 @@ func DefaultOverridePath() (string, error) {
 // Used by `protonmcp policy show` to print the effective config —
 // users want to see what's actually in force, not just diff their
 // override against the default mentally.
+//
+// H6: every field is copied (the old snapshot dropped keep_alive, the
+// allowlist, idle lock and the attachment cap, so `policy show` hid
+// exactly the settings a hostile override would change).
 func (e *Engine) Snapshot() document {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	out := document{
-		Defaults: e.doc.Defaults,
-		Tools:    make(map[string]ToolPolicy, len(e.doc.Tools)),
-	}
+	out := e.doc
+	out.Tools = make(map[string]ToolPolicy, len(e.doc.Tools))
 	for k, v := range e.doc.Tools {
 		out.Tools[k] = v
 	}
+	out.AttachmentPathAllowlist = append([]string(nil), e.doc.AttachmentPathAllowlist...)
 	return out
+}
+
+// snapshotView is the `policy show` rendering: every global field is
+// printed even at its zero value (no omitempty), with the effective
+// attachment cap.
+type snapshotView struct {
+	Defaults                ToolPolicy            `yaml:"defaults"`
+	KeepAlive               bool                  `yaml:"keep_alive"`
+	IdleLockMinutes         int                   `yaml:"idle_lock_minutes"`
+	MaxAttachmentBytes      int64                 `yaml:"max_attachment_bytes"`
+	AttachmentPathAllowlist []string              `yaml:"attachment_path_allowlist"`
+	Tools                   map[string]ToolPolicy `yaml:"tools"`
 }
 
 // SnapshotYAML marshals Snapshot back to YAML for the `show` CLI.
 func (e *Engine) SnapshotYAML() ([]byte, error) {
-	return yaml.Marshal(e.Snapshot())
+	s := e.Snapshot()
+	allow := s.AttachmentPathAllowlist
+	if allow == nil {
+		allow = []string{}
+	}
+	return yaml.Marshal(snapshotView{
+		Defaults:                s.Defaults,
+		KeepAlive:               s.KeepAlive,
+		IdleLockMinutes:         s.IdleLockMinutes,
+		MaxAttachmentBytes:      e.MaxAttachmentBytes(),
+		AttachmentPathAllowlist: allow,
+		Tools:                   s.Tools,
+	})
 }
 
 func parseDocument(data []byte) (document, error) {

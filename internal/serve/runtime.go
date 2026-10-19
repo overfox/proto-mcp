@@ -25,6 +25,7 @@ import (
 	"github.com/just-an-oldsalt/proto-mcp/internal/approval"
 	"github.com/just-an-oldsalt/proto-mcp/internal/audit"
 	"github.com/just-an-oldsalt/proto-mcp/internal/caller"
+	"github.com/just-an-oldsalt/proto-mcp/internal/keystore"
 	"github.com/just-an-oldsalt/proto-mcp/internal/mcp"
 	"github.com/just-an-oldsalt/proto-mcp/internal/mcptools"
 	"github.com/just-an-oldsalt/proto-mcp/internal/policy"
@@ -618,7 +619,15 @@ func Setup(ctx context.Context, cfg SetupConfig) (*Runtime, error) {
 		_ = st.Close()
 		return nil, fmt.Errorf("policy override path: %w", err)
 	}
-	engine, err := policy.New(ctx, overridePath, logger)
+	// H6: an override that loosens the embedded defaults needs a Touch
+	// ID approval at the Mac (pinned helper, never Remote mode) unless
+	// its exact content was approved before.
+	engine, err := policy.NewWithGate(ctx, overridePath, logger, policyWeakeningGate(startupHelperPath, logger))
+	if err == nil {
+		if oerr := engine.OverrideError(); oerr != nil {
+			cfg.State.SetWarning(policyWarningKey, "policy.yaml not applied: "+oerr.Error())
+		}
+	}
 	if err != nil {
 		cleanupSession()
 		_ = st.Close()
@@ -681,8 +690,10 @@ func Setup(ctx context.Context, cfg SetupConfig) (*Runtime, error) {
 			case <-hupCh:
 				if rerr := engine.Reload(); rerr != nil {
 					logger.Warn("policy reload failed; previous policy retained", "err", rerr.Error())
+					cfg.State.SetWarning(policyWarningKey, "policy reload refused (previous policy kept): "+rerr.Error())
 					continue
 				}
+				cfg.State.SetWarning(policyWarningKey, "")
 				n := 0
 				if broker != nil {
 					n = broker.Invalidate()
@@ -812,7 +823,7 @@ func Setup(ctx context.Context, cfg SetupConfig) (*Runtime, error) {
 		// to the menu bar via state.json.
 		logger.Error("lockwatch helper not found; screen-lock and sleep auto-lock disabled",
 			"hint", "run `make lockwatch` from the repo root or reinstall")
-		cfg.State.SetWarning(LockwatchMissingWarning)
+		cfg.State.SetWarning(lockwatchWarningKey, LockwatchMissingWarning)
 	}
 
 	// PROTO-144 — background sync. Without this the local mirror only
@@ -831,6 +842,26 @@ func Setup(ctx context.Context, cfg SetupConfig) (*Runtime, error) {
 
 	setupOK = true
 	return rt, nil
+}
+
+// policyWeakeningGate is the daemon's H6 gate: approvals are stored in
+// policy.approved, HMAC'd with a key in its own Keychain item, and the
+// prompt is the Mac's own pin-verified Touch ID helper (the broker's
+// LocalApprover shape, but usable before the broker exists).
+func policyWeakeningGate(helperPath string, logger *slog.Logger) policy.Gate {
+	approvedPath, err := policy.DefaultApprovalPath()
+	if err != nil {
+		approvedPath = ""
+	}
+	store := policy.ApprovalStore{Path: approvedPath, Key: keystore.PolicyHMACKey}
+	return policy.TouchIDGate(store, func(ctx context.Context, title, body string) error {
+		return approval.PromptDirect(ctx, helperPath, approval.DirectPrompt{
+			Title:   title,
+			Body:    body,
+			Caller:  "protonmcp policy",
+			Timeout: startupGateTimeout,
+		}, logger)
+	}, logger)
 }
 
 // remotePath is remote.json's location ("" on a home-dir failure makes

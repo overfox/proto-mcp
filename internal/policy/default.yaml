@@ -26,8 +26,22 @@
 #                      ttl must be 0.
 #   destructive floor: mail_trash, mail_move, mail_label,
 #                      labels_delete, folders_delete,
-#                      mail_draft_delete, mail_delete_permanent —
-#                      never allow (prompt with any ttl, or deny).
+#                      mail_draft_delete, mail_delete_permanent,
+#                      rules_set, rules_run, rules_delete,
+#                      mail_report_spam — never allow (prompt with
+#                      ttl <= 15m, or deny).
+#   hard limits:       defaults: allow is refused; an
+#                      attachment_path_allowlist entry may not be /,
+#                      your home folder, /Users, /Volumes or any
+#                      ancestor of your home folder.
+#
+# Loosening anything else vs this file (a decision made more
+# permissive, a longer ttl, keep_alive on, a shorter idle lock, a
+# larger max_attachment_bytes, allowlist additions, removed
+# allowed_recipients) is held until you approve it with Touch ID at
+# the Mac. The approval is remembered for that exact file content
+# (policy.approved), so an unchanged file doesn't ask again.
+# `protonmcp policy show` lists the loosenings and their status.
 #
 # attachment_path_allowlist: absolute directories whose files can be
 # attached by path (attachments[].path) with no extra prompt. Files

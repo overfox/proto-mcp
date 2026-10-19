@@ -42,7 +42,7 @@ func TestIdleTrackerLogsOncePerEpisode(t *testing.T) {
 func TestStatePublisher_WarningInReason(t *testing.T) {
 	p := NewStatePublisher(t.TempDir()+"/state.json", discardLogger())
 	p.SetState(StateUnlocked, "", "a@b.c")
-	p.SetWarning(LockwatchMissingWarning)
+	p.SetWarning(lockwatchWarningKey, LockwatchMissingWarning)
 	doc := readState(t, p.path)
 	reason, _ := doc["reason"].(string)
 	if doc["warning"] != LockwatchMissingWarning || !strings.Contains(reason, "lockwatch helper missing") {

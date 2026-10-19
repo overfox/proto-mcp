@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"syscall"
 
+	"github.com/just-an-oldsalt/proto-mcp/internal/keystore"
 	"github.com/just-an-oldsalt/proto-mcp/internal/policy"
 )
 
@@ -78,7 +81,30 @@ func runPolicyShow(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	e, err := policy.New(ctx, overridePath, nil)
+	approvedPath, err := policy.DefaultApprovalPath()
+	if err != nil {
+		return err
+	}
+	store := policy.ApprovalStore{Path: approvedPath, Key: keystore.PolicyHMACKey}
+	return showPolicy(ctx, os.Stdout, overridePath, store)
+}
+
+// showPolicy renders the policy a daemon would run with (H6): every
+// field, then the override's loosenings vs the built-in defaults and
+// whether they carry a valid Touch ID approval. It never prompts: an
+// unapproved weakening is shown as pending and the effective policy as
+// the built-in defaults (what a starting daemon falls back to if the
+// prompt is declined).
+func showPolicy(ctx context.Context, w io.Writer, overridePath string, store policy.ApprovalStore) error {
+	ws, hash, aerr := policy.AnalyzeOverride(overridePath)
+	approved := hash != "" && store.Approved(hash)
+	gate := func(context.Context, []string, string) error {
+		if approved {
+			return nil
+		}
+		return policy.ErrWeakeningNotApproved
+	}
+	e, err := policy.NewWithGate(ctx, overridePath, slog.New(slog.NewTextHandler(io.Discard, nil)), gate)
 	if err != nil {
 		return err
 	}
@@ -86,7 +112,25 @@ func runPolicyShow(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	_, _ = os.Stdout.Write(out)
+	fmt.Fprintf(w, "# effective policy (built-in defaults + %s)\n", overridePath)
+	_, _ = w.Write(out)
+
+	fmt.Fprintln(w)
+	switch {
+	case aerr != nil:
+		fmt.Fprintf(w, "# override REJECTED (built-in defaults in force): %v\n", aerr)
+	case len(ws) == 0:
+		fmt.Fprintln(w, "# weakenings vs built-in defaults: none")
+	default:
+		status := "approved with Touch ID"
+		if !approved {
+			status = "NOT approved — not in force until approved with Touch ID at the Mac (`protonmcp policy reload`)"
+		}
+		fmt.Fprintf(w, "# weakenings vs built-in defaults (%s):\n", status)
+		for _, x := range ws {
+			fmt.Fprintf(w, "#   - %s\n", x)
+		}
+	}
 	return nil
 }
 
@@ -107,5 +151,11 @@ func runPolicyValidate(ctx context.Context, args []string) error {
 		return fmt.Errorf("policy %s is invalid: %w", args[0], err)
 	}
 	fmt.Printf("policy %s parses cleanly\n", args[0])
+	if ws, _, err := policy.AnalyzeOverride(args[0]); err == nil && len(ws) > 0 {
+		fmt.Println("it loosens the built-in defaults; the daemon will ask for Touch ID before applying it:")
+		for _, w := range ws {
+			fmt.Println("  -", w)
+		}
+	}
 	return nil
 }

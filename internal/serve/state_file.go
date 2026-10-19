@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -71,6 +73,7 @@ type StatePublisher struct {
 	keepAlive  func() bool
 	remote     func() bool
 	removed    bool
+	warnings   map[string]string
 
 	kick chan struct{}
 }
@@ -120,14 +123,38 @@ func (p *StatePublisher) SetRemote(fn func() bool) {
 	p.mu.Unlock()
 }
 
-// SetWarning records a standing degraded-security condition ("" clears
-// it) and rewrites the file. See stateDoc.Warning.
-func (p *StatePublisher) SetWarning(msg string) {
+// Warning sources (SetWarning keys).
+const (
+	lockwatchWarningKey = "lockwatch"
+	policyWarningKey    = "policy"
+)
+
+// SetWarning records a standing degraded-security condition from one
+// source (msg "" clears that source) and rewrites the file. See
+// stateDoc.Warning.
+func (p *StatePublisher) SetWarning(key, msg string) {
 	if p == nil {
 		return
 	}
 	p.mu.Lock()
-	p.doc.Warning = msg
+	if p.warnings == nil {
+		p.warnings = map[string]string{}
+	}
+	if msg == "" {
+		delete(p.warnings, key)
+	} else {
+		p.warnings[key] = msg
+	}
+	keys := make([]string, 0, len(p.warnings))
+	for k := range p.warnings {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, p.warnings[k])
+	}
+	p.doc.Warning = strings.Join(parts, "; ")
 	p.mu.Unlock()
 	p.write()
 }

@@ -36,7 +36,7 @@ func TestDestructiveFloorAcceptsPromptTTLAndDeny(t *testing.T) {
 tools:
   mail_trash:
     decision: prompt
-    ttl: 30m
+    ttl: 15m
   mail_move:
     decision: deny
   mail_delete_permanent:
@@ -46,8 +46,8 @@ tools:
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if d, p := e.Decide("mail_trash", nil, caller.Caller{}); d != DecisionPrompt || p.TTL != "30m" {
-		t.Errorf("mail_trash = %s ttl=%q, want prompt/30m", d, p.TTL)
+	if d, p := e.Decide("mail_trash", nil, caller.Caller{}); d != DecisionPrompt || p.TTL != "15m" {
+		t.Errorf("mail_trash = %s ttl=%q, want prompt/15m", d, p.TTL)
 	}
 	if d, _ := e.Decide("mail_move", nil, caller.Caller{}); d != DecisionDeny {
 		t.Errorf("mail_move = %s, want deny", d)
