@@ -3,18 +3,28 @@ package mcptools
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"os/exec"
+	"os/signal"
 	"path"
+	"runtime"
+	"runtime/debug"
+	"runtime/metrics"
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
 	"github.com/ledongthuc/pdf"
+	"golang.org/x/sys/unix"
 
 	"github.com/just-an-oldsalt/proto-mcp/internal/sanitize"
 )
@@ -28,13 +38,37 @@ import (
 
 // Extraction limits. Attachments are already capped at
 // max_attachment_bytes before they're decrypted; these bound the
-// expansion (zip bombs, pathological PDFs).
+// expansion (zip bombs, pathological PDFs). The parsers additionally
+// run in a resource-limited child process (extractTextIsolated below),
+// so a parser bug that loops or balloons kills only the child.
 const (
 	extractMaxZipEntryBytes = 64 << 20 // per decompressed XML part
 	extractMaxZipEntries    = 10000
 	extractPDFTimeBudget    = 20 * time.Second
 	extractMaxSheets        = 200
+
+	// PDF page tree walk (pdfPageList): a self-referential /Kids
+	// (2 0 obj << /Type /Pages /Kids [2 0 R] >>) made the library's
+	// Page(i) descend forever.
+	extractPDFMaxTreeDepth = 64
+	extractPDFMaxTreeNodes = 100000
+
+	// XLSX amplification: one shared string can be referenced from
+	// every cell, so output is budgeted per cell append, not per row.
+	extractMaxSharedStrings     = 1 << 20
+	extractMaxSharedStringBytes = 32 << 10
+	extractMaxCellsPerRow       = 1000
 )
+
+// extractOutputBudget is the byte budget an extractor may produce for
+// a rune limit: limit*4 bytes always holds at least limit runes, so a
+// cut at the budget still fills the caller's window.
+func extractOutputBudget(limit int) int {
+	if limit <= 0 {
+		limit = maxReadMaxChars
+	}
+	return limit*4 + 1024
+}
 
 // errUnsupportedFormat is returned for types we can't extract text from.
 var errUnsupportedFormat = errors.New("unsupported attachment type for text extraction")
@@ -83,15 +117,17 @@ func detectFormat(mimeType, filename string, content []byte) string {
 	return ""
 }
 
-// extractText dispatches on format. limit is a rune budget: extractors
-// may stop once they have produced more than limit runes (the caller
-// truncates precisely and reports truncated).
+// extractText dispatches on format, in this process. limit is a rune
+// budget: extractors may stop once they have produced more than limit
+// runes (the caller truncates precisely and reports truncated). Tool
+// handlers use extractTextIsolated, which runs the document parsers
+// out of process.
 func extractText(format string, content []byte, limit int) (string, error) {
 	switch format {
 	case "pdf":
 		return extractPDF(content, limit)
 	case "docx":
-		return extractDOCX(content)
+		return extractDOCXLimit(content, limit)
 	case "xlsx":
 		return extractXLSX(content, limit)
 	case "html":
@@ -139,14 +175,18 @@ func extractPDF(content []byte, limit int) (out string, err error) {
 		return "", fmt.Errorf("pdf open: %w", err)
 	}
 	deadline := time.Now().Add(extractPDFTimeBudget)
+	pages, err := pdfPageList(r)
+	if err != nil {
+		return "", err
+	}
 	var b strings.Builder
-	n := r.NumPage()
+	n := len(pages)
 	for i := 1; i <= n; i++ {
 		if time.Now().After(deadline) {
 			b.WriteString(fmt.Sprintf("\n[extraction stopped after %d of %d pages: time budget]\n", i-1, n))
 			break
 		}
-		text, perr := r.Page(i).GetPlainText(nil)
+		text, perr := pages[i-1].GetPlainText(nil)
 		if perr != nil {
 			b.WriteString(fmt.Sprintf("\n[page %d: text could not be extracted]\n", i))
 			continue
@@ -164,6 +204,44 @@ func extractPDF(content []byte, limit int) (out string, err error) {
 		return "", errors.New("pdf contains no extractable text (likely a scanned image; OCR is not supported)")
 	}
 	return strings.TrimSpace(s), nil
+}
+
+// pdfPageList walks the page tree once, depth-first in document order,
+// and returns the leaf pages. Unlike the library's Page(i) (which
+// re-descends from the root for every page, trusting /Count) it is
+// bounded: a /Kids cycle or an absurdly deep or wide tree is an error
+// rather than an endless loop.
+func pdfPageList(r *pdf.Reader) ([]pdf.Page, error) {
+	var (
+		pages []pdf.Page
+		nodes int
+	)
+	var walk func(v pdf.Value, depth int) error
+	walk = func(v pdf.Value, depth int) error {
+		nodes++
+		if nodes > extractPDFMaxTreeNodes {
+			return fmt.Errorf("pdf page tree has more than %d nodes; refusing", extractPDFMaxTreeNodes)
+		}
+		switch v.Key("Type").Name() {
+		case "Page":
+			pages = append(pages, pdf.Page{V: v})
+		case "Pages":
+			if depth >= extractPDFMaxTreeDepth {
+				return errors.New("pdf page tree is cyclic or nested too deeply; refusing")
+			}
+			kids := v.Key("Kids")
+			for i := 0; i < kids.Len(); i++ {
+				if err := walk(kids.Index(i), depth+1); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	if err := walk(r.Trailer().Key("Root").Key("Pages"), 0); err != nil {
+		return nil, err
+	}
+	return pages, nil
 }
 
 // openZip opens content as a zip archive with an entry-count bound.
@@ -215,6 +293,12 @@ func newXMLDecoder(b []byte) *xml.Decoder {
 // extractDOCX walks word/document.xml: text runs (w:t), tabs, breaks,
 // and paragraph ends. Tables come out cell-per-tab, row-per-line.
 func extractDOCX(content []byte) (string, error) {
+	return extractDOCXLimit(content, 0)
+}
+
+// extractDOCXLimit is extractDOCX that stops once the output passes
+// extractOutputBudget(limit).
+func extractDOCXLimit(content []byte, limit int) (string, error) {
 	zr, err := openZip(content)
 	if err != nil {
 		return "", err
@@ -223,10 +307,11 @@ func extractDOCX(content []byte) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	budget := extractOutputBudget(limit)
 	var b strings.Builder
 	d := newXMLDecoder(doc)
 	inText := false
-	for {
+	for b.Len() <= budget {
 		tok, err := d.Token()
 		if err == io.EOF {
 			break
@@ -278,6 +363,7 @@ func extractXLSX(content []byte, limit int) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	budget := extractOutputBudget(limit)
 	var b strings.Builder
 	for i, sh := range sheets {
 		if i >= extractMaxSheets {
@@ -289,12 +375,12 @@ func extractXLSX(content []byte, limit int) (string, error) {
 			b.WriteString(fmt.Sprintf("## Sheet: %s\n[unreadable: %v]\n\n", sh.name, err))
 			continue
 		}
-		b.WriteString("## Sheet: " + sh.name + "\n")
-		if err := xlsxWriteSheet(&b, data, shared, limit); err != nil {
+		b.WriteString("## Sheet: " + clipRunes(sh.name, 200) + "\n")
+		if err := xlsxWriteSheet(&b, data, shared, budget); err != nil {
 			b.WriteString(fmt.Sprintf("[parse error: %v]\n", err))
 		}
 		b.WriteString("\n")
-		if limit > 0 && b.Len() > limit*4 && utf8.RuneCountInString(b.String()) > limit {
+		if b.Len() >= budget {
 			break
 		}
 	}
@@ -337,6 +423,11 @@ func xlsxSharedStrings(zr *zip.Reader) ([]string, error) {
 			switch t.Name.Local {
 			case "si":
 				inSI = false
+				if len(out) >= extractMaxSharedStrings {
+					// Later indexes stay unresolved (rendered as the
+					// raw index) rather than growing without bound.
+					return out, nil
+				}
 				out = append(out, cur.String())
 			case "t":
 				inT = false
@@ -345,7 +436,14 @@ func xlsxSharedStrings(zr *zip.Reader) ([]string, error) {
 			}
 		case xml.CharData:
 			if inSI && inT && !inRPh {
-				cur.Write(t)
+				// Cap each string: one 8 MiB string referenced from
+				// every cell was a 1.5 GiB allocation.
+				if room := extractMaxSharedStringBytes - cur.Len(); room > 0 {
+					if len(t) > room {
+						t = t[:room]
+					}
+					cur.Write(t)
+				}
 			}
 		}
 	}
@@ -433,18 +531,26 @@ func sheetNum(name string) int {
 
 // xlsxWriteSheet streams one worksheet's cells as TSV rows. Column
 // gaps are preserved using the cell reference (A1, C1 → "a\t\tc").
-func xlsxWriteSheet(b *strings.Builder, data []byte, shared []string, limit int) error {
+// budget is the size b may reach: it is charged per cell as the cell is
+// added (a row of 60 references to one large shared string must not be
+// joined first and measured after), rows are capped at
+// extractMaxCellsPerRow cells whether or not cells carry r=, and the
+// sheet stops once the budget is spent.
+func xlsxWriteSheet(b *strings.Builder, data []byte, shared []string, budget int) error {
 	d := newXMLDecoder(data)
 	var (
 		row      []string
+		rowBytes int
 		cellType string
 		cellCol  int
 		inV      bool
 		inIsT    bool
 		val      strings.Builder
 		inCell   bool
+		full     bool
 	)
 	flushRow := func() {
+		defer func() { rowBytes = 0 }()
 		// Trim trailing empties.
 		end := len(row)
 		for end > 0 && row[end-1] == "" {
@@ -513,14 +619,33 @@ func xlsxWriteSheet(b *strings.Builder, data []byte, shared []string, limit int)
 					}
 				}
 				// Cap absurd column indexes (a crafted r="XFD1048576"
-				// would otherwise allocate a 16k-wide row per cell).
-				if cellCol > 1000 {
+				// would otherwise allocate a 16k-wide row per cell),
+				// and the row width itself (cells without r= append).
+				if cellCol >= extractMaxCellsPerRow {
 					cellCol = len(row)
 				}
+				if cellCol >= extractMaxCellsPerRow {
+					continue // row full: drop the cell
+				}
+				// Charge the budget before keeping the cell; the gap
+				// tabs count too.
+				cost := len(text) + 1
+				if cellCol > len(row) {
+					cost += cellCol - len(row)
+				}
+				if room := budget - b.Len() - rowBytes; cost > room {
+					full = true
+					if room <= 1 {
+						continue
+					}
+					text = text[:room-1]
+					cost = room
+				}
+				rowBytes += cost
 				for len(row) < cellCol {
 					row = append(row, "")
 				}
-				text = strings.NewReplacer("\t", " ", "\n", " ", "\r", " ").Replace(text)
+				text = cellReplacer.Replace(text)
 				if cellCol < len(row) {
 					row[cellCol] = text
 				} else {
@@ -528,19 +653,318 @@ func xlsxWriteSheet(b *strings.Builder, data []byte, shared []string, limit int)
 				}
 			case "row":
 				flushRow()
-				if limit > 0 && b.Len() > limit*4 {
+				if full || b.Len() >= budget {
 					return nil
 				}
 			}
 		case xml.CharData:
 			if inCell && (inV || inIsT) {
-				val.Write(t)
+				if room := extractMaxSharedStringBytes - val.Len(); room > 0 {
+					if len(t) > room {
+						t = t[:room]
+					}
+					val.Write(t)
+				}
 			}
 		}
 	}
 	flushRow()
 	return nil
 }
+
+// --- out-of-process extraction (SECURITY H5) ----------------------
+//
+// The PDF / DOCX / XLSX parsers chew on attacker-supplied bytes, and a
+// budget checked between pages can't stop a parser that never returns
+// (a 300-byte PDF with a self-referential page tree spun forever inside
+// the library). So the daemon re-executes its own binary with a hidden
+// subcommand, feeds the document on stdin and reads the text from
+// stdout:
+//
+//	<self> __extract-text <pdf|docx|xlsx> <max_chars>
+//
+// The child gets an empty environment (GOMAXPROCS aside) and only
+// stdin/stdout/stderr, sets its own rlimits before reading the input
+// (CPU 20 s, no file writes, no core files, 16 descriptors, data
+// segment where the OS enforces it), caps its Go heap and runs a
+// watchdog that exits past extractChildMaxMemory (darwin doesn't
+// enforce RLIMIT_DATA / RLIMIT_AS, so the watchdog is the real memory
+// bound there). The parent kills it after extractSandboxTimeout and
+// caps what it reads back. The child never touches the session, the
+// Keychain or the store: the dispatch runs before anything in main.
+//
+// A binary that didn't install the dispatch (MaybeRunExtractTextChild)
+// falls back to in-process extraction under a goroutine timeout. That
+// returns to the caller on time but cannot stop the parser: a hostile
+// document can leave a goroutine spinning until the process exits.
+
+// ExtractTextSubcommand is the hidden argv[1] that turns a binary into
+// the extraction child.
+const ExtractTextSubcommand = "__extract-text"
+
+const (
+	extractInProcessTimeout = 20 * time.Second
+	extractChildMaxInput    = 256 << 20
+	extractChildMaxMemory   = 1 << 30
+	extractChildGoMemLimit  = 512 << 20
+	extractChildStderrMax   = 2048
+)
+
+// extractSandboxEnabled is set when this binary can serve as the
+// extraction child (MaybeRunExtractTextChild ran in main / TestMain).
+var extractSandboxEnabled atomic.Bool
+
+// Swapped in tests.
+var (
+	// extractExecutable locates the binary to re-execute.
+	extractExecutable = os.Executable
+	// extractSandboxTimeout bounds the child's wall-clock time.
+	extractSandboxTimeout = 30 * time.Second
+	// extractChildEnv is the child's whole environment: nothing from
+	// ours (no tokens, no paths), just a small thread count.
+	extractChildEnv = []string{"GOMAXPROCS=2"}
+	// extractTextFn is the extractor the child and the in-process
+	// fallback run.
+	extractTextFn = extractText
+	// extractChildCPUSeconds is the child's RLIMIT_CPU (soft; hard is +1).
+	extractChildCPUSeconds uint64 = 20
+)
+
+// MaybeRunExtractTextChild must be called first thing in a binary that
+// can host mail_attachment_text: when argv[1] is ExtractTextSubcommand
+// it runs the extraction child and exits; otherwise it records that
+// this binary supports the subcommand and returns.
+func MaybeRunExtractTextChild() {
+	if len(os.Args) >= 2 && os.Args[1] == ExtractTextSubcommand {
+		os.Exit(runExtractTextChild(os.Args[2:], os.Stdin, os.Stdout, os.Stderr))
+	}
+	extractSandboxEnabled.Store(true)
+}
+
+// sandboxedFormat reports whether format's parser runs out of process.
+func sandboxedFormat(format string) bool {
+	switch format {
+	case "pdf", "docx", "xlsx":
+		return true
+	}
+	return false
+}
+
+// extractTextIsolated is the tool-facing extractor: it returns the
+// text (at most limit runes) and the extracted length before that cut.
+// PDF / DOCX / XLSX run in the sandboxed child when available.
+func extractTextIsolated(ctx context.Context, format string, content []byte, limit int) (string, int, error) {
+	if !sandboxedFormat(format) {
+		text, err := extractText(format, content, limit)
+		return text, utf8.RuneCountInString(text), err
+	}
+	if extractSandboxEnabled.Load() {
+		return extractTextSubprocess(ctx, format, content, limit)
+	}
+	return extractTextInProcessGuarded(ctx, format, content, limit, extractInProcessTimeout)
+}
+
+// extractTextInProcessGuarded runs extractText on a goroutine and gives
+// up after timeout. The goroutine is NOT stopped (Go can't); see the
+// residual-risk note above.
+func extractTextInProcessGuarded(ctx context.Context, format string, content []byte, limit int, timeout time.Duration) (string, int, error) {
+	type result struct {
+		text string
+		err  error
+	}
+	fn := extractTextFn
+	ch := make(chan result, 1) // buffered: a late finisher must not block
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				ch <- result{err: fmt.Errorf("%s parse failed: %v", format, r)}
+			}
+		}()
+		text, err := fn(format, content, limit)
+		ch <- result{text: text, err: err}
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			return "", 0, r.err
+		}
+		return r.text, utf8.RuneCountInString(r.text), nil
+	case <-timer.C:
+		return "", 0, fmt.Errorf("text extraction gave up after %s (the document may be malformed or hostile)", timeout)
+	case <-ctx.Done():
+		return "", 0, ctx.Err()
+	}
+}
+
+// cappedBuffer collects at most max bytes. Past that it either fails
+// the write (so exec stops copying and the child dies on a broken
+// pipe) or, with truncate, silently drops the rest.
+type cappedBuffer struct {
+	buf      bytes.Buffer
+	max      int
+	truncate bool
+	overflow bool
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	if room := c.max - c.buf.Len(); len(p) > room {
+		c.overflow = true
+		if room > 0 {
+			c.buf.Write(p[:room])
+		}
+		if c.truncate {
+			return len(p), nil
+		}
+		return 0, errors.New("output limit exceeded")
+	}
+	return c.buf.Write(p)
+}
+
+// extractTextSubprocess runs the extraction child and parses its
+// "<total runes>\n<text>" reply.
+func extractTextSubprocess(ctx context.Context, format string, content []byte, limit int) (string, int, error) {
+	exe, err := extractExecutable()
+	if err != nil {
+		return "", 0, fmt.Errorf("text extraction unavailable: locate executable: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(ctx, extractSandboxTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, exe, ExtractTextSubcommand, format, strconv.Itoa(limit))
+	cmd.Env = extractChildEnv
+	cmd.Dir = "/"
+	cmd.Stdin = bytes.NewReader(content)
+	stdout := &cappedBuffer{max: extractOutputBudget(limit) + 32}
+	stderr := &cappedBuffer{max: extractChildStderrMax, truncate: true}
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	cmd.WaitDelay = 2 * time.Second
+	runErr := cmd.Run()
+
+	switch {
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		return "", 0, fmt.Errorf("text extraction was stopped after %s (the document may be malformed or hostile)", extractSandboxTimeout)
+	case stdout.overflow:
+		return "", 0, errors.New("text extraction produced more output than allowed; refusing")
+	case runErr != nil:
+		var ee *exec.ExitError
+		if errors.As(runErr, &ee) {
+			msg := strings.TrimSpace(cleanPlainText(stderr.buf.Bytes()))
+			if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+				return "", 0, fmt.Errorf("text extraction was stopped (%s): the document exceeded the extractor's CPU or memory limits", ws.Signal())
+			}
+			if ee.ExitCode() == 2 && msg != "" {
+				return "", 0, errors.New(clipRunes(msg, 500))
+			}
+			switch ee.ExitCode() {
+			case 3:
+				return "", 0, errors.New("text extraction was stopped: the document exceeded the extractor's memory limit")
+			case 4:
+				return "", 0, errors.New("text extraction was stopped: the document exceeded the extractor's CPU limit")
+			}
+		}
+		return "", 0, fmt.Errorf("text extraction failed: %v", runErr)
+	}
+	out := stdout.buf.String()
+	head, text, ok := strings.Cut(out, "\n")
+	total, perr := strconv.Atoi(head)
+	if !ok || perr != nil || total < 0 {
+		return "", 0, errors.New("text extraction returned a malformed reply")
+	}
+	if !utf8.ValidString(text) {
+		text = strings.ToValidUTF8(text, "�")
+	}
+	return text, total, nil
+}
+
+// runExtractTextChild is the child side: args are <format> <max_chars>.
+// Exit 0 → "<total runes>\n<text cut to max_chars>" on stdout; exit 2 →
+// an extraction error on stderr; exit 3 → memory watchdog; exit 4 →
+// CPU limit.
+func runExtractTextChild(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) != 2 || !sandboxedFormat(args[0]) {
+		fmt.Fprintf(stderr, "usage: %s <pdf|docx|xlsx> <max_chars>", ExtractTextSubcommand)
+		return 2
+	}
+	limit, err := strconv.Atoi(args[1])
+	if err != nil || limit < 0 || limit > maxReadMaxChars {
+		fmt.Fprintf(stderr, "invalid max_chars %q", args[1])
+		return 2
+	}
+	applyExtractChildLimits(stderr)
+	startExtractMemoryWatchdog(extractChildMaxMemory, stderr)
+
+	content, err := io.ReadAll(io.LimitReader(stdin, extractChildMaxInput+1))
+	if err != nil {
+		fmt.Fprintf(stderr, "read input: %v", err)
+		return 2
+	}
+	if len(content) > extractChildMaxInput {
+		fmt.Fprintf(stderr, "input larger than %d bytes; refusing", extractChildMaxInput)
+		return 2
+	}
+	text, err := extractTextFn(args[0], content, limit)
+	if err != nil {
+		fmt.Fprint(stderr, err.Error())
+		return 2
+	}
+	total := utf8.RuneCountInString(text)
+	text, _ = truncateRunes(text, limit)
+	if _, err := fmt.Fprintf(stdout, "%d\n%s", total, text); err != nil {
+		return 2
+	}
+	return 0
+}
+
+// applyExtractChildLimits sets the child's rlimits. Best-effort: a
+// limit the OS refuses is skipped (the parent timeout and the memory
+// watchdog still apply).
+func applyExtractChildLimits(stderr io.Writer) {
+	set := func(res int, v uint64) {
+		_ = unix.Setrlimit(res, &unix.Rlimit{Cur: v, Max: v})
+	}
+	// The soft CPU limit raises SIGXCPU, which the Go runtime ignores
+	// unless asked for it, and darwin doesn't SIGKILL at the hard
+	// limit: catch it and exit.
+	xcpu := make(chan os.Signal, 1)
+	signal.Notify(xcpu, syscall.SIGXCPU)
+	go func() {
+		<-xcpu
+		fmt.Fprintf(stderr, "CPU limit (%ds) exceeded", extractChildCPUSeconds)
+		os.Exit(4)
+	}()
+	_ = unix.Setrlimit(unix.RLIMIT_CPU, &unix.Rlimit{Cur: extractChildCPUSeconds, Max: extractChildCPUSeconds + 1})
+	set(unix.RLIMIT_FSIZE, 0)
+	set(unix.RLIMIT_CORE, 0)
+	set(unix.RLIMIT_NOFILE, 16)
+	if runtime.GOOS == "darwin" {
+		// Accepted but not enforced by darwin; enforced elsewhere it
+		// would also count the Go runtime's reservations, so only
+		// set it where it is harmless.
+		set(unix.RLIMIT_DATA, extractChildMaxMemory)
+	}
+	debug.SetMemoryLimit(extractChildGoMemLimit)
+}
+
+// startExtractMemoryWatchdog exits the child once the Go runtime has
+// mapped more than limit bytes.
+func startExtractMemoryWatchdog(limit uint64, stderr io.Writer) {
+	sample := []metrics.Sample{{Name: "/memory/classes/total:bytes"}}
+	go func() {
+		t := time.NewTicker(20 * time.Millisecond)
+		defer t.Stop()
+		for range t.C {
+			metrics.Read(sample)
+			if sample[0].Value.Kind() == metrics.KindUint64 && sample[0].Value.Uint64() > limit {
+				fmt.Fprintf(stderr, "memory limit (%d bytes) exceeded", limit)
+				os.Exit(3)
+			}
+		}
+	}()
+}
+
+// cellReplacer keeps a cell on one TSV field.
+var cellReplacer = strings.NewReplacer("\t", " ", "\n", " ", "\r", " ")
 
 // colIndex converts the column letters of a cell reference ("C7" → 2).
 func colIndex(ref string) (int, bool) {

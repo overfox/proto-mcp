@@ -36,12 +36,10 @@ const inlineAttachmentMaxBytes = 16 * 1024
 // Store.EvictAttachmentsToFit at this cap, deleting the oldest
 // cached_at rows until the SUM(size_bytes) is back under it.
 //
-// 500 MiB is the v1 number: ten 50-MiB attachments worth of slack
-// before eviction kicks in, while still bounding the worst-case
-// disk footprint to something a laptop user won't notice. Not
-// user-configurable in v1 — adding a config knob is cheap if
-// someone asks for it.
-const attachmentCacheCeilingBytes int64 = 500 * 1024 * 1024
+// It is store.DefaultAttachmentCacheMaxBytes (256 MiB), the same cap
+// the startup / daily retention sweep enforces (SECURITY M1: the cache
+// is plaintext at rest, so it is kept small and short-lived).
+const attachmentCacheCeilingBytes = store.DefaultAttachmentCacheMaxBytes
 
 func mailDownloadAttachment(deps Deps) mcp.Tool {
 	type input struct {
@@ -71,7 +69,7 @@ func mailDownloadAttachment(deps Deps) mcp.Tool {
 			"written to a local staging file and the response carries its path instead (keeping the " +
 			"response under the MCP token cap) — use mail_save_attachment to copy it somewhere permanent. " +
 			"Either way a sha256 of the plaintext is returned. On first call, fetches from Proton, decrypts " +
-			"with the address keyring, and caches locally for 30 days; subsequent calls return from cache. " +
+			"with the address keyring, and caches locally (7 days, 256 MiB cap); subsequent calls return from cache. " +
 			"Refuses attachments larger than max_attachment_bytes (policy; default 25 MiB) before any " +
 			"network traffic. Filenames are sanitized — RTL spoofing, control chars, path separators, and " +
 			"leading dots are stripped to defend the display + save paths.",
@@ -209,7 +207,7 @@ func mailDownloadAttachment(deps Deps) mcp.Tool {
 				slog.Warn("attachment_cache write failed; returning uncached", "err", err.Error(),
 					"message_id", payload.MessageID, "attachment_id", payload.AttachmentID)
 			} else {
-				// Best-effort eviction down to the 500 MiB ceiling.
+				// Best-effort eviction down to the 256 MiB ceiling.
 				// Errors only show up in the log; the user still gets
 				// their bytes.
 				if n, evictErr := deps.Store.EvictAttachmentsToFit(ctx.Std, attachmentCacheCeilingBytes); evictErr != nil {
@@ -283,7 +281,7 @@ func stagingDir() (string, error) {
 // dir stays bounded by the number of distinct large attachments fetched,
 // not the call count. Mode 0600 in a 0700 dir, mirroring the on-disk
 // hardening the SQLite cache and socket already use. The bytes are also
-// in the 500 MiB-capped SQLite cache; this is the filesystem handoff for
+// in the 256 MiB-capped SQLite cache; this is the filesystem handoff for
 // callers that can't read base64 out of a token-capped response.
 //
 // Retention: the file is swept by SweepStagingOlderThan (wired into
@@ -296,6 +294,10 @@ func writeAttachmentStaging(attachmentID, filename string, content []byte) (stri
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("mkdir staging: %w", err)
+	}
+	// Decrypted plaintext: keep it out of Time Machine. Best-effort.
+	if xerr := store.ExcludeFromBackup(dir); xerr != nil {
+		slog.Warn("attachment staging: could not exclude from Time Machine", "path", dir, "err", xerr.Error())
 	}
 
 	// Both components are sanitized + Base'd so neither the

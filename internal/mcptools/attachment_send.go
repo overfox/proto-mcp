@@ -135,7 +135,7 @@ func decodeAttachmentsGated(deps Deps, atts []sendAttachmentInput, gate attachme
 		var size int64
 		switch {
 		case a.Path != "":
-			r, err := resolveAttachmentPath(deps, a.Path)
+			r, err := resolveAttachmentPathForRead(deps, a.Path)
 			if err != nil {
 				return nil, fmt.Errorf("attachments[%d]: %w", i, err)
 			}

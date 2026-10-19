@@ -96,6 +96,12 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
 
+	// SECURITY M1: keep decrypted mail out of Time Machine. After
+	// migrate so the WAL / SHM sidecars exist.
+	if path != ":memory:" {
+		excludeStoreFromBackup(path)
+	}
+
 	return &Store{DB: db, Path: path}, nil
 }
 
