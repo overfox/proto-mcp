@@ -122,7 +122,23 @@ func openRotatedDaemonLog() (io.WriteCloser, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("mkdir %s: %w", dir, err)
 	}
-	return logging.NewRotator(filepath.Join(dir, "daemon.log"), 0, 0)
+	logPath := filepath.Join(dir, "daemon.log")
+	tightenLogPerms(dir, logPath)
+	return logging.NewRotator(logPath, 0, 0)
+}
+
+// tightenLogPerms forces the log dir to 0700 and the log file to 0600.
+// launchd creates StandardErrorPath (daemon.log) itself, under its own
+// 022 umask, BEFORE we run — confirmed 0644 on a live install — and
+// MkdirAll doesn't change an existing directory's mode. Best effort; a
+// symlinked log path or dir is left alone (Lstat).
+func tightenLogPerms(dir, logPath string) {
+	if fi, err := os.Lstat(dir); err == nil && fi.IsDir() && fi.Mode().Perm() != 0o700 {
+		_ = os.Chmod(dir, 0o700)
+	}
+	if fi, err := os.Lstat(logPath); err == nil && fi.Mode().IsRegular() && fi.Mode().Perm()&0o077 != 0 {
+		_ = os.Chmod(logPath, 0o600)
+	}
 }
 
 func run() error {
@@ -136,6 +152,12 @@ func run() error {
 	if fs.NArg() > 0 {
 		return fmt.Errorf("protonmcpd takes no positional arguments; got %v", fs.Args())
 	}
+
+	// Owner-only umask for every file the daemon creates from here on
+	// (store.db + WAL, audit.log, state.json, staged attachments,
+	// rotated logs), matching cmd/protonmcp. The daemon used to run
+	// with launchd's 022 umask.
+	syscall.Umask(0o077)
 
 	// SIGTERM / SIGINT cancel ctx (clean shutdown). SIGHUP is
 	// handled inside the Runtime (policy reload). Same split as

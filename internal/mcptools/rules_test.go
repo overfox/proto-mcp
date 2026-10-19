@@ -232,7 +232,7 @@ func TestApplyAutoRules(t *testing.T) {
 	callTool(t, rulesSet(deps), `{"name":"auto-star","query":"from:bank.example","actions":[{"star":true}],"auto":true}`, nil)
 	callTool(t, rulesSet(deps), `{"name":"manual-read","query":"from:news","actions":[{"mark_read":true}]}`, nil)
 
-	rep, err := ApplyAutoRules(ctx, deps)
+	rep, err := ApplyAutoRules(ctx, deps, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,7 +254,7 @@ func TestApplyAutoRules(t *testing.T) {
 	if wm, err := f.st.GetSyncState(ctx, rulesAutoWatermarkKey); err != nil || wm == "" {
 		t.Errorf("watermark not stored: %q %v", wm, err)
 	}
-	rep, err = ApplyAutoRules(ctx, deps)
+	rep, err = ApplyAutoRules(ctx, deps, nil)
 	if err != nil || rep.Since.Before(time.Now().Add(-rulesAutoOverlap-time.Minute)) {
 		t.Errorf("second pass should start near the watermark: %+v %v", rep.Since, err)
 	}

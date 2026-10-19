@@ -298,7 +298,7 @@ func runWhoami(ctx context.Context, args []string) error {
 	defer cancel()
 
 	start := time.Now()
-	bundle, err := acquireSession(acquireCtx)
+	bundle, err := acquireSession(acquireCtx, "whoami")
 	if err != nil {
 		return err
 	}

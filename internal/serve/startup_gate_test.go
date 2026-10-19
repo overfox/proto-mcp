@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/just-an-oldsalt/proto-mcp/internal/approval"
 )
 
 func fakeHelper(t *testing.T, script string) string {
@@ -62,6 +64,47 @@ func TestPromptStartupTouchID_ParentCancel(t *testing.T) {
 	err := promptStartupTouchID(ctx, fakeHelper(t, "sleep 5"), discardLogger())
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+}
+
+// SECURITY M4 — the startup gate verifies the helper's pinned SHA-256
+// before exec. A helper that would approve (exit 0) but doesn't match
+// the pin must be refused without running and without the inner acquire
+// (the Keychain load) being reached.
+func TestStartupGate_RefusesHelperWithWrongHash(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "ran")
+	helper := fakeHelper(t, "cat >/dev/null; touch "+marker+"; exit 0")
+	restore := approval.SetTouchIDHashForTesting(strings.Repeat("0f", 32))
+	defer restore()
+
+	innerCalled := false
+	acq := newStartupGatedAcquire(helper, func(context.Context) (SessionBundle, error) {
+		innerCalled = true
+		return fakeBundle{}, nil
+	}, discardLogger())
+	_, err := acq(context.Background())
+	if !errors.Is(err, ErrTouchIDGate) || !errors.Is(err, approval.ErrHelperUntrusted) {
+		t.Fatalf("err = %v, want ErrTouchIDGate wrapping ErrHelperUntrusted", err)
+	}
+	if innerCalled {
+		t.Fatal("session acquire ran despite an untrusted helper")
+	}
+	if _, serr := os.Stat(marker); serr == nil {
+		t.Fatal("untrusted helper was executed")
+	}
+}
+
+// The unlock requester is named in the dialog body.
+func TestStartupGate_NamesRequester(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "stdin")
+	helper := fakeHelper(t, "cat > "+out)
+	ctx := withUnlockRequester(context.Background(), "proton_connect from claude (pid 42)")
+	if err := promptStartupTouchID(ctx, helper, discardLogger()); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(out)
+	if !strings.Contains(string(got), "Requested by: proton_connect from claude (pid 42)") {
+		t.Fatalf("helper payload %s does not name the requester", got)
 	}
 }
 

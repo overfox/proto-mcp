@@ -1,14 +1,13 @@
 package serve
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
-	"os/exec"
 	"time"
+
+	"github.com/just-an-oldsalt/proto-mcp/internal/approval"
 )
 
 // newStartupGatedAcquire wraps an AcquireSession callback with a
@@ -18,14 +17,17 @@ import (
 // Why this exists vs. just calling broker.Request: at the point we
 // need to gate startup, the broker hasn't been constructed yet
 // (broker construction is step 7 in Setup, AcquireSession is step
-// 3). We invoke the helper directly with a minimal payload matching
-// the helper's stdin JSON contract.
+// 3). We invoke the helper directly (approval.PromptDirect) with a
+// minimal payload matching the helper's stdin JSON contract.
 //
-// The helper exec is intentionally narrow: empty Args, a fixed
-// title/body, and the daemon's own PID as caller. Unlock-driven
-// re-acquires hit the SAME wrapper (because rt.acquireSession is
-// the gated callback), so SIGUSR2 also Touch-ID-prompts before
-// touching the keychain.
+// SECURITY M4: PromptDirect re-verifies the helper's pinned SHA-256
+// before every exec, exactly like the broker — this gate used to exec
+// whatever sat at helperPath unverified.
+//
+// Unlock-driven re-acquires hit the SAME wrapper (because
+// rt.acquireSession is the gated callback), so SIGUSR2 and
+// proton_connect also Touch-ID-prompt before touching the keychain;
+// the requester (withUnlockRequester) is named in the dialog.
 func newStartupGatedAcquire(helperPath string, inner func(context.Context) (SessionBundle, error), logger *slog.Logger) func(context.Context) (SessionBundle, error) {
 	return func(ctx context.Context) (SessionBundle, error) {
 		if err := promptStartupTouchID(ctx, helperPath, logger); err != nil {
@@ -48,55 +50,33 @@ var ErrTouchIDGate = errors.New("touch-id startup gate")
 // can shorten it.
 var startupGateTimeout = 60 * time.Second
 
+type unlockRequesterKey struct{}
+
+// withUnlockRequester names who asked for an unlock ("proton_connect
+// from claude (pid 123)", "SIGUSR2 (protonmcp unlock / menu bar)") so
+// the Touch ID dialog can say so.
+func withUnlockRequester(ctx context.Context, who string) context.Context {
+	return context.WithValue(ctx, unlockRequesterKey{}, who)
+}
+
+func unlockRequester(ctx context.Context) string {
+	v, _ := ctx.Value(unlockRequesterKey{}).(string)
+	return v
+}
+
 func promptStartupTouchID(ctx context.Context, helperPath string, logger *slog.Logger) error {
-	payload, _ := json.Marshal(struct {
-		Title   string `json:"title"`
-		Body    string `json:"body"`
-		Caller  string `json:"caller"`
-		Confirm bool   `json:"confirm"`
-	}{
+	body := "Touch ID required to unlock your saved Proton session so Claude can access Proton Mail."
+	if who := unlockRequester(ctx); who != "" {
+		body += "\n\nRequested by: " + who
+	}
+	err := approval.PromptDirect(ctx, helperPath, approval.DirectPrompt{
 		Title:   "Unlock Proton Mail for Claude",
-		Body:    "Touch ID required to unlock your saved Proton session so Claude can access Proton Mail.",
+		Body:    body,
 		Caller:  "protonmcp daemon",
-		Confirm: false,
-	})
-
-	subCtx, cancel := context.WithTimeout(ctx, startupGateTimeout)
-	defer cancel()
-
-	cmd := exec.CommandContext(subCtx, helperPath)
-	cmd.Stdin = bytes.NewReader(payload)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	cmd.Stdout = &bytes.Buffer{} // discard helper stdout; never inherit (serve-stdio would corrupt MCP framing)
-
-	err := cmd.Run()
+		Timeout: startupGateTimeout,
+	}, logger)
 	if err == nil {
 		logger.Info("touch-id startup gate approved")
-		return nil
 	}
-
-	// Context first: CommandContext kills the helper on timeout /
-	// cancel, which surfaces as an ExitError with code -1. Matching
-	// the exit code first mislabelled every timeout as "helper exit -1".
-	if subCtx.Err() != nil {
-		if ctx.Err() != nil {
-			return fmt.Errorf("startup approval aborted: %w", ctx.Err())
-		}
-		return fmt.Errorf("startup approval timed out after %s", startupGateTimeout)
-	}
-
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
-		switch exitErr.ExitCode() {
-		case 1:
-			return errors.New("user canceled startup approval")
-		case 2:
-			return fmt.Errorf("helper rejected request: %s", stderr.String())
-		default:
-			return fmt.Errorf("helper exit %d: %s", exitErr.ExitCode(), stderr.String())
-		}
-	}
-
-	return fmt.Errorf("helper invocation failed: %v", err)
+	return err
 }

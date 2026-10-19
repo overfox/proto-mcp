@@ -23,7 +23,10 @@ import (
 // has its own mutex, so the chain is safe.
 type idleTracker struct {
 	lastActivity atomic.Int64 // unix nanos
-	stop         chan struct{}
+	// idleLogged is set once the current idle episode has been logged;
+	// cleared by bumpActivity.
+	idleLogged atomic.Bool
+	stop       chan struct{}
 }
 
 func newIdleTracker() *idleTracker {
@@ -37,6 +40,7 @@ func newIdleTracker() *idleTracker {
 // called by Runtime.Unlock so an unlock counts as activity.
 func (t *idleTracker) bumpActivity() {
 	t.lastActivity.Store(time.Now().UnixNano())
+	t.idleLogged.Store(false)
 }
 
 // run polls every 30 seconds. minutesFn is called on each tick so
@@ -85,9 +89,15 @@ func (t *idleTracker) check(minutesFn func() int, skipFn func() bool, lockFn fun
 	threshold := time.Duration(minutes) * time.Minute
 	since := time.Since(time.Unix(0, t.lastActivity.Load()))
 	if since >= threshold {
-		logger.Info("idle threshold exceeded; locking daemon",
-			"idle_minutes", int(since.Minutes()),
-			"threshold_minutes", minutes)
+		// Log once per idle episode: 13k of 19.5k daemon.log lines were
+		// this message repeated every tick while a lock attempt didn't
+		// (or couldn't) change state. The flag resets on activity
+		// (bumpActivity, which Unlock also calls).
+		if t.idleLogged.CompareAndSwap(false, true) {
+			logger.Info("idle threshold exceeded; locking daemon",
+				"idle_minutes", int(since.Minutes()),
+				"threshold_minutes", minutes)
+		}
 		lockFn("idle_timeout")
 	}
 }

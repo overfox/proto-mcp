@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -28,6 +30,10 @@ const (
 // "touch id", so keep both words in it.
 const LockReasonTouchIDRequired = "keys locked — Touch ID required"
 
+// LockwatchMissingWarning is published (state.json warning + reason)
+// when the screen-lock watcher helper can't be found.
+const LockwatchMissingWarning = "lockwatch helper missing — screen-lock/sleep auto-lock disabled"
+
 // stateHeartbeat is how often the state file is rewritten even when
 // nothing changed, so a reader can tell a live daemon from a stale file
 // (updated_at older than a couple of beats → daemon is gone or wedged).
@@ -45,6 +51,12 @@ type stateDoc struct {
 	LastTool   string `json:"last_tool"`
 	LastToolAt string `json:"last_tool_at"`
 	UpdatedAt  string `json:"updated_at"`
+	// Warning is a standing degraded-security condition (e.g. the
+	// lockwatch helper is missing, so screen-lock / sleep auto-lock is
+	// off). Also appended to Reason in the locked / unlocked states so
+	// readers that only show Reason surface it; never in connecting /
+	// starting, where the menu bar parses Reason for "lock".
+	Warning string `json:"warning,omitempty"`
 }
 
 // StatePublisher writes the daemon's state to a JSON file (0600, atomic
@@ -61,6 +73,7 @@ type StatePublisher struct {
 	keepAlive  func() bool
 	remote     func() bool
 	removed    bool
+	warnings   map[string]string
 
 	kick chan struct{}
 }
@@ -108,6 +121,42 @@ func (p *StatePublisher) SetRemote(fn func() bool) {
 	p.mu.Lock()
 	p.remote = fn
 	p.mu.Unlock()
+}
+
+// Warning sources (SetWarning keys).
+const (
+	lockwatchWarningKey = "lockwatch"
+	policyWarningKey    = "policy"
+)
+
+// SetWarning records a standing degraded-security condition from one
+// source (msg "" clears that source) and rewrites the file. See
+// stateDoc.Warning.
+func (p *StatePublisher) SetWarning(key, msg string) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	if p.warnings == nil {
+		p.warnings = map[string]string{}
+	}
+	if msg == "" {
+		delete(p.warnings, key)
+	} else {
+		p.warnings[key] = msg
+	}
+	keys := make([]string, 0, len(p.warnings))
+	for k := range p.warnings {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, p.warnings[k])
+	}
+	p.doc.Warning = strings.Join(parts, "; ")
+	p.mu.Unlock()
+	p.write()
 }
 
 // SetState records a transition and writes the file synchronously.
@@ -199,6 +248,13 @@ func (p *StatePublisher) write() {
 	}
 	if !p.lastToolAt.IsZero() {
 		doc.LastToolAt = p.lastToolAt.UTC().Format(time.RFC3339)
+	}
+	if doc.Warning != "" && (doc.State == StateLocked || doc.State == StateUnlocked) {
+		if doc.Reason == "" {
+			doc.Reason = doc.Warning
+		} else {
+			doc.Reason += "; " + doc.Warning
+		}
 	}
 	doc.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 	if err := writeFileAtomic(p.path, doc); err != nil {

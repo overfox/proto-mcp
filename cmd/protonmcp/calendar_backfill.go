@@ -49,7 +49,7 @@ func runCalendarBackfill(ctx context.Context, args []string) error {
 
 	acquireCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
-	bundle, err := acquireSession(acquireCtx)
+	bundle, err := acquireSession(acquireCtx, "calendar-backfill")
 	if err != nil {
 		return err
 	}

@@ -81,7 +81,13 @@ func runLogin(ctx context.Context, _ []string) error {
 // runLogout revokes the server-side session (best effort) and deletes
 // the Keychain entry.
 func runLogout(ctx context.Context, _ []string) error {
-	stored, loadErr := keystore.Load()
+	// H2: reading the blob (to revoke server-side) is a Keychain session
+	// load like any other — Touch ID first. A declined prompt aborts the
+	// logout rather than silently skipping the revoke.
+	stored, loadErr := loadStoredSession(ctx, "logout")
+	if loadErr != nil && !errors.Is(loadErr, keystore.ErrNotFound) && isGateRefusal(loadErr) {
+		return loadErr
+	}
 	if loadErr != nil && !errors.Is(loadErr, keystore.ErrNotFound) {
 		slog.Warn("couldn't load stored session for server-side revoke", "err", loadErr.Error())
 	}

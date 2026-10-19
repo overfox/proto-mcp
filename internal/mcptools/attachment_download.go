@@ -206,7 +206,7 @@ func mailDownloadAttachment(deps Deps) mcp.Tool {
 				// Cache write failure is non-fatal for the user — we
 				// have the bytes in memory and can return them. Log
 				// + continue.
-				slog.Warn("attachment_cache write failed; returning uncached", "err", err,
+				slog.Warn("attachment_cache write failed; returning uncached", "err", err.Error(),
 					"message_id", payload.MessageID, "attachment_id", payload.AttachmentID)
 			} else {
 				// Best-effort eviction down to the 500 MiB ceiling.

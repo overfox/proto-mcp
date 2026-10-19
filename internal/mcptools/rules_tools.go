@@ -69,7 +69,8 @@ func rulesSet(deps Deps) mcp.Tool {
 		Name: "rules_set",
 		Description: "Create or replace (by name) a local mail rule: a mail_search DSL query plus 1-4 actions, each exactly one of " +
 			"{\"label\": <label id or name>}, {\"move\": inbox|archive|spam|<user folder id or name>}, {\"star\": true}, {\"mark_read\": true}. " +
-			"Rules can never send, forward, trash or delete. auto=true applies the rule to new mail after every background sync; " +
+			"Rules can never send, forward, trash or delete. auto=true applies the rule to new mail after every background sync " +
+			"and is only allowed for label / star / mark_read actions (no move); " +
 			"otherwise it only runs via rules_run. Tip: run rules_run with dry_run=true first to see what the query matches. " +
 			"Standing configuration — every change is confirmed by the user.",
 		InputSchema: json.RawMessage(`{
@@ -96,17 +97,8 @@ func rulesSet(deps Deps) mcp.Tool {
 		PromptBody: func(raw json.RawMessage) (string, string) {
 			var r Rule
 			_ = json.Unmarshal(raw, &r)
-			acts := make([]string, 0, len(r.Actions))
-			for _, a := range r.Actions {
-				acts = append(acts, describeAction(a))
-			}
-			mode := "manual (rules_run only)"
-			if r.Auto {
-				mode = "AUTOMATIC on new mail after every sync"
-			}
 			title := mcp.SanitizePromptText("Approve rules_set?", 120)
-			body := fmt.Sprintf("save mail rule %q\nmatch: %s\nthen: %s\nmode: %s",
-				r.Name, r.Query, strings.Join(acts, ", "), mode)
+			body := "save mail rule " + describeRuleForPrompt(r)
 			return title, mcp.SanitizePromptText(body, 4000)
 		},
 		Handler: func(ctx mcp.Context, raw json.RawMessage) (*mcp.ToolResult, error) {
@@ -144,6 +136,34 @@ func rulesSet(deps Deps) mcp.Tool {
 			return mcp.StructuredResult(result{Rule: r, Replaced: replaced, Warning: unresolvedTargets(ctx, deps, r)})
 		},
 	}
+}
+
+// describeRuleForPrompt renders a rule for a Touch ID dialog. Every
+// model-supplied field goes through sanitizeField so a newline in the
+// query or a label name can't forge extra dialog lines (e.g. a fake
+// "mode: manual" under a real automatic rule).
+func describeRuleForPrompt(r Rule) string {
+	acts := make([]string, 0, len(r.Actions))
+	for _, a := range r.Actions {
+		acts = append(acts, sanitizeField(describeAction(a)))
+	}
+	mode := "manual (rules_run only)"
+	if r.Auto {
+		mode = "AUTOMATIC on new mail after every sync"
+	}
+	return fmt.Sprintf("%q\nmatch: %s\nthen: %s\nmode: %s",
+		sanitizeField(r.Name), sanitizeField(r.Query), strings.Join(acts, ", "), mode)
+}
+
+// selectRules picks the rule named name, or all of them for "all".
+func selectRules(rules []Rule, name string) []Rule {
+	var selected []Rule
+	for _, r := range rules {
+		if strings.EqualFold(name, "all") || strings.EqualFold(r.Name, name) {
+			selected = append(selected, r)
+		}
+	}
+	return selected
 }
 
 // unresolvedTargets warns (without failing) when a label / folder name
@@ -290,10 +310,37 @@ func rulesRun(deps Deps) mcp.Tool {
 			if in.DryRun != nil && !*in.DryRun {
 				verb = "APPLY mail rule"
 			}
+			var head string
 			if strings.EqualFold(in.Name, "all") {
-				return title, mcp.SanitizePromptText(verb+"s: all", 4000)
+				head = verb + "s: all"
+			} else {
+				head = fmt.Sprintf("%s %q", verb, sanitizeField(in.Name))
 			}
-			return title, mcp.SanitizePromptText(fmt.Sprintf("%s %q", verb, in.Name), 4000)
+			// M5: bind the approval to the rules' CONTENT. The body
+			// (which the middleware folds into the approval-cache key)
+			// carries what the selected rules do plus a hash of them,
+			// so editing a rule after approval — e.g. via a shell
+			// rewrite of rules.yaml — changes the key and re-prompts.
+			rulesMu.Lock()
+			rules, err := loadRules(deps)
+			rulesMu.Unlock()
+			if err != nil {
+				return title, mcp.SanitizePromptText(head+"\n(rules file unreadable: the run will fail)", 4000)
+			}
+			selected := selectRules(rules, in.Name)
+			var b strings.Builder
+			b.WriteString(head)
+			for i, r := range selected {
+				if i == 5 {
+					fmt.Fprintf(&b, "\n…and %d more rule(s)", len(selected)-i)
+					break
+				}
+				b.WriteString("\n• " + describeRuleForPrompt(r))
+			}
+			if len(selected) > 0 {
+				b.WriteString("\nrule content: " + ruleContentHash(selected)[:16])
+			}
+			return title, mcp.SanitizePromptText(b.String(), 4000)
 		},
 		Handler: func(ctx mcp.Context, raw json.RawMessage) (*mcp.ToolResult, error) {
 			var in input
@@ -320,12 +367,7 @@ func rulesRun(deps Deps) mcp.Tool {
 			if err != nil {
 				return mcp.ErrorResult("rules_run: %v", err), nil
 			}
-			var selected []Rule
-			for _, r := range rules {
-				if strings.EqualFold(in.Name, "all") || strings.EqualFold(r.Name, in.Name) {
-					selected = append(selected, r)
-				}
-			}
+			selected := selectRules(rules, in.Name)
 			if len(selected) == 0 {
 				return mcp.ErrorResult("rules_run: no rule named %q (see rules_list)", in.Name), nil
 			}

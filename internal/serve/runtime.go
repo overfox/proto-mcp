@@ -12,6 +12,7 @@ package serve
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -25,10 +26,12 @@ import (
 	"github.com/just-an-oldsalt/proto-mcp/internal/approval"
 	"github.com/just-an-oldsalt/proto-mcp/internal/audit"
 	"github.com/just-an-oldsalt/proto-mcp/internal/caller"
+	"github.com/just-an-oldsalt/proto-mcp/internal/keystore"
 	"github.com/just-an-oldsalt/proto-mcp/internal/mcp"
 	"github.com/just-an-oldsalt/proto-mcp/internal/mcptools"
 	"github.com/just-an-oldsalt/proto-mcp/internal/policy"
 	protonclient "github.com/just-an-oldsalt/proto-mcp/internal/proton"
+	"github.com/just-an-oldsalt/proto-mcp/internal/redact"
 	"github.com/just-an-oldsalt/proto-mcp/internal/remote"
 	"github.com/just-an-oldsalt/proto-mcp/internal/store"
 	syncpkg "github.com/just-an-oldsalt/proto-mcp/internal/sync"
@@ -104,6 +107,10 @@ type Runtime struct {
 	// connectFailedAt records the last declined proton_connect, guarded
 	// by mu. Drives connectCooldown.
 	connectFailedAt time.Time
+
+	// unlockLimiter rate-limits unlock Touch ID prompts (SIGUSR2,
+	// proton_connect). Set by Setup; nil = unlimited.
+	unlockLimiter *promptLimiter
 
 	// Phase 7/A — auto-lock infrastructure. idleTracker bumps on
 	// every tool call via the mcp.WithToolCallObserver hook.
@@ -201,6 +208,52 @@ func waitDrained(drained <-chan struct{}, timeout time.Duration) {
 // pending Touch ID prompt or a network retry) already holds the slot.
 var ErrUnlockInProgress = errors.New("an unlock is already in progress; try again shortly")
 
+// ErrUnlockRateLimited is returned when an unlock would exceed the
+// Touch ID prompt budget (promptLimiter).
+var ErrUnlockRateLimited = errors.New("too many unlock prompts")
+
+// Unlock prompt budget: at most one prompt per unlockPromptMinGap and
+// unlockPromptHourlyMax per rolling hour.
+const (
+	unlockPromptMinGap    = 30 * time.Second
+	unlockPromptHourlyMax = 6
+)
+
+// promptLimiter is the unlock prompt budget. Every attempt that would
+// prompt counts, approved or not.
+type promptLimiter struct {
+	mu     sync.Mutex
+	recent []time.Time
+	now    func() time.Time
+}
+
+func newPromptLimiter() *promptLimiter { return &promptLimiter{now: time.Now} }
+
+func (l *promptLimiter) allow() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	kept := l.recent[:0]
+	for _, t := range l.recent {
+		if now.Sub(t) < time.Hour {
+			kept = append(kept, t)
+		}
+	}
+	l.recent = kept
+	if n := len(l.recent); n > 0 {
+		if wait := unlockPromptMinGap - now.Sub(l.recent[n-1]); wait > 0 {
+			return fmt.Errorf("%w: retry in %ds", ErrUnlockRateLimited, int(wait.Seconds())+1)
+		}
+	}
+	if len(l.recent) >= unlockPromptHourlyMax {
+		wait := time.Hour - now.Sub(l.recent[0])
+		return fmt.Errorf("%w: %d in the last hour; retry in %s", ErrUnlockRateLimited,
+			len(l.recent), wait.Round(time.Minute))
+	}
+	l.recent = append(l.recent, now)
+	return nil
+}
+
 func (r *Runtime) unlockSlot() chan struct{} {
 	r.unlockSemOnce.Do(func() { r.unlockSem = make(chan struct{}, 1) })
 	return r.unlockSem
@@ -243,6 +296,16 @@ func (r *Runtime) unlock(ctx context.Context, wait bool) error {
 	}
 	if acquire == nil {
 		return errors.New("runtime: no acquireSession callback registered for unlock")
+	}
+	// Prompt fatigue: cap how often SIGUSR2 / proton_connect can put a
+	// Touch ID dialog in front of the user (a looping or injected model,
+	// or any same-user process sending signals, could otherwise train
+	// them to tap through). nil on hand-built test runtimes.
+	if r.unlockLimiter != nil {
+		if err := r.unlockLimiter.allow(); err != nil {
+			slog.Warn("unlock prompt rate-limited", "requester", unlockRequester(ctx), "err", err.Error())
+			return err
+		}
 	}
 
 	// PROTO-141: the Touch-ID-gated acquire (up to a 60s human prompt)
@@ -359,6 +422,11 @@ func (r *Runtime) Connect(ctx context.Context) (alreadyConnected bool, email str
 	if wait > 0 {
 		return false, "", fmt.Errorf("previous Touch ID attempt was declined; retry in %ds", int(wait.Seconds())+1)
 	}
+	who := "proton_connect (MCP tool)"
+	if c := caller.FromContext(ctx); c.PID != 0 {
+		who = "proton_connect from " + c.String()
+	}
+	ctx = withUnlockRequester(ctx, who)
 	ctx, cancel := context.WithTimeout(WithoutNetworkRetry(ctx), connectBound)
 	defer cancel()
 	if err := r.unlock(ctx, false); err != nil {
@@ -618,7 +686,15 @@ func Setup(ctx context.Context, cfg SetupConfig) (*Runtime, error) {
 		_ = st.Close()
 		return nil, fmt.Errorf("policy override path: %w", err)
 	}
-	engine, err := policy.New(ctx, overridePath, logger)
+	// H6: an override that loosens the embedded defaults needs a Touch
+	// ID approval at the Mac (pinned helper, never Remote mode) unless
+	// its exact content was approved before.
+	engine, err := policy.NewWithGate(ctx, overridePath, logger, policyWeakeningGate(startupHelperPath, logger))
+	if err == nil {
+		if oerr := engine.OverrideError(); oerr != nil {
+			cfg.State.SetWarning(policyWarningKey, "policy.yaml not applied: "+oerr.Error())
+		}
+	}
 	if err != nil {
 		cleanupSession()
 		_ = st.Close()
@@ -681,8 +757,10 @@ func Setup(ctx context.Context, cfg SetupConfig) (*Runtime, error) {
 			case <-hupCh:
 				if rerr := engine.Reload(); rerr != nil {
 					logger.Warn("policy reload failed; previous policy retained", "err", rerr.Error())
+					cfg.State.SetWarning(policyWarningKey, "policy reload refused (previous policy kept): "+rerr.Error())
 					continue
 				}
+				cfg.State.SetWarning(policyWarningKey, "")
 				n := 0
 				if broker != nil {
 					n = broker.Invalidate()
@@ -711,6 +789,7 @@ func Setup(ctx context.Context, cfg SetupConfig) (*Runtime, error) {
 		acquireSession: gatedAcquire,
 		state:          cfg.State,
 		bgSyncCancel:   bgCancel,
+		unlockLimiter:  newPromptLimiter(),
 	}
 	if ls != nil {
 		rt.live = ls
@@ -763,7 +842,9 @@ func Setup(ctx context.Context, cfg SetupConfig) (*Runtime, error) {
 				rt.Lock("SIGUSR1")
 			case syscall.SIGUSR2:
 				go func() {
-					uctx, cancel := context.WithTimeout(bgCtx, unlockTimeout)
+					uctx, cancel := context.WithTimeout(
+						withUnlockRequester(bgCtx, "SIGUSR2 (`protonmcp unlock`, the menu bar, or another local process)"),
+						unlockTimeout)
 					defer cancel()
 					if err := rt.unlock(uctx, false); err != nil {
 						logger.Warn("unlock failed", "err", err.Error())
@@ -807,8 +888,12 @@ func Setup(ctx context.Context, cfg SetupConfig) (*Runtime, error) {
 	if lockwatchPath, found := resolveLockwatchPath(); found {
 		rt.lockwatchCancel = startLockwatch(lockwatchPath, autoLock, rt.Lock, logger)
 	} else {
-		logger.Info("lockwatch helper not found; screen-lock and sleep auto-lock disabled",
-			"hint", "run `make lockwatch` from the repo root")
+		// A missing watcher silently removes screen-lock / sleep
+		// auto-lock — a security degradation, so ERROR and surface it
+		// to the menu bar via state.json.
+		logger.Error("lockwatch helper not found; screen-lock and sleep auto-lock disabled",
+			"hint", "run `make lockwatch` from the repo root or reinstall")
+		cfg.State.SetWarning(lockwatchWarningKey, LockwatchMissingWarning)
 	}
 
 	// PROTO-144 — background sync. Without this the local mirror only
@@ -827,6 +912,26 @@ func Setup(ctx context.Context, cfg SetupConfig) (*Runtime, error) {
 
 	setupOK = true
 	return rt, nil
+}
+
+// policyWeakeningGate is the daemon's H6 gate: approvals are stored in
+// policy.approved, HMAC'd with a key in its own Keychain item, and the
+// prompt is the Mac's own pin-verified Touch ID helper (the broker's
+// LocalApprover shape, but usable before the broker exists).
+func policyWeakeningGate(helperPath string, logger *slog.Logger) policy.Gate {
+	approvedPath, err := policy.DefaultApprovalPath()
+	if err != nil {
+		approvedPath = ""
+	}
+	store := policy.ApprovalStore{Path: approvedPath, Key: keystore.PolicyHMACKey}
+	return policy.TouchIDGate(store, func(ctx context.Context, title, body string) error {
+		return approval.PromptDirect(ctx, helperPath, approval.DirectPrompt{
+			Title:   title,
+			Body:    body,
+			Caller:  "protonmcp policy",
+			Timeout: startupGateTimeout,
+		}, logger)
+	}, logger)
 }
 
 // remotePath is remote.json's location ("" on a home-dir failure makes
@@ -918,7 +1023,8 @@ func (r *Runtime) syncSession(ctx context.Context, sess *protonclient.Session, s
 
 	// Owner-defined auto rules (rules_set with auto: true, each created
 	// behind Touch ID) run on freshly synced mail. Actions are limited
-	// to label / move / star / mark_read by the rules engine; a failure
+	// to label / star / mark_read for auto rules (M5) and each action is
+	// audited (autoRuleAudit); a failure
 	// is logged and never aborts the sync.
 	r.applyAutoRules(syncCtx, sess, st, logger)
 
@@ -941,7 +1047,11 @@ func (r *Runtime) syncSession(ctx context.Context, sess *protonclient.Session, s
 }
 
 func (r *Runtime) applyAutoRules(ctx context.Context, sess *protonclient.Session, st *store.Store, logger *slog.Logger) {
-	rep, err := mcptools.ApplyAutoRules(ctx, mcptools.Deps{Session: sess, Store: st, Policy: r.Policy})
+	var auditor mcptools.AutoRuleAuditor
+	if r.Audit != nil {
+		auditor = autoRuleAudit{w: r.Audit}
+	}
+	rep, err := mcptools.ApplyAutoRules(ctx, mcptools.Deps{Session: sess, Store: st, Policy: r.Policy}, auditor)
 	if err != nil {
 		if ctx.Err() == nil {
 			logger.Warn("auto rules failed", "err", err.Error())
@@ -955,6 +1065,40 @@ func (r *Runtime) applyAutoRules(ctx context.Context, sess *protonclient.Session
 			logger.Info("auto rule applied", "rule", res.Rule, "matched", res.Matched, "applied", res.Applied)
 		}
 	}
+}
+
+// autoRuleAudit adapts the audit writer to mcptools.AutoRuleAuditor
+// (M5): every unattended auto-rule action gets an audit row, tool
+// "rules_auto", caller = the daemon itself, approval_source "auto_rule"
+// (the rule was approved with Touch ID when rules_set saved it).
+type autoRuleAudit struct{ w *audit.Writer }
+
+// maxAuditedIDs caps the message IDs written per row.
+const maxAuditedIDs = 200
+
+func (a autoRuleAudit) AutoRuleAction(ctx context.Context, ev mcptools.AutoRuleEvent) {
+	ids := ev.MessageIDs
+	if len(ids) > maxAuditedIDs {
+		ids = ids[:maxAuditedIDs]
+	}
+	args, _ := json.Marshal(struct {
+		Rule       string   `json:"rule"`
+		Action     string   `json:"action"`
+		Changed    int      `json:"changed"`
+		Matched    int      `json:"matched"`
+		MessageIDs []string `json:"message_ids"`
+	}{ev.Rule, ev.Action, ev.Changed, len(ev.MessageIDs), ids})
+	outcome, errMsg := audit.OutcomeOK, ""
+	if ev.Err != nil {
+		outcome, errMsg = audit.OutcomeError, redact.Error(ev.Err.Error())
+	}
+	exe, _ := os.Executable()
+	a.w.Record(ctx, &audit.Entry{
+		Caller:         caller.Caller{PID: os.Getpid(), UID: os.Getuid(), Binary: exe},
+		Tool:           "rules_auto",
+		ArgsJSON:       redact.JSON(args),
+		PolicyDecision: "auto",
+	}, outcome, "auto_rule", errMsg)
 }
 
 // fullRefreshMinInterval rate-limits the automatic backfill; a server

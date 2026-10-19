@@ -1,18 +1,23 @@
 package approval
 
 import (
+	"bytes"
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // Helper pinning.
@@ -135,4 +140,102 @@ func SetLockwatchHashForTesting(hash string) (restore func()) {
 	prev := lockwatchHelperSHA256
 	lockwatchHelperSHA256 = hash
 	return func() { lockwatchHelperSHA256 = prev }
+}
+
+// VerifyTouchIDHelper verifies the Touch ID helper at path against the
+// hash embedded at build time (see verifyHelper). Every direct helper
+// exec outside the broker — the daemon's startup gate, the CLI's
+// Keychain gate, the policy-weakening prompt — goes through
+// PromptDirect, which calls this first. Same unpinned-dev handling as
+// the broker: an empty embedded hash logs a loud warning and falls back
+// to the owner/permission checks.
+func VerifyTouchIDHelper(path string, logger *slog.Logger) error {
+	return verifyHelper(path, touchIDHelperSHA256, logger, os.Getuid())
+}
+
+// SetTouchIDHashForTesting pins the Touch ID helper hash from another
+// package's tests and returns a restore func. No-op outside `go test`.
+func SetTouchIDHashForTesting(hash string) (restore func()) {
+	if !testing.Testing() {
+		return func() {}
+	}
+	prev := touchIDHelperSHA256
+	touchIDHelperSHA256 = hash
+	return func() { touchIDHelperSHA256 = prev }
+}
+
+// ErrPromptDeclined is returned by PromptDirect when the user cancels
+// the dialog or the biometric fails (helper exit 1).
+var ErrPromptDeclined = errors.New("user canceled approval")
+
+// DirectPrompt is one Touch ID dialog run by PromptDirect.
+type DirectPrompt struct {
+	Title   string
+	Body    string
+	Caller  string        // shown by the helper as the requester
+	Timeout time.Duration // 0 → 60s
+}
+
+// PromptDirect runs the Touch ID helper once, outside the broker: no
+// policy, no approval cache, never routed to Remote mode. Used where a
+// broker doesn't exist yet or must not be consulted (the daemon's
+// startup gate, CLI Keychain loads, policy-weakening approval).
+//
+// SECURITY M4: the helper's pinned SHA-256 is verified before EVERY
+// exec, exactly like the broker. A mismatch fails closed with
+// ErrHelperUntrusted. Returns nil only on helper exit 0.
+func PromptDirect(ctx context.Context, helperPath string, p DirectPrompt, logger *slog.Logger) error {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if err := VerifyTouchIDHelper(helperPath, logger); err != nil {
+		logger.Error("touch-id helper failed verification; refusing to prompt", "err", err.Error())
+		return err
+	}
+	payload, err := json.Marshal(struct {
+		Title   string `json:"title"`
+		Body    string `json:"body"`
+		Caller  string `json:"caller"`
+		Confirm bool   `json:"confirm"`
+	}{Title: p.Title, Body: p.Body, Caller: p.Caller})
+	if err != nil {
+		return fmt.Errorf("approval: marshal prompt: %w", err)
+	}
+	timeout := p.Timeout
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	subCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(subCtx, helperPath)
+	cmd.Stdin = bytes.NewReader(payload)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	cmd.Stdout = &bytes.Buffer{} // never inherit (serve-stdio would corrupt MCP framing)
+
+	err = cmd.Run()
+	if err == nil {
+		return nil
+	}
+	// Context first: CommandContext kills the helper on timeout /
+	// cancel, which surfaces as an ExitError with code -1.
+	if subCtx.Err() != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("approval aborted: %w", ctx.Err())
+		}
+		return fmt.Errorf("approval timed out after %s", timeout)
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		switch exitErr.ExitCode() {
+		case 1:
+			return ErrPromptDeclined
+		case 2:
+			return fmt.Errorf("helper rejected request: %s", stderr.String())
+		default:
+			return fmt.Errorf("helper exit %d: %s", exitErr.ExitCode(), stderr.String())
+		}
+	}
+	return fmt.Errorf("helper invocation failed: %v", err)
 }

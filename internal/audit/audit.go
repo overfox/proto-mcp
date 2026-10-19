@@ -253,6 +253,18 @@ func (w *Writer) SetDecision(ctx context.Context, id int64, decision string) err
 	return nil
 }
 
+// Record writes a complete row in one go (Begin + Complete) for an
+// event with no separate start/finish: a tool call refused before it
+// began (daemon locked) or an unattended action (auto rules). e.ArgsJSON
+// must already be redacted. Safe on a nil Writer.
+func (w *Writer) Record(ctx context.Context, e *Entry, outcome, approvalSource, errMsg string) {
+	if w == nil {
+		return
+	}
+	id := w.Begin(ctx, e)
+	w.Complete(ctx, id, outcome, approvalSource, errMsg, 0)
+}
+
 // DefaultJSONLPath is the canonical location of the audit JSONL.
 // Phase 4 uses this; Phase 7's log rotation will reuse it.
 func DefaultJSONLPath() (string, error) {

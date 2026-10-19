@@ -258,7 +258,7 @@ func writeExclusive(rootDir, fname string, content []byte) (string, error) {
 		return "", fmt.Errorf("close: %w", err)
 	}
 	if err := setQuarantine(finalPath); err != nil {
-		slog.Warn("quarantine xattr failed", "path", finalPath, "err", err)
+		slog.Warn("quarantine xattr failed", "path", finalPath, "err", err.Error())
 	}
 	return finalPath, nil
 }

@@ -3,8 +3,12 @@ package mcptools
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -31,7 +35,9 @@ import (
 // Rules live in ~/Library/Application Support/protonmcp/rules.yaml
 // (0600, written atomically). Rules marked auto: true are applied by
 // ApplyAutoRules, which the background sync loop calls after each
-// sync pass.
+// sync pass; auto rules are further limited to label / star /
+// mark_read (no move of any kind — M5), and every action they take is
+// audited.
 
 const (
 	maxRules          = 100
@@ -115,6 +121,7 @@ func loadRules(deps Deps) ([]Rule, error) {
 		}
 		return nil, fmt.Errorf("parse %s: %w", p, err)
 	}
+	disableUnsafeAutoRules(doc.Rules, p)
 	if err := validateRules(doc.Rules); err != nil {
 		return nil, fmt.Errorf("%s: %w", p, err)
 	}
@@ -143,7 +150,8 @@ func saveRules(deps Deps, rules []Rule) error {
 	}
 	var buf bytes.Buffer
 	buf.WriteString("# protonmcp local rules — managed by the rules_set / rules_delete tools.\n" +
-		"# Actions are limited to label, move (not to trash), star and mark_read.\n")
+		"# Actions are limited to label, move (not to trash), star and mark_read;\n" +
+		"# auto: true rules may only label, star and mark_read.\n")
 	enc := yaml.NewEncoder(&buf)
 	enc.SetIndent(2)
 	if err := enc.Encode(rulesFile{Rules: rules}); err != nil {
@@ -210,7 +218,48 @@ func validateRule(r Rule) error {
 			return fmt.Errorf("action %d: %w", j+1, err)
 		}
 	}
+	if r.Auto && autoRuleMoves(r) {
+		return errAutoRuleMove
+	}
 	return nil
+}
+
+// errAutoRuleMove: SECURITY M5. An auto rule runs unattended on every
+// sync against mail an attacker can shape (subject / sender match the
+// query), so it may only add visible marks — label, star, mark read.
+// Moving mail (to Spam, Archive, or any folder) would let one approved
+// rule silently bury future mail; that stays a manual rules_run.
+var errAutoRuleMove = errors.New("auto rules may only label, star or mark read — moving mail (spam, archive, any folder) needs a manual rule run via rules_run")
+
+func autoRuleMoves(r Rule) bool {
+	for _, a := range r.Actions {
+		if a.Move != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// disableUnsafeAutoRules turns off auto on rules that would move mail
+// (files written before M5). The rule is kept, as a manual rule, and
+// the change is logged; the next rules_set / rules_delete persists it.
+func disableUnsafeAutoRules(rules []Rule, path string) {
+	for i := range rules {
+		if rules[i].Auto && autoRuleMoves(rules[i]) {
+			rules[i].Auto = false
+			slog.Warn("auto rule moves mail; disabled automatic runs (manual rules_run still works)",
+				"rule", rules[i].Name, "file", path)
+		}
+	}
+}
+
+// ruleContentHash is a SHA-256 over the canonical JSON of rules: binds
+// a rules_run approval to what the rules actually do, so editing a rule
+// after approval forces a new prompt.
+func ruleContentHash(rules []Rule) string {
+	data, _ := json.Marshal(rules)
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }
 
 func validateAction(a RuleAction) error {
@@ -325,6 +374,13 @@ func matchRule(ctx context.Context, deps Deps, r Rule, sinceUnix int64, max int)
 
 // runRule matches and (unless dryRun) applies one rule.
 func runRule(ctx context.Context, deps Deps, r Rule, dryRun bool, sinceUnix int64, max int) RuleRunResult {
+	return runRuleObserved(ctx, deps, r, dryRun, sinceUnix, max, nil)
+}
+
+// runRuleObserved is runRule with a per-action hook (called after each
+// applied action, success or failure, with the matched message IDs).
+func runRuleObserved(ctx context.Context, deps Deps, r Rule, dryRun bool, sinceUnix int64, max int,
+	onAction func(a RuleAction, messageIDs []string, changed int, err error)) RuleRunResult {
 	res := RuleRunResult{Rule: r.Name, DryRun: dryRun}
 	hits, capped, err := matchRule(ctx, deps, r, sinceUnix, max)
 	if err != nil {
@@ -349,8 +405,18 @@ func runRule(ctx context.Context, deps Deps, r Rule, dryRun bool, sinceUnix int6
 		res.Error = "session not available"
 		return res
 	}
+	var hitIDs []string
+	if onAction != nil {
+		hitIDs = make([]string, 0, len(hits))
+		for _, h := range hits {
+			hitIDs = append(hitIDs, h.MessageID)
+		}
+	}
 	for _, a := range r.Actions {
 		n, err := applyRuleAction(ctx, deps, a, hits)
+		if onAction != nil {
+			onAction(a, hitIDs, n, err)
+		}
 		if err != nil {
 			res.Error = fmt.Sprintf("%s: %v", describeAction(a), err)
 			return res
@@ -485,6 +551,21 @@ func labelKindName(t int) string {
 	return "label"
 }
 
+// AutoRuleEvent is one action an auto rule performed.
+type AutoRuleEvent struct {
+	Rule       string
+	Action     string   // describeAction, e.g. "label Receipts"
+	MessageIDs []string // messages the rule matched this pass
+	Changed    int      // how many actually changed
+	Err        error
+}
+
+// AutoRuleAuditor records auto-rule actions (internal/serve adapts the
+// audit writer to it).
+type AutoRuleAuditor interface {
+	AutoRuleAction(ctx context.Context, ev AutoRuleEvent)
+}
+
 // AutoRulesReport summarises one ApplyAutoRules pass.
 type AutoRulesReport struct {
 	Since   time.Time       `json:"since"`
@@ -499,7 +580,11 @@ type AutoRulesReport struct {
 // failing rule is reported in its result and does not stop the others.
 // Returns an error only when the rules file can't be read or the
 // watermark can't be persisted.
-func ApplyAutoRules(ctx context.Context, deps Deps) (AutoRulesReport, error) {
+//
+// audit (may be nil) receives one AutoRuleAction per action performed
+// (SECURITY M5: unattended changes must leave an audit trail, like
+// every tool call does).
+func ApplyAutoRules(ctx context.Context, deps Deps, audit AutoRuleAuditor) (AutoRulesReport, error) {
 	var rep AutoRulesReport
 	if deps.Store == nil {
 		return rep, errors.New("store not available")
@@ -520,10 +605,19 @@ func ApplyAutoRules(ctx context.Context, deps Deps) (AutoRulesReport, error) {
 	rep.Since = since
 	failed := false
 	for _, r := range rules {
-		if !r.Auto {
+		if !r.Auto || autoRuleMoves(r) { // belt and braces: loadRules already disabled these
 			continue
 		}
-		res := runRule(ctx, deps, r, false, since.Unix(), defaultRuleRunMax)
+		var onAction func(RuleAction, []string, int, error)
+		if audit != nil {
+			rule := r
+			onAction = func(a RuleAction, ids []string, n int, err error) {
+				audit.AutoRuleAction(ctx, AutoRuleEvent{
+					Rule: rule.Name, Action: describeAction(a), MessageIDs: ids, Changed: n, Err: err,
+				})
+			}
+		}
+		res := runRuleObserved(ctx, deps, r, false, since.Unix(), defaultRuleRunMax, onAction)
 		res.Messages = nil // keep the report small; counts suffice
 		if res.Error != "" {
 			failed = true
