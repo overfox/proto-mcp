@@ -854,7 +854,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !configured {
             let setup = NSMenuItem(title: "Set Up Remote Mode…", action: #selector(remoteSetup), keyEquivalent: "")
             setup.target = self
-            setup.toolTip = "Publishes the approval page on your private Tailscale network. Needs Tailscale signed in."
+            setup.toolTip = "Serves the approval page over HTTPS on this Mac's Tailscale address (private to your tailnet). " +
+                "Needs Tailscale signed in, with HTTPS certificates enabled for the tailnet."
             menu.addItem(setup)
             return
         }
@@ -929,20 +930,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func showEnrollQR(_ url: String) {
         let alert = NSAlert()
         alert.messageText = "Scan with your phone or tablet"
-        alert.informativeText = "Open the camera and scan the code (the device must be signed in to Tailscale). " +
-            "Then tap Create passkey and confirm with your fingerprint or face. " +
+        alert.informativeText = "Open the camera and scan the code (the device must be signed in to Tailscale as you). " +
+            "Then tap Create passkey and confirm with your fingerprint or face, and confirm the device here with Touch ID. " +
             "The code works once and expires in 10 minutes."
         if let qr = qrImage(url, size: 240) {
             alert.accessoryView = NSImageView(image: qr)
             alert.accessoryView?.frame = NSRect(x: 0, y: 0, width: 240, height: 240)
         }
+        // QR only: no "Copy Link" — the clipboard is readable by local processes.
         alert.addButton(withTitle: "Done")
-        alert.addButton(withTitle: "Copy Link")
         NSApp.activate(ignoringOtherApps: true)
-        if alert.runModal() == .alertSecondButtonReturn {
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(url, forType: .string)
-        }
+        alert.runModal()
     }
 
     private func qrImage(_ text: String, size: CGFloat) -> NSImage? {
