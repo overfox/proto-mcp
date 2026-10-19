@@ -221,3 +221,89 @@ func (s *Store) PurgeAttachmentsOlderThan(ctx context.Context, cutoff time.Time)
 	n, _ := res.RowsAffected()
 	return n, nil
 }
+
+// GetCachedAttachmentMeta is GetCachedAttachment without the content
+// BLOB — for display (the save prompt's filename) and accounting.
+func (s *Store) GetCachedAttachmentMeta(ctx context.Context, messageID, attachmentID string) (AttachmentCacheMeta, error) {
+	var (
+		m        AttachmentCacheMeta
+		cachedAt int64
+	)
+	err := s.DB.QueryRowContext(ctx, `
+SELECT message_id, attachment_id, filename, mime_type, size_bytes, cached_at
+FROM attachment_cache
+WHERE message_id = ? AND attachment_id = ?
+`, messageID, attachmentID).Scan(
+		&m.MessageID, &m.AttachmentID, &m.Filename, &m.MIMEType, &m.SizeBytes, &cachedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return AttachmentCacheMeta{}, ErrAttachmentNotCached
+	}
+	if err != nil {
+		return AttachmentCacheMeta{}, fmt.Errorf("get attachment_cache meta (%s, %s): %w", messageID, attachmentID, err)
+	}
+	m.CachedAt = time.Unix(cachedAt, 0).UTC()
+	return m, nil
+}
+
+// Attachment-cache retention (SECURITY M1). Decrypted attachments are
+// a convenience cache, not an archive: a week covers "read it, then
+// save / reply to it", and the byte cap bounds what a stolen disk or a
+// backup holds even when a lot was opened recently.
+const (
+	DefaultAttachmentRetention     = 7 * 24 * time.Hour
+	DefaultAttachmentCacheMaxBytes = int64(256 << 20)
+)
+
+// AttachmentSweepStats reports what SweepAttachmentCache removed.
+type AttachmentSweepStats struct {
+	Expired int64 // rows past the age cutoff
+	Evicted int64 // rows evicted (oldest first) to get under the byte cap
+}
+
+// SweepAttachmentCache applies both retention rules: rows cached
+// before now-maxAge go, then the oldest rows until the cache holds at
+// most maxBytes. When anything was deleted the store is compacted so
+// the deleted plaintext doesn't linger in WAL frames.
+func (s *Store) SweepAttachmentCache(ctx context.Context, now time.Time, maxAge time.Duration, maxBytes int64) (AttachmentSweepStats, error) {
+	var st AttachmentSweepStats
+	n, err := s.PurgeAttachmentsOlderThan(ctx, now.Add(-maxAge))
+	if err != nil {
+		return st, err
+	}
+	st.Expired = n
+	n, err = s.EvictAttachmentsToFit(ctx, maxBytes)
+	if err != nil {
+		return st, err
+	}
+	st.Evicted = n
+	if st.Expired+st.Evicted > 0 {
+		if err := s.Compact(ctx); err != nil {
+			return st, err
+		}
+	}
+	return st, nil
+}
+
+// Compact makes deleted plaintext unrecoverable from the files on disk
+// as far as SQLite allows without a full VACUUM: freed pages inside
+// store.db are already zeroed by secure_delete=on; this reclaims them
+// when the database is in incremental auto-vacuum mode, and checkpoints
+// + truncates the WAL, whose older frames still hold pre-delete page
+// images.
+func (s *Store) Compact(ctx context.Context) error {
+	if s.Path == ":memory:" {
+		return nil
+	}
+	var mode int
+	if err := s.DB.QueryRowContext(ctx, `PRAGMA auto_vacuum`).Scan(&mode); err == nil && mode == 2 {
+		if _, err := s.DB.ExecContext(ctx, `PRAGMA incremental_vacuum`); err != nil {
+			return fmt.Errorf("incremental_vacuum: %w", err)
+		}
+	}
+	var busy, logFrames, checkpointed int
+	if err := s.DB.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &logFrames, &checkpointed); err != nil {
+		return fmt.Errorf("wal_checkpoint: %w", err)
+	}
+	return nil
+}

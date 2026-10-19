@@ -422,7 +422,20 @@ func SweepStaleBodies(ctx context.Context, st *store.Store) (int64, error) {
 	// staging dir at the same retention cutoff, so daemon startup also
 	// clears stale plaintext files (not just the SQLite cache rows).
 	_, _ = mcptools.SweepStagingOlderThan(cutoff)
-	return st.PurgeOlderThan(ctx, cutoff)
+	n, err := st.PurgeOlderThan(ctx, cutoff)
+	if err != nil {
+		return n, err
+	}
+	// SECURITY M1 — the decrypted attachment cache has its own, shorter
+	// retention (7 days, 256 MiB). Sweep it now and register the store
+	// with the staging ticker, which repeats this daily.
+	registerAttachmentCacheSweep(ctx, slog.Default(), st, time.Now())
+	if n > 0 {
+		if cerr := st.Compact(ctx); cerr != nil {
+			slog.Warn("store compact after body purge failed", "err", cerr.Error())
+		}
+	}
+	return n, nil
 }
 
 // SetupConfig is the input to Setup. Callers fill it in based on
