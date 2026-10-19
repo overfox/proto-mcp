@@ -18,15 +18,27 @@ import (
 //     env var (`PROTONMCP_TOUCHID=/bin/true` → all Touch ID
 //     prompts auto-approve, with audit showing
 //     approval_source=touchid for what is in fact no auth).
-//  2. Sibling of argv[0]: helpers/touchid/protonmcp-touchid relative
-//     to filepath.Dir(argv[0]).
+//  2. Layout-relative candidates next to the RUNNING binary, with every
+//     symlink in its path resolved (exe is os.Executable() in
+//     production; see ResolveHelperPath).
 //  3. /Applications/protonmcp.app/Contents/MacOS/protonmcp-touchid
-//     (Phase 7 packaged app).
+//     (Phase 7 packaged app) and the fixed Homebrew prefixes.
+//
+// SECURITY M4: candidates are derived ONLY from the symlink-resolved
+// executable path, never from argv[0] or the unresolved symlink's
+// directory. argv[0] is chosen by whoever execs us (`exec -a`, or a
+// symlink to protonmcp placed next to an attacker helper), so deriving
+// trust from it let a same-user process pick the biometric verdict
+// oracle.
 //
 // Returns the first existing executable path. If none exist, returns
 // an error listing all the locations tried so the user knows where
 // to put the binary.
-func resolveHelperPath(argv0 string) (string, error) {
+//
+// The argv0 parameter is IGNORED (kept so ResolveHelperPath's signature
+// is unchanged for callers); the anchor is always runningExecutable().
+func resolveHelperPath(_ string) (string, error) {
+	exe := runningExecutable()
 	var candidates []string
 
 	if env := os.Getenv("PROTONMCP_TOUCHID"); env != "" {
@@ -56,22 +68,17 @@ func resolveHelperPath(argv0 string) (string, error) {
 		)
 	}
 
-	if argv0 != "" {
-		abs, err := filepath.Abs(argv0)
-		if err == nil {
-			fromBinDir(filepath.Dir(abs))
-			// PROTO-127 / cask layout: a `binary` stanza symlinks the
-			// daemon into Homebrew's group-writable <prefix>/bin, but the
-			// real binaries sit beside each other in the owner-writable-only
-			// Caskroom. The lexical candidates above land in the writable
-			// bin dir and are correctly rejected by ownerWritableOnly; the
-			// trusted helper is only reachable by following the daemon's
-			// own symlink to its real directory. Resolve it and emit the
-			// same candidates from there. Anchoring on the *daemon's*
-			// resolved path (not the helper symlink, which an attacker could
-			// repoint inside the writable bin dir) keeps the trust chain
-			// rooted in whatever binary is actually running as the daemon.
-			if resolved, rerr := filepath.EvalSymlinks(abs); rerr == nil && resolved != abs {
+	if exe != "" {
+		// PROTO-127 / cask layout: a `binary` stanza symlinks the daemon
+		// into Homebrew's group-writable <prefix>/bin, but the real
+		// binaries sit beside each other in the owner-writable-only
+		// Caskroom. Anchoring on the daemon's *resolved* path (not the
+		// symlink's directory, and not the helper symlink, which an
+		// attacker could repoint) keeps the trust chain rooted in
+		// whatever binary is actually running. M4: the unresolved
+		// directory is no longer a candidate at all.
+		if abs, err := filepath.Abs(exe); err == nil {
+			if resolved, rerr := filepath.EvalSymlinks(abs); rerr == nil {
 				fromBinDir(filepath.Dir(resolved))
 			}
 		}
@@ -80,8 +87,8 @@ func resolveHelperPath(argv0 string) (string, error) {
 	candidates = append(candidates,
 		// Phase 7 packaged app — deferred (paired with D37).
 		"/Applications/protonmcp.app/Contents/MacOS/protonmcp-touchid",
-		// Explicit Homebrew prefixes in case argv0 was invoked
-		// via a PATH symlink and Dir(abs) didn't land in bin/.
+		// Explicit Homebrew prefixes (fixed paths; still subject to
+		// the ownerWritableOnly check below).
 		"/opt/homebrew/bin/protonmcp-touchid",
 		"/usr/local/bin/protonmcp-touchid",
 	)
@@ -130,6 +137,20 @@ func ownerWritableOnly(p string) bool {
 		}
 	}
 	return true
+}
+
+// executablePath is os.Executable — a var so tests can point it at a
+// fixture layout.
+var executablePath = os.Executable
+
+// runningExecutable returns the running binary's path ("" if unknown).
+// Resolution of symlinks happens in resolveHelperPath.
+func runningExecutable() string {
+	exe, err := executablePath()
+	if err != nil {
+		return ""
+	}
+	return exe
 }
 
 // (touch a sentinel error here to anchor the doc comment in path.go)

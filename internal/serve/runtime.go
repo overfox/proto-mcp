@@ -807,8 +807,12 @@ func Setup(ctx context.Context, cfg SetupConfig) (*Runtime, error) {
 	if lockwatchPath, found := resolveLockwatchPath(); found {
 		rt.lockwatchCancel = startLockwatch(lockwatchPath, autoLock, rt.Lock, logger)
 	} else {
-		logger.Info("lockwatch helper not found; screen-lock and sleep auto-lock disabled",
-			"hint", "run `make lockwatch` from the repo root")
+		// A missing watcher silently removes screen-lock / sleep
+		// auto-lock — a security degradation, so ERROR and surface it
+		// to the menu bar via state.json.
+		logger.Error("lockwatch helper not found; screen-lock and sleep auto-lock disabled",
+			"hint", "run `make lockwatch` from the repo root or reinstall")
+		cfg.State.SetWarning(LockwatchMissingWarning)
 	}
 
 	// PROTO-144 — background sync. Without this the local mirror only

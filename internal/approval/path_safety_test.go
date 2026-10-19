@@ -93,7 +93,9 @@ func TestResolveHelperPath_FollowsDaemonSymlinkToCleanDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := resolveHelperPath(daemonLink)
+	t.Setenv("PROTONMCP_TOUCHID", "")
+	withExecutable(t, daemonLink) // os.Executable reports the symlink
+	got, err := resolveHelperPath("")
 	if err != nil {
 		t.Fatalf("helper should resolve via the daemon symlink; err=%v", err)
 	}

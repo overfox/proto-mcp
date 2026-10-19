@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"testing"
 	"time"
 
 	"github.com/just-an-oldsalt/proto-mcp/internal/approval"
@@ -152,7 +153,7 @@ func runLockwatchOnce(ctx context.Context, binPath string, lockFn, onTamper func
 // resolveLockwatchPath discovers the helper binary across the
 // install layouts proto-mcp supports:
 //
-//  1. Env override: PROTONMCP_LOCKWATCH (test / dev override).
+//  1. Env override: PROTONMCP_LOCKWATCH (honored only under `go test`).
 //  2. Sibling of the running daemon binary:
 //     <dir(os.Executable())>/helpers/lockwatch/protonmcp-lockwatch
 //     (dev layout: bin/protonmcpd + helpers/lockwatch/...)
@@ -168,8 +169,13 @@ func runLockwatchOnce(ctx context.Context, binPath string, lockFn, onTamper func
 //     other than the actual bin directory.
 //
 // Returns ("", false) if no candidate is executable.
+//
+// SECURITY M4 / lows: the env override is honored only under `go test`
+// (an untrusted parent could otherwise point it at a no-op watcher and
+// silently disable auto-lock), and the layout candidates hang off the
+// symlink-RESOLVED executable, same as the Touch ID helper.
 func resolveLockwatchPath() (string, bool) {
-	if envPath := os.Getenv("PROTONMCP_LOCKWATCH"); envPath != "" {
+	if envPath := os.Getenv("PROTONMCP_LOCKWATCH"); envPath != "" && testing.Testing() {
 		if isExecutable(envPath) {
 			return envPath, true
 		}
@@ -177,6 +183,9 @@ func resolveLockwatchPath() (string, bool) {
 	exe, err := os.Executable()
 	if err != nil {
 		return "", false
+	}
+	if resolved, rerr := filepath.EvalSymlinks(exe); rerr == nil {
+		exe = resolved
 	}
 	binDir := filepath.Dir(exe)
 	for _, candidate := range []string{
