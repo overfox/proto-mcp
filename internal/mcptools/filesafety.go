@@ -56,6 +56,19 @@ var blockedSaveNames = canonSet(
 	// Build / test entry points that run on a routine command.
 	"makefile", "gnumakefile", "conftest.py", "package.json", "pyproject.toml",
 	"setup.py", "dockerfile",
+	"build.rs", "justfile", "rakefile", "gemfile", "taskfile.yml", "taskfile.yaml",
+	"cmakelists.txt", "meson.build", "build", "build.bazel", "workspace",
+	"workspace.bazel", "module.bazel",
+	"gradlew", "gradlew.bat", "build.gradle", "build.gradle.kts",
+	"settings.gradle", "settings.gradle.kts", "pom.xml",
+	// sanitize.Filename strips the leading dot, so both spellings.
+	".pre-commit-config.yaml", "pre-commit-config.yaml",
+)
+
+// blockedSaveNamePatterns are filepath.Match patterns (after canonName)
+// for test files a routine `pytest` / `go test` collects and runs.
+var blockedSaveNamePatterns = canonList(
+	"test_*.py", "*_test.py", "*_test.go",
 )
 
 // blockedSaveExts launch code (or install something) when opened from
@@ -69,6 +82,9 @@ var blockedSaveExts = canonSet(
 	".pkg", ".mpkg", ".dmg", ".mobileconfig",
 	".prefpane", ".saver", ".kext", ".qlgenerator", ".mdimporter",
 	".jar",
+	// Bundles / plug-ins a host app loads, and shell scripts.
+	".bundle", ".plugin", ".xip", ".appex", ".xpc", ".component", ".vst", ".vst3",
+	".sh", ".zsh", ".bash", ".fish", ".ps1",
 )
 
 // launchdDirs are directory names whose .plist files launchd loads at
@@ -86,6 +102,11 @@ func checkSaveName(name string) error {
 	c = strings.TrimRight(c, ". ")
 	if blockedSaveNames[c] {
 		return fmt.Errorf("refusing to write %q: AI-agent / IDE / build config filenames can't be saved from email (rename it)", name)
+	}
+	for _, pat := range blockedSaveNamePatterns {
+		if ok, _ := filepath.Match(pat, c); ok {
+			return fmt.Errorf("refusing to write %q: test files a test runner would collect can't be saved from email (rename it)", name)
+		}
 	}
 	if blockedSaveExts[filepath.Ext(c)] {
 		return fmt.Errorf("refusing to write %q: files that run code when opened can't be saved from email", name)

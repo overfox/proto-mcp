@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"os"
 	"runtime"
+	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -29,4 +30,9 @@ func kernelPath(f *os.File) (string, error) {
 		n = len(buf)
 	}
 	return string(buf[:n]), nil
+}
+
+// statCtimeNs is the inode change time (st_ctimespec) in nanoseconds.
+func statCtimeNs(st *syscall.Stat_t) int64 {
+	return st.Ctimespec.Nano()
 }
