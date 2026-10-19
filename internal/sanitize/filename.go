@@ -22,9 +22,11 @@ import (
 //
 // Strips applied in order:
 //   - C0 / C1 control bytes (reuses stripControlChars).
-//   - RTL / LRO / bidi-isolate codepoints (U+202D, U+202E,
-//     U+2066–U+2069). Same set internal/mcp/middleware.go's
-//     SanitizePromptText drops.
+//   - Invisible format characters (IsInvisible: every Unicode Cf code
+//     point — bidi controls, zero-width chars, U+180E, BOM — and the
+//     tag block U+E0000–U+E007F).
+//   - Unicode line/paragraph separators (U+2028, U+2029, U+0085, VT,
+//     FF) become a space.
 //   - Path separators (/, \, NUL) replaced with '_'.
 //   - Leading '.' (defeats Unix dot-hidden trick when saved).
 //   - Trailing whitespace + dots (Windows refuses these; macOS just
@@ -38,32 +40,28 @@ import (
 const filenameMaxBytes = 255
 const filenameFallback = "attachment.bin"
 
-// bidiControl is the set of bidi-control codepoints that can flip
-// visual rendering. Same list as internal/mcp/middleware.go's
-// SanitizePromptText — keeping the two in sync matters because the
-// filename ends up in the Touch ID prompt body for both
-// mail_save_attachment and the send-family's attachment summary.
-var bidiControl = map[rune]struct{}{
-	0x202d: {}, // LRO
-	0x202e: {}, // RLO
-	0x2066: {}, // LRI
-	0x2067: {}, // RLI
-	0x2068: {}, // FSI
-	0x2069: {}, // PDI
-}
-
 // Filename returns the sanitized form of s. See package-level doc
 // for the transforms applied. Idempotent: Filename(Filename(s)) ==
 // Filename(s).
 func Filename(s string) string {
-	// Single-pass: bidi-drop, path-sep-replace, control-strip.
-	// Done in one loop so NUL (a control char AND a C-string
-	// terminator) gets replaced with '_' for visibility instead of
-	// silently disappearing.
+	// Single-pass: invisible-drop, line-separator→space,
+	// path-sep-replace, control-strip. Done in one loop so NUL (a
+	// control char AND a C-string terminator) gets replaced with '_'
+	// for visibility instead of silently disappearing.
 	var b strings.Builder
 	b.Grow(len(s))
 	for _, r := range s {
-		if _, isBidi := bidiControl[r]; isBidi {
+		if IsInvisible(r) {
+			// Bidi controls, zero-width chars, tag block — the name
+			// ends up in Touch ID prompts and LLM context. Same set
+			// internal/mcp SanitizePromptText drops.
+			continue
+		}
+		if IsLineSeparator(r) {
+			// U+2028/2029/0085/VT/FF would start a new line in an
+			// AppKit dialog (M3): a filename could paint a fake
+			// "BCC:" line. Plain space instead.
+			b.WriteByte(' ')
 			continue
 		}
 		switch r {

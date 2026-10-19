@@ -79,3 +79,22 @@ func TestSanitizePromptText_NFKCNormalization(t *testing.T) {
 		t.Errorf("NFKC didn't fold fullwidth: %q", got)
 	}
 }
+
+// M3: U+2028 / U+2029 / U+0085 render as line breaks in AppKit but used
+// to survive, letting a subject paint a fake "BCC:" line. They become
+// spaces; every Cf format char and the tag block are dropped.
+func TestSanitizePromptText_UnicodeLineSeparators(t *testing.T) {
+	for _, sep := range []rune{0x2028, 0x2029, 0x0085, 0x000b, 0x000c} {
+		in := "Subject: hi" + string(sep) + "BCC: evil@x.com"
+		got := SanitizePromptText(in, 1000)
+		if got != "Subject: hi BCC: evil@x.com" {
+			t.Errorf("U+%04X: got %q", sep, got)
+		}
+	}
+	invisible := []rune{0x200b, 0x200e, 0x202e, 0x2060, 0x2064, 0x2066, 0xfeff, 0x180e, 0x00ad, 0xe0001, 0xe0041, 0xe007f}
+	for _, r := range invisible {
+		if got := SanitizePromptText("a"+string(r)+"b", 100); got != "ab" {
+			t.Errorf("U+%04X not stripped: %q", r, got)
+		}
+	}
+}

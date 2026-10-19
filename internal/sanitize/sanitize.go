@@ -72,7 +72,10 @@ func HTML(input string) string {
 	if input == "" {
 		return ""
 	}
-	return htmlPolicy.Sanitize(input)
+	// M6: elements hidden with inline CSS / the hidden attribute go
+	// first — bluemonday drops the style attribute, which would
+	// otherwise make invisible text visible to the LLM.
+	return StripInvisible(htmlPolicy.Sanitize(stripHiddenElements(input)))
 }
 
 // Outbound sanitizes LLM-supplied HTML before it's encrypted and
@@ -129,6 +132,9 @@ var whitespaceRun = regexp.MustCompile(`\s+`)
 //
 // Steps:
 //
+//  0. Drop elements hidden from the human reader (hidden attribute,
+//     display:none, visibility:hidden, font-size:0, opacity:0,
+//     zero-size + overflow:hidden) with their content — M6.
 //  1. Strip <style>…</style> and <script>…</script> element content
 //     wholesale (D42 — otherwise CSS / JS leaks into the plaintext).
 //  2. Strip every remaining tag (including allowlist tags — for text
@@ -147,7 +153,13 @@ func Text(input string) string {
 	if input == "" {
 		return ""
 	}
-	out := styleContentStripper.ReplaceAllString(input, " ")
+	out := input
+	if hidden := stripHiddenElements(input); hidden != input {
+		// Re-rendered tree: html.Render escapes quotes as numeric
+		// references; undo just those so snippets don't change shape.
+		out = strings.NewReplacer("&#39;", "'", "&#34;", `"`).Replace(hidden)
+	}
+	out = styleContentStripper.ReplaceAllString(out, " ")
 	out = scriptContentStripper.ReplaceAllString(out, " ")
 	out = htmlTagStripper.ReplaceAllString(out, " ")
 	out = stripControlChars(out)
@@ -165,7 +177,9 @@ func Text(input string) string {
 }
 
 // stripControlChars drops C0 (< 0x20, excluding \n and \t) and C1
-// (0x80–0x9F) control bytes from s. SECURITY C-2: terminal escape
+// (0x80–0x9F) control bytes from s, plus invisible format characters
+// (IsInvisible: zero-width, bidi, tag block); Unicode line/paragraph
+// separators become a space (M3/M6). SECURITY C-2: terminal escape
 // sequences and zero-width control bytes embedded in mail bodies
 // can corrupt LLM output, hide content from human reviewers, or
 // break terminal rendering when the body is dumped to stdout via
@@ -182,10 +196,14 @@ func stripControlChars(s string) string {
 		switch {
 		case r == '\n' || r == '\t':
 			b.WriteRune(r)
+		case IsLineSeparator(r):
+			b.WriteByte(' ')
 		case r < 0x20:
 			// C0 control char — drop.
 		case r >= 0x7f && r <= 0x9f:
 			// DEL (0x7f) and C1 control range — drop.
+		case IsInvisible(r):
+			// Zero-width / bidi / tag characters — drop.
 		default:
 			b.WriteRune(r)
 		}

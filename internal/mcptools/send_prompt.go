@@ -7,11 +7,13 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	gpa "github.com/ProtonMail/go-proton-api"
 
@@ -23,33 +25,56 @@ import (
 //
 // The Touch ID helper renders ONLY the prompt body (as LAContext's
 // localizedReason), and macOS truncates long reasons. The body is
-// therefore ordered by what the user must not miss — recipients
-// first, then subject, a body excerpt, and every attachment — and
-// budgeted to ~640 chars (the helper appends a "Requested by" line,
-// keeping the total near 700). The body excerpt shrinks first; the
-// recipient and attachment lists are never elided.
+// therefore ordered by what the user must not miss — a recipient
+// summary naming every external address first, then To/CC/BCC, the
+// subject, a body excerpt, and every attachment.
+//
+// Budget (M3): we assume the LAContext sheet reliably shows about 1500
+// characters of localizedReason on current macOS before it elides the
+// rest. The helper appends a "Requested by …" line (≤ ~100 chars), so
+// the body gets sendPromptBudget = 1400 runes. Only the body excerpt
+// is ever shortened to fit. Recipients (BCC included) and attachments
+// are mandatory: if they alone don't fit, the dialog FAILS CLOSED — it
+// says so at the top, and the PromptBody records a ledger failure so
+// the handler refuses even if the user approves (formatSendPromptChecked
+// returns the failure reason). The model is told to split the send.
 //
 // What the dialog showed is recorded in sendLedger (keyed by tool +
 // raw args, which the middleware passes identically to PromptBody and
 // Handler) so the handler can refuse to send anything other than what
 // was approved: a different draft (draft swap), different reply
 // recipients, out-of-allowlist files that weren't listed, or content
-// the dialog couldn't load at all.
+// the dialog couldn't load or couldn't fit.
 
 const (
-	sendPromptBudget  = 640
-	bodyExcerptMax    = 300
-	bodyExcerptMin    = 80
-	subjectPromptMax  = 120
-	attachNamePrompt  = 80
+	sendPromptBudget = 1400
+	bodyExcerptMax   = 300
+	bodyExcerptMin   = 80
+	subjectPromptMax = 120
+	attachNamePrompt = 80
+	attachDirPrompt  = 100
+	// nfkcSlack covers SanitizePromptText's NFKC pass growing the
+	// text after we measured it (each "…" we add becomes "...").
+	nfkcSlack         = 8
 	sendLedgerTTL     = 2 * time.Minute
 	promptServerFetch = 5 * time.Second
 )
 
 // promptAttachment is one attachment line in a send dialog.
 type promptAttachment struct {
+	// Name is the file's real name: for path attachments the base
+	// name of the resolved file on disk (not the model-chosen
+	// filename); for draft / forwarded attachments the server-side
+	// name.
 	Name string
 	Size int64
+	// Dir is the display form of a path attachment's parent
+	// directory ("~/Documents"), so the user sees where the file
+	// comes from.
+	Dir string
+	// SentAs is the attachment name recipients will see when it
+	// differs from Name (model-chosen filename, or a symlink name).
+	SentAs string
 	// Path is set (full resolved path) for files from outside
 	// attachment_path_allowlist; the dialog shows it instead of the
 	// bare name so the user sees exactly which host file is leaving.
@@ -93,6 +118,19 @@ func ownDomains(deps Deps) map[string]bool {
 	return out
 }
 
+// isExternal reports whether addr's domain is not one of own. Always
+// false when own is empty (domains unknown).
+func isExternal(addr string, own map[string]bool) bool {
+	if len(own) == 0 {
+		return false
+	}
+	dom := ""
+	if i := strings.LastIndexByte(addr, '@'); i >= 0 {
+		dom = strings.ToLower(strings.TrimSpace(addr[i+1:]))
+	}
+	return !own[dom]
+}
+
 // promptAddrs formats a recipient list for the dialog: each entry
 // sanitized (no line-break injection), display names reduced to the
 // bare address where parseable, and "(external)" appended when the
@@ -102,19 +140,55 @@ func promptAddrs(addrs []string, own map[string]bool) string {
 	for _, raw := range addrs {
 		for _, a := range normalizeRecipientList(raw) {
 			s := sanitizeField(a)
-			if len(own) > 0 {
-				dom := ""
-				if i := strings.LastIndexByte(a, '@'); i >= 0 {
-					dom = strings.ToLower(strings.TrimSpace(a[i+1:]))
-				}
-				if !own[dom] {
-					s += " (external)"
-				}
+			if isExternal(a, own) {
+				s += " (external)"
 			}
 			out = append(out, s)
 		}
 	}
 	return strings.Join(out, ", ")
+}
+
+// recipientSummary is the dialog's first content line: the total
+// recipient count, how many are external, and every external address
+// (with its CC/BCC role) — so a BCC to an outside address is visible
+// before anything else, whatever the To list looks like.
+func recipientSummary(spec sendPromptSpec, own map[string]bool) string {
+	ccLabel := spec.CCLabel
+	if ccLabel == "" {
+		ccLabel = "CC"
+	}
+	var total int
+	var ext []string
+	for _, l := range []struct {
+		role  string
+		addrs []string
+	}{{"", spec.To}, {ccLabel, spec.CC}, {"BCC", spec.BCC}} {
+		for _, raw := range l.addrs {
+			for _, a := range normalizeRecipientList(raw) {
+				total++
+				if isExternal(a, own) {
+					s := sanitizeField(a)
+					if l.role != "" {
+						s += " [" + l.role + "]"
+					}
+					ext = append(ext, s)
+				}
+			}
+		}
+	}
+	noun := "recipients"
+	if total == 1 {
+		noun = "recipient"
+	}
+	switch {
+	case len(own) == 0:
+		return fmt.Sprintf("%d %s", total, noun)
+	case len(ext) == 0:
+		return fmt.Sprintf("%d %s (none external)", total, noun)
+	default:
+		return fmt.Sprintf("%d %s (%d external): %s", total, noun, len(ext), strings.Join(ext, ", "))
+	}
 }
 
 // bodyExcerpt renders the outgoing body for the dialog: HTML reduced
@@ -130,8 +204,25 @@ func bodyExcerpt(text, html string, max int) string {
 	return clipRunes(src, max)
 }
 
-// formatSendPrompt assembles the dialog body for spec.
+// formatSendPrompt assembles the dialog body for spec. Callers that
+// record a ledger entry use formatSendPromptChecked instead so an
+// over-budget dialog refuses the send.
 func formatSendPrompt(deps Deps, spec sendPromptSpec) string {
+	body, _ := formatSendPromptChecked(deps, spec)
+	return body
+}
+
+// errDialogOverflow is the ledger failure (and the model-facing
+// refusal) when recipients + attachments can't all be shown.
+const errDialogOverflow = "the Touch ID dialog cannot show all %d recipients and %d attachments within its " +
+	"%d-character limit, so nothing would be sent — split this into several messages with fewer " +
+	"recipients and/or attachments each"
+
+// formatSendPromptChecked assembles the dialog body for spec and
+// returns a non-empty failure when the mandatory content (recipients,
+// attachments) doesn't fit sendPromptBudget. The caller must record
+// that failure in sendLedger so the handler refuses.
+func formatSendPromptChecked(deps Deps, spec sendPromptSpec) (string, string) {
 	own := ownDomains(deps)
 	var head []string
 	for _, w := range spec.Warnings {
@@ -142,6 +233,7 @@ func formatSendPrompt(deps Deps, spec sendPromptSpec) string {
 		action += " (" + spec.Tool + ")"
 	}
 	head = append(head, action)
+	head = append(head, recipientSummary(spec, own))
 	head = append(head, "To: "+orNone(promptAddrs(spec.To, own)))
 	if len(spec.CC) > 0 {
 		label := spec.CCLabel
@@ -164,13 +256,23 @@ func formatSendPrompt(deps Deps, spec sendPromptSpec) string {
 		tail = append(tail, fmt.Sprintf("Attachments (%d): %s", len(spec.Attachments), strings.Join(lines, "; ")))
 	}
 
-	fixed := len([]rune(strings.Join(head, "\n"))) + len([]rune(strings.Join(tail, "\n"))) + 16
-	budget := sendPromptBudget - fixed - len([]rune(spec.BodySuffix))
-	if budget > bodyExcerptMax {
-		budget = bodyExcerptMax
+	suffix := ""
+	if spec.BodySuffix != "" {
+		suffix = " " + sanitizeField(spec.BodySuffix)
 	}
+	// Everything but the excerpt itself: head + tail + the body line's
+	// fixed parts ("Body: \"\"" + suffix) + the joining newlines.
+	fixed := runeLen(strings.Join(head, "\n")) + runeLen(strings.Join(tail, "\n")) +
+		runeLen(`Body: ""`) + runeLen(suffix) + len(tail) + 1 + nfkcSlack
+	budget := min(sendPromptBudget-fixed, bodyExcerptMax)
 	if budget < bodyExcerptMin {
-		budget = bodyExcerptMin
+		// FAIL CLOSED: the mandatory content would push itself (or
+		// what follows) out of what macOS displays.
+		n := len(recipientSet(spec.To, spec.CC, spec.BCC))
+		failure := fmt.Sprintf(errDialogOverflow, n, len(spec.Attachments), sendPromptBudget)
+		lines := append([]string{"⚠️ TOO MANY RECIPIENTS/ATTACHMENTS TO SHOW — approving will NOT send; split the message"}, head...)
+		lines = append(lines, tail...)
+		return mcp.SanitizePromptText(strings.Join(lines, "\n"), sendPromptBudget), failure
 	}
 	body := bodyExcerpt(spec.BodyText, spec.BodyHTML, budget)
 	bodyLine := "Body: "
@@ -179,25 +281,30 @@ func formatSendPrompt(deps Deps, spec sendPromptSpec) string {
 	} else {
 		bodyLine += "\"" + body + "\""
 	}
-	if spec.BodySuffix != "" {
-		bodyLine += " " + sanitizeField(spec.BodySuffix)
-	}
+	bodyLine += suffix
 
 	lines := append(head, bodyLine)
 	lines = append(lines, tail...)
-	return mcp.SanitizePromptText(strings.Join(lines, "\n"), 4000)
+	return mcp.SanitizePromptText(strings.Join(lines, "\n"), 4000), ""
 }
+
+func runeLen(s string) int { return utf8.RuneCountInString(s) }
 
 func formatPromptAttachment(a promptAttachment) string {
 	var s string
 	switch {
 	case a.Path != "":
 		s = sanitizeField(a.Path) + " [outside allowlist]"
+	case a.Dir != "":
+		s = clipRunes(sanitizeField(a.Name), attachNamePrompt) + " — " + clipLeft(sanitizeField(a.Dir), attachDirPrompt)
 	default:
 		s = clipRunes(sanitizeField(a.Name), attachNamePrompt)
 	}
 	if a.Err != "" {
 		return s + " (REFUSED: " + clipRunes(sanitizeField(a.Err), 120) + ")"
+	}
+	if a.SentAs != "" {
+		s += ", sent as \"" + clipRunes(sanitizeField(a.SentAs), attachNamePrompt) + "\""
 	}
 	s += " (" + humanBytes(a.Size) + ")"
 	switch {
@@ -207,6 +314,38 @@ func formatPromptAttachment(a promptAttachment) string {
 		s += " [on draft]"
 	}
 	return s
+}
+
+// clipLeft keeps the last max runes of s, prefixing "…" when clipped
+// (the end of a directory path is the informative part).
+func clipLeft(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return "…" + string(r[len(r)-max+1:])
+}
+
+// displayDir renders a directory for the dialog, abbreviating the
+// user's home folder to "~".
+func displayDir(dir string) string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return dir
+	}
+	homes := []string{home}
+	if r, err := filepath.EvalSymlinks(home); err == nil && r != home {
+		homes = append(homes, r)
+	}
+	for _, h := range homes {
+		if dir == h {
+			return "~"
+		}
+		if rel, err := filepath.Rel(h, dir); err == nil && rel != ".." && !strings.HasPrefix(rel, "../") {
+			return "~/" + rel
+		}
+	}
+	return dir
 }
 
 func orNone(s string) string {
@@ -220,6 +359,12 @@ func orNone(s string) string {
 // WITHOUT reading file contents: names + sizes, full paths for
 // out-of-allowlist files, and refusal reasons. outside lists the
 // resolved paths the dialog is approving.
+//
+// M3: for path attachments the dialog names the REAL file — the base
+// name of the symlink-resolved path plus its parent directory — never
+// just the model-chosen filename (which could call passport.pdf
+// "holiday.jpg"). When the name recipients will see differs, it's
+// shown as "sent as".
 func describeAttachments(deps Deps, atts []sendAttachmentInput) (out []promptAttachment, outside []string) {
 	for i, a := range atts {
 		name := a.Filename
@@ -228,14 +373,21 @@ func describeAttachments(deps Deps, atts []sendAttachmentInput) (out []promptAtt
 			out = append(out, promptAttachment{Name: orNone(name), Err: "content_b64 and path both set"})
 		case a.Path != "":
 			if name == "" {
-				name = filepath.Base(a.Path)
+				name = filepath.Base(a.Path) // what decodeAttachments will send
 			}
 			r, err := resolveAttachmentPath(deps, a.Path)
 			if err != nil {
 				out = append(out, promptAttachment{Name: a.Path, Err: err.Error()})
 				continue
 			}
-			pa := promptAttachment{Name: sanitize.Filename(name), Size: r.Size}
+			pa := promptAttachment{
+				Name: sanitize.Filename(filepath.Base(r.Resolved)),
+				Dir:  displayDir(filepath.Dir(r.Resolved)),
+				Size: r.Size,
+			}
+			if sent := sanitize.Filename(name); sent != pa.Name {
+				pa.SentAs = sent
+			}
 			if r.Tier == tierNeedsApproval {
 				pa.Path = r.Resolved
 				outside = append(outside, r.Resolved)

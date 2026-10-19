@@ -30,7 +30,7 @@ func TestFilenameStripsBidiControls(t *testing.T) {
 		}
 		// Ensure no bidi codepoint survives.
 		for _, r := range got {
-			if _, isBidi := bidiControl[r]; isBidi {
+			if IsInvisible(r) {
 				t.Errorf("Filename(%q) leaked bidi codepoint U+%04X", tc.in, r)
 			}
 		}

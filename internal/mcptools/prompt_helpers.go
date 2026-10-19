@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/just-an-oldsalt/proto-mcp/internal/sanitize"
 	"github.com/just-an-oldsalt/proto-mcp/internal/store"
 )
 
@@ -19,8 +20,13 @@ import (
 // recipient or subject containing "\nBCC: evil@x" would otherwise inject
 // a fake line and make the approval dialog misrepresent the send. We
 // neutralize newlines inside each value; only our own separators remain.
+//
+// M3: AppKit also breaks lines at U+2028 / U+2029 / U+0085 (and VT/FF),
+// and invisible format characters (bidi overrides, zero-width chars,
+// tag block) can reorder or hide text — sanitize.StripInvisible maps
+// the former to spaces and drops the latter.
 func sanitizeField(s string) string {
-	return strings.NewReplacer("\r", " ", "\n", " ", "\t", " ").Replace(s)
+	return sanitize.StripInvisible(strings.NewReplacer("\r", " ", "\n", " ", "\t", " ").Replace(s))
 }
 
 // joinAddrs sanitizes each address (PROTO-126) then comma-joins for
@@ -159,15 +165,35 @@ func shortID(id string) string {
 }
 
 // quote wraps a string in matching single quotes for display.
-// Strips newlines (a multi-line subject would corrupt the prompt
-// layout). Truncates at 80 chars with an ellipsis.
+// Line breaks of every kind and invisible format characters are
+// neutralized (sanitizeField — a multi-line subject would corrupt the
+// prompt layout or forge a line). Truncates at 80 runes with an
+// ellipsis (rune-safe: never splits a UTF-8 sequence).
 func quote(s string) string {
-	s = strings.ReplaceAll(s, "\n", " ")
-	s = strings.ReplaceAll(s, "\r", " ")
-	if len(s) > 80 {
-		s = s[:80] + "…"
+	return "'" + clipRunes(sanitizeField(s), 81) + "'"
+}
+
+// lookupSubjectSender returns "'<subject>' from <sender address>" for
+// a message from the local mirror, or the short id when unknown. Used
+// by the batch dialogs so the user sees whose mail is affected.
+func lookupSubjectSender(deps Deps, messageID string) string {
+	if deps.Store == nil || messageID == "" {
+		return shortID(messageID)
 	}
-	return "'" + s + "'"
+	ctx, cancel := context.WithTimeout(context.Background(), promptLookupTimeout)
+	defer cancel()
+	m, err := deps.Store.GetMessage(ctx, messageID)
+	if err != nil {
+		return shortID(messageID)
+	}
+	out := shortID(messageID)
+	if m.Subject != "" {
+		out = quote(m.Subject)
+	}
+	if m.FromAddress != "" {
+		out += " from " + clipRunes(sanitizeField(m.FromAddress), 80)
+	}
+	return out
 }
 
 // statePromptBody is the shared closure shape for the simple

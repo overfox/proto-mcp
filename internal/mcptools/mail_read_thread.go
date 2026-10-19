@@ -24,8 +24,9 @@ func mailReadThread(deps Deps) mcp.Tool {
 	}
 
 	type result struct {
-		ThreadID string       `json:"thread_id"`
-		Messages []readResult `json:"messages"`
+		ThreadID        string       `json:"thread_id"`
+		Messages        []readResult `json:"messages"`
+		UntrustedNotice string       `json:"untrusted_notice,omitempty"`
 	}
 
 	return mcp.Tool{
@@ -51,7 +52,8 @@ func mailReadThread(deps Deps) mcp.Tool {
 			"type": "object",
 			"properties": {
 				"thread_id": {"type": "string"},
-				"messages":  {"type": "array", "items": ` + readResultSchema + `}
+				"messages":  {"type": "array", "items": ` + readResultSchema + `},
+				` + untrustedNoticeSchema + `
 			},
 			"required": ["thread_id", "messages"]
 		}`),
@@ -85,15 +87,22 @@ func mailReadThread(deps Deps) mcp.Tool {
 			}
 
 			out := result{ThreadID: in.ThreadID, Messages: make([]readResult, 0, len(hits))}
+			// M6: snippets (and, in the metadata-only / error rows,
+			// subjects) are sender-controlled; fence them like bodies.
+			// Bodies and subjects from readOne carry their own fences.
+			fence := newFieldFence()
+			if len(hits) > 0 {
+				out.UntrustedNotice = fence.notice("snippet (and subject where not fenced as UNTRUSTED EMAIL SUBJECT)")
+			}
 			for _, h := range hits {
 				if !includeBodies {
 					out.Messages = append(out.Messages, readResult{
 						MessageID: h.MessageID,
 						ThreadID:  h.ThreadID,
-						Subject:   h.Subject,
+						Subject:   fence.wrap(h.Subject),
 						From:      h.FromAddress,
 						Date:      h.Date.UTC().Format(time.RFC3339),
-						Snippet:   h.Snippet,
+						Snippet:   fence.wrap(h.Snippet),
 					})
 					continue
 				}
@@ -113,15 +122,14 @@ func mailReadThread(deps Deps) mcp.Tool {
 						"message_id", h.MessageID, "err", rerr.Error())
 					out.Messages = append(out.Messages, readResult{
 						MessageID: h.MessageID,
-						Subject:   h.Subject,
+						Subject:   fence.wrap(h.Subject),
 						Text:      "(this message could not be decrypted or loaded; skipped)",
 					})
 					continue
 				}
 				// Snippet from the mirror (computed over the cached
-				// plaintext). Not fenced: it's a ~200-char preview the
-				// list tools already return the same way.
-				rr.Snippet = h.Snippet
+				// plaintext) — fenced like the list tools' snippets.
+				rr.Snippet = fence.wrap(h.Snippet)
 				out.Messages = append(out.Messages, rr)
 			}
 			return mcp.StructuredResult(out)

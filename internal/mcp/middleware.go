@@ -18,6 +18,7 @@ import (
 	"github.com/just-an-oldsalt/proto-mcp/internal/mcperrors"
 	"github.com/just-an-oldsalt/proto-mcp/internal/policy"
 	"github.com/just-an-oldsalt/proto-mcp/internal/redact"
+	"github.com/just-an-oldsalt/proto-mcp/internal/sanitize"
 )
 
 // firstDisallowedRecipient returns "" if every recipient in extracted
@@ -357,6 +358,9 @@ func SanitizePromptText(in string, maxRunes int) string {
 	if maxRunes <= 0 {
 		maxRunes = 4000
 	}
+	// NFKC first, filter second: normalization could in principle
+	// compose/decompose into code points the filter must see, so the
+	// filter always runs on the final form (M3).
 	in = norm.NFKC.String(in)
 	var b strings.Builder
 	b.Grow(len(in))
@@ -364,16 +368,21 @@ func SanitizePromptText(in string, maxRunes int) string {
 		switch {
 		case r == '\n' || r == '\t':
 			b.WriteRune(r)
+		case sanitize.IsLineSeparator(r):
+			// U+2028 / U+2029 / U+0085 / VT / FF: AppKit renders
+			// these as line breaks, so a subject or filename could
+			// paint a fake dialog line (M3). '\n' stays the only
+			// line break — and callers sanitize '\n' out of every
+			// individual field (sanitizeField).
+			b.WriteByte(' ')
 		case r < 0x20:
 			// C0 controls — drop.
 		case r >= 0x7f && r <= 0x9f:
 			// DEL + C1 controls — drop.
-		case r == 0x200e || r == 0x200f, // LRM / RLM
-			r == 0x202a, r == 0x202b, r == 0x202c, r == 0x202d, r == 0x202e, // bidi embed / override
-			r == 0x2066, r == 0x2067, r == 0x2068, r == 0x2069: // bidi isolate
-			// Drop bidi-control codepoints entirely.
-		case r == 0x200b || r == 0x200c || r == 0x200d || r == 0xfeff:
-			// Zero-width joiners / non-joiners / BOM — drop.
+		case sanitize.IsInvisible(r):
+			// Every Unicode format (Cf) char — bidi embed/override/
+			// isolate, LRM/RLM, zero-width space/joiners, word
+			// joiner, BOM, U+180E — and the tag block. Drop.
 		default:
 			b.WriteRune(r)
 		}
