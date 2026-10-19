@@ -10,9 +10,10 @@
 //     that prompt-injection embedded in exotic markup has nowhere
 //     to hide.
 //
-//   - Text(input) — pure text extraction with quoted-reply markers
-//     trimmed and whitespace collapsed. Source for snippets and
-//     for the FTS5 body_text column.
+//   - Text(input) — the visible text only (M6: nothing a reader
+//     wouldn't see), one line per block, quoted-reply markers
+//     trimmed and whitespace collapsed. Source for mail_read text
+//     bodies, snippets and the FTS5 body_text column.
 //
 // SECURITY Foundational #7 + Phase-2 plan Q1 (strict policy).
 package sanitize
@@ -72,9 +73,10 @@ func HTML(input string) string {
 	if input == "" {
 		return ""
 	}
-	// M6: elements hidden with inline CSS / the hidden attribute go
-	// first — bluemonday drops the style attribute, which would
-	// otherwise make invisible text visible to the LLM.
+	// M6: comments, non-rendered elements and everything hidden from
+	// the reader (attributes, inline styles, <style> rules) go first —
+	// bluemonday drops the style attribute, which would otherwise make
+	// invisible text visible to the LLM.
 	return StripInvisible(htmlPolicy.Sanitize(stripHiddenElements(input)))
 }
 
@@ -100,80 +102,80 @@ func Outbound(input string) string {
 // not the email-thread tail.
 var quotedReplyLine = regexp.MustCompile(`^\s*(>+\s?)+`)
 
-// htmlTagStripper removes any remaining tags after the HTML policy
-// has done its work. The policy keeps allowlist tags; this pass
-// converts them to plain text. We DON'T use bluemonday.StripTagsPolicy
-// because it doesn't handle entities the way Text() needs (it
-// decodes &amp; → & which can re-introduce noise).
-var htmlTagStripper = regexp.MustCompile(`(?s)<[^>]+>`)
-
-// styleContentStripper / scriptContentStripper remove <style>…</style>
-// and <script>…</script> element CONTENT (not just the delimiters)
-// before the tag-stripper runs. D42: marketing HTML emails commonly
-// carry multi-KB <style> blocks (font-face, media queries) that
-// would otherwise survive htmlTagStripper and land in the plaintext
-// / FTS index.
-//
-// RE2 (Go's regexp engine) doesn't support backreferences, so we
-// use a separate regex per tag rather than one with \1. Case-
-// insensitive + dot-matches-newline so each regex catches the
-// element regardless of formatting / mixed case.
-var (
-	styleContentStripper  = regexp.MustCompile(`(?is)<style\b[^>]*>.*?</\s*style\s*>`)
-	scriptContentStripper = regexp.MustCompile(`(?is)<script\b[^>]*>.*?</\s*script\s*>`)
-)
-
-// whitespaceRun matches any run of two-or-more whitespace chars
-// (including newlines) so Text() can collapse them to one space.
-var whitespaceRun = regexp.MustCompile(`\s+`)
-
-// Text extracts plain text from an HTML or text input, suitable for
-// snippet generation and FTS5 indexing.
+// Text extracts the plain text a reader of input would see — for the
+// LLM (mail_read text bodies, HTML attachments), snippets and FTS5
+// indexing.
 //
 // Steps:
 //
-//  0. Drop elements hidden from the human reader (hidden attribute,
-//     display:none, visibility:hidden, font-size:0, opacity:0,
-//     zero-size + overflow:hidden) with their content — M6.
-//  1. Strip <style>…</style> and <script>…</script> element content
-//     wholesale (D42 — otherwise CSS / JS leaks into the plaintext).
-//  2. Strip every remaining tag (including allowlist tags — for text
-//     output we want pure content).
-//  3. Drop lines that are entirely quoted-reply markers.
-//  4. Collapse whitespace runs to a single space.
-//  5. Trim leading/trailing space.
+//  1. Parse input with the HTML5 algorithm (golang.org/x/net/html)
+//     and drop everything that doesn't render: comments (Outlook
+//     conditional comments included), script / style / template /
+//     noscript / title / head / svg / … content, attribute values,
+//     and elements or text hidden by attributes or CSS (inline styles
+//     and simple <style> rules) — M6, see visible.go. D42: <style>
+//     and <script> content never leaks.
+//  2. Emit text nodes only, entities decoded as displayed; block
+//     elements and <br> start a new line; whitespace inside a line is
+//     collapsed as a browser would (outside <pre>). Plain-text input
+//     (no markup at all) keeps its own line breaks.
+//  3. Drop control characters and invisible / default-ignorable
+//     characters (Unicode line separators become spaces).
+//  4. Drop lines that are entirely quoted-reply markers.
+//  5. Collapse whitespace runs inside each line to one space, trim
+//     each line and drop blank ones.
 //
-// Note: HTML entities like &amp; are NOT decoded. Decoding adds a
-// dependency on html.UnescapeString and lets clever encodings hide
-// content from the FTS index — which is the inverse of what we want.
-// A literal "&amp;" in the index won't match "&" in a search query,
-// but that's a reasonable trade-off for an index built specifically
-// to find prompt-injection-like content via key terms.
+// Link text is kept; hrefs (like every other attribute) are not.
 func Text(input string) string {
 	if input == "" {
 		return ""
 	}
 	out := input
-	if hidden := stripHiddenElements(input); hidden != input {
-		// Re-rendered tree: html.Render escapes quotes as numeric
-		// references; undo just those so snippets don't change shape.
-		out = strings.NewReplacer("&#39;", "'", "&#34;", `"`).Replace(hidden)
+	if strings.ContainsAny(input, "<&") {
+		d, ok := parseVisible(input)
+		if !ok {
+			return unparseableNotice
+		}
+		out = extractText(d)
 	}
-	out = styleContentStripper.ReplaceAllString(out, " ")
-	out = scriptContentStripper.ReplaceAllString(out, " ")
-	out = htmlTagStripper.ReplaceAllString(out, " ")
 	out = stripControlChars(out)
 
-	var lines []string
-	for _, line := range strings.Split(out, "\n") {
+	lines := strings.Split(out, "\n")
+	kept := lines[:0]
+	for _, line := range lines {
 		if quotedReplyLine.MatchString(line) {
 			continue
 		}
-		lines = append(lines, line)
+		line = strings.TrimSpace(collapseBlankRuns(line))
+		if line == "" {
+			continue
+		}
+		kept = append(kept, line)
 	}
-	out = strings.Join(lines, " ")
-	out = whitespaceRun.ReplaceAllString(out, " ")
-	return strings.TrimSpace(out)
+	return strings.Join(kept, "\n")
+}
+
+// collapseBlankRuns maps each run of whitespace (ASCII or Unicode
+// \p{Z}) in one line to a single space.
+func collapseBlankRuns(s string) string {
+	if !strings.ContainsFunc(s, IsBlank) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	space := false
+	for _, r := range s {
+		if IsBlank(r) {
+			if !space {
+				b.WriteByte(' ')
+			}
+			space = true
+			continue
+		}
+		space = false
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 // stripControlChars drops C0 (< 0x20, excluding \n and \t) and C1
@@ -203,7 +205,7 @@ func stripControlChars(s string) string {
 		case r >= 0x7f && r <= 0x9f:
 			// DEL (0x7f) and C1 control range — drop.
 		case IsInvisible(r):
-			// Zero-width / bidi / tag characters — drop.
+			// Zero-width / bidi / tag / default-ignorable — drop.
 		default:
 			b.WriteRune(r)
 		}
@@ -211,8 +213,9 @@ func stripControlChars(s string) string {
 	return b.String()
 }
 
-// Snippet returns up to maxRunes runes from Text(input), suitable for
-// the message-list preview. maxRunes <= 0 falls back to 200.
+// Snippet returns up to maxRunes runes from Text(input) on one line
+// (line breaks become spaces), suitable for the message-list preview.
+// maxRunes <= 0 falls back to 200.
 //
 // Runes (not bytes) so a snippet doesn't slice a multibyte character
 // in half — important for emoji-heavy email and any non-ASCII content.
@@ -220,7 +223,7 @@ func Snippet(input string, maxRunes int) string {
 	if maxRunes <= 0 {
 		maxRunes = 200
 	}
-	text := Text(input)
+	text := strings.ReplaceAll(Text(input), "\n", " ")
 	r := []rune(text)
 	if len(r) <= maxRunes {
 		return text

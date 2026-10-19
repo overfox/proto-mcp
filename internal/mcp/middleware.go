@@ -391,6 +391,13 @@ func defaultPromptBody(tool string, args json.RawMessage, _ *policy.ToolPolicy) 
 //     NFKC normalization folds many compatibility forms; not a
 //     full homograph defense (those need explicit allowlisting)
 //     but cheap and helps.
+//  6. Padding (M6): blank-looking fillers (braille blank, Hangul
+//     fillers, variation selectors — sanitize.IsInvisible) are
+//     dropped, and a run of Unicode spaces (NBSP, ideographic space,
+//     U+2000–U+200A …, with any ASCII spaces around them) becomes one
+//     space, so a field can't be padded until a forged line wraps
+//     into view. Runs of plain ASCII spaces are left alone (our own
+//     dialog layout may use them).
 //
 // Exported so internal/mcptools' per-tool PromptBody builders can
 // call it without re-implementing the same logic.
@@ -398,14 +405,21 @@ func SanitizePromptText(in string, maxRunes int) string {
 	if maxRunes <= 0 {
 		maxRunes = 4000
 	}
+	in = sanitize.CollapseUnicodeSpaceRuns(in)
 	// NFKC first, filter second: normalization could in principle
 	// compose/decompose into code points the filter must see, so the
 	// filter always runs on the final form (M3).
 	in = norm.NFKC.String(in)
 	var b strings.Builder
 	b.Grow(len(in))
+	var prev rune
 	for _, r := range in {
 		switch {
+		case r == 0xFE0F && sanitize.IsEmojiBase(prev):
+			// One emoji-presentation selector straight after a symbol
+			// ("⚠️") is how emoji are spelled; keep it. Any other
+			// variation selector is invisible filler and dropped below.
+			b.WriteRune(r)
 		case r == '\n' || r == '\t':
 			b.WriteRune(r)
 		case sanitize.IsLineSeparator(r):
@@ -422,10 +436,12 @@ func SanitizePromptText(in string, maxRunes int) string {
 		case sanitize.IsInvisible(r):
 			// Every Unicode format (Cf) char — bidi embed/override/
 			// isolate, LRM/RLM, zero-width space/joiners, word
-			// joiner, BOM, U+180E — and the tag block. Drop.
+			// joiner, BOM, U+180E — the tag block, every other
+			// default-ignorable code point and blank fillers. Drop.
 		default:
 			b.WriteRune(r)
 		}
+		prev = r
 	}
 	out := b.String()
 	r := []rune(out)

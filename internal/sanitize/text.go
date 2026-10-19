@@ -2,7 +2,6 @@ package sanitize
 
 import (
 	"bytes"
-	"strconv"
 	"strings"
 	"unicode"
 
@@ -14,13 +13,20 @@ import (
 // Two classes of code point let sender-controlled text lie to a human
 // or a model:
 //
-//   - Format characters (Unicode category Cf) render as nothing: bidi
-//     embeddings/overrides/isolates (U+202A–U+202E, U+2066–U+2069),
-//     LRM/RLM/ALM, zero-width space/joiners (U+200B–U+200D), word
-//     joiner and invisible operators (U+2060–U+2064), BOM (U+FEFF),
-//     the Mongolian vowel separator (U+180E), soft hyphen, and the
-//     tag block (U+E0000–U+E007F, "ASCII smuggling"). They hide text,
-//     reorder it visually, or split keywords so filters miss them.
+//   - Characters that render as nothing: every format character
+//     (Unicode category Cf — bidi embeddings/overrides/isolates
+//     U+202A–U+202E / U+2066–U+2069, LRM/RLM/ALM, zero-width space/
+//     joiners U+200B–U+200D, word joiner and invisible operators
+//     U+2060–U+2064, BOM U+FEFF, U+180E, soft hyphen, the tag block
+//     U+E0000–U+E007F "ASCII smuggling"), every other
+//     Default_Ignorable_Code_Point (combining grapheme joiner U+034F,
+//     Hangul fillers U+115F/U+1160/U+3164/U+FFA0, Khmer U+17B4/U+17B5,
+//     variation selectors U+180B–U+180F, U+FE00–U+FE0F,
+//     U+E0100–U+E01EF), and blank-looking fillers that are formally
+//     "visible" (braille blank U+2800, musical null notehead
+//     U+1D159). They hide text, pad a dialog line until a forged line
+//     wraps into view, reorder text visually, or split keywords so
+//     filters miss them.
 //   - Line separators other than '\n' — U+2028 LINE SEPARATOR,
 //     U+2029 PARAGRAPH SEPARATOR, U+0085 NEXT LINE, VT, FF — are
 //     rendered as a line break by AppKit (the Touch ID dialog) but
@@ -31,14 +37,28 @@ import (
 // sanitizer in this package and internal/mcp.SanitizePromptText uses
 // them so the sets can't drift apart.
 
-// IsInvisible reports whether r is an invisible formatting character
-// that should be dropped from display / LLM text: any Unicode Cf code
-// point plus the whole tag block.
+// IsInvisible reports whether r renders as nothing (or as blank
+// filler) and should be dropped from display / LLM text: Unicode Cf,
+// Default_Ignorable_Code_Point, and the blank fillers listed above.
 func IsInvisible(r rune) bool {
-	if r >= 0xE0000 && r <= 0xE007F {
+	switch {
+	case r < 0xAD:
+		return false
+	case r >= 0xE0000 && r <= 0xE0FFF:
+		// Tag block, variation selectors supplement and the rest of
+		// the reserved default-ignorable plane-14 range.
+		return true
+	case unicode.Is(unicode.Cf, r),
+		unicode.Is(unicode.Other_Default_Ignorable_Code_Point, r),
+		unicode.Is(unicode.Variation_Selector, r):
 		return true
 	}
-	return unicode.Is(unicode.Cf, r)
+	switch r {
+	case 0x2800, // BRAILLE PATTERN BLANK
+		0x1D159: // MUSICAL SYMBOL NULL NOTEHEAD
+		return true
+	}
+	return false
 }
 
 // IsLineSeparator reports whether r is a line or paragraph break other
@@ -50,6 +70,55 @@ func IsLineSeparator(r rune) bool {
 		return true
 	}
 	return false
+}
+
+// IsBlank reports whether r is any kind of whitespace — ASCII or
+// Unicode (\p{Z}: NBSP, en/em/ideographic spaces, …). Dialog fields
+// collapse runs of these to one space so padding can't push text
+// around (M6).
+func IsBlank(r rune) bool {
+	return unicode.IsSpace(r) || unicode.Is(unicode.Z, r)
+}
+
+// IsEmojiBase reports whether r is a symbol that a following U+FE0F
+// (emoji presentation selector) legitimately modifies ("⚠️", "✔️").
+// Callers that want emoji to keep their look may keep a single FE0F
+// after such a rune; anywhere else it is invisible filler.
+func IsEmojiBase(r rune) bool {
+	return unicode.Is(unicode.So, r)
+}
+
+// CollapseUnicodeSpaceRuns replaces each run of spaces that contains
+// a non-ASCII space separator (\p{Z} other than U+0020 — NBSP,
+// U+2000–U+200A, U+3000 …) with one ASCII space. Runs of plain ASCII
+// spaces, '\n' and '\t' are left alone.
+func CollapseUnicodeSpaceRuns(s string) string {
+	wide := func(r rune) bool { return r > 0x7f && unicode.Is(unicode.Z, r) }
+	if !strings.ContainsFunc(s, wide) {
+		return s
+	}
+	rs := []rune(s)
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(rs); {
+		if rs[i] != ' ' && !wide(rs[i]) {
+			b.WriteRune(rs[i])
+			i++
+			continue
+		}
+		j, hasWide := i, false
+		for j < len(rs) && (rs[j] == ' ' || wide(rs[j])) {
+			hasWide = hasWide || wide(rs[j])
+			j++
+		}
+		if hasWide {
+			b.WriteByte(' ')
+		} else {
+			b.WriteString(string(rs[i:j]))
+		}
+		i = j
+	}
+	return b.String()
 }
 
 // StripInvisible drops IsInvisible runes and maps IsLineSeparator
@@ -79,166 +148,56 @@ func StripInvisible(s string) string {
 	return b.String()
 }
 
-// --- hidden HTML elements ------------------------------------------
-
-// stripHiddenElements removes elements a mail client would not show —
-// the `hidden` attribute, or an inline style with display:none,
-// visibility:hidden|collapse, font-size:0, opacity:0, or a zero
-// (max-)height/width combined with overflow:hidden — together with
-// everything inside them. Senders use these to put instructions in
-// front of an LLM that the human reading the same mail never sees.
-//
-// The input is parsed with the HTML5 algorithm (golang.org/x/net/html)
-// so the "inside" relation matches what a browser builds, even for
-// malformed markup — a regex or tokenizer could be made to end the
-// hidden region early with a stray end tag the browser ignores.
-//
-// When nothing is hidden the input is returned unchanged (byte for
-// byte), so ordinary mail keeps its existing text / entity handling.
-// Otherwise the pruned tree is re-rendered.
-func stripHiddenElements(input string) string {
-	if !strings.Contains(input, "<") {
-		return input
-	}
-	doc, err := html.Parse(strings.NewReader(input))
-	if err != nil {
-		return input
-	}
-	if !pruneHidden(doc) {
-		return input
-	}
-	var buf bytes.Buffer
-	if err := html.Render(&buf, doc); err != nil {
-		return input
-	}
-	return buf.String()
-}
-
-// pruneHidden removes hidden element subtrees under n; reports whether
-// anything was removed.
-func pruneHidden(n *html.Node) bool {
-	removed := false
-	for c := n.FirstChild; c != nil; {
-		next := c.NextSibling
-		if c.Type == html.ElementNode && elementHidden(c) {
-			n.RemoveChild(c)
-			removed = true
-		} else if pruneHidden(c) {
-			removed = true
-		}
-		c = next
-	}
-	return removed
-}
-
-func elementHidden(n *html.Node) bool {
-	for _, a := range n.Attr {
-		switch strings.ToLower(a.Key) {
-		case "hidden":
-			return true
-		case "style":
-			if styleHides(a.Val) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// styleHides reports whether an inline style declaration list hides
-// its element. Property names/values are normalized first: CSS
-// comments removed, backslash escapes decoded, case folded, whitespace
-// and !important dropped — so "DISPLAY : n\6f ne" still counts.
-func styleHides(style string) bool {
-	decls := map[string]string{}
-	for _, d := range strings.Split(normalizeCSS(style), ";") {
-		k, v, ok := strings.Cut(d, ":")
-		if !ok {
-			continue
-		}
-		decls[k] = strings.TrimSuffix(v, "!important")
-	}
-	switch decls["display"] {
-	case "none":
-		return true
-	}
-	switch decls["visibility"] {
-	case "hidden", "collapse":
-		return true
-	}
-	if v, ok := decls["font-size"]; ok && cssZero(v) {
-		return true
-	}
-	if v, ok := decls["opacity"]; ok && cssZero(v) {
-		return true
-	}
-	if decls["overflow"] == "hidden" || decls["overflow-y"] == "hidden" || decls["overflow-x"] == "hidden" {
-		for _, k := range []string{"max-height", "height", "max-width", "width"} {
-			if v, ok := decls[k]; ok && cssZero(v) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// cssZero reports whether a CSS length / number is zero (0, 0px,
-// 0.0em, 0%, -0, …).
-func cssZero(v string) bool {
-	num := strings.TrimRightFunc(v, func(r rune) bool { return unicode.IsLetter(r) || r == '%' })
-	if num == "" {
-		return false
-	}
-	f, err := strconv.ParseFloat(num, 64)
-	return err == nil && f == 0
-}
-
-// normalizeCSS lower-cases s, drops /* comments */, decodes CSS
-// escapes (\XX hex up to 6 digits, or \c) and removes all whitespace.
-func normalizeCSS(s string) string {
-	for {
-		i := strings.Index(s, "/*")
-		if i < 0 {
-			break
-		}
-		j := strings.Index(s[i+2:], "*/")
-		if j < 0 {
-			s = s[:i]
-			break
-		}
-		s = s[:i] + s[i+2+j+2:]
-	}
+// CollapseBlanks drops invisible characters and maps every run of
+// whitespace (IsBlank, line separators included) to a single ASCII
+// space. For one-line display fields.
+func CollapseBlanks(s string) string {
 	var b strings.Builder
-	rs := []rune(s)
-	for i := 0; i < len(rs); i++ {
-		r := rs[i]
-		if r == '\\' && i+1 < len(rs) {
-			j := i + 1
-			for j < len(rs) && j < i+7 && isHex(rs[j]) {
-				j++
+	b.Grow(len(s))
+	space := false
+	for _, r := range s {
+		switch {
+		case IsInvisible(r):
+			continue
+		case IsBlank(r) || IsLineSeparator(r):
+			if !space {
+				b.WriteByte(' ')
 			}
-			if j > i+1 {
-				if v, err := strconv.ParseUint(string(rs[i+1:j]), 16, 32); err == nil {
-					b.WriteRune(rune(v))
-				}
-				i = j - 1
-				if i+1 < len(rs) && unicode.IsSpace(rs[i+1]) {
-					i++ // one whitespace terminates a hex escape
-				}
-				continue
-			}
-			b.WriteRune(rs[j])
-			i = j
+			space = true
 			continue
 		}
-		if unicode.IsSpace(r) || IsInvisible(r) {
-			continue
-		}
-		b.WriteRune(unicode.ToLower(r))
+		space = false
+		b.WriteRune(r)
 	}
 	return b.String()
 }
 
-func isHex(r rune) bool {
-	return (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')
+// --- hidden HTML elements ------------------------------------------
+
+// stripHiddenElements removes what a mail client would not show —
+// comments, non-rendered elements, and elements / text hidden by
+// attributes or CSS (see visible.go) — before HTML() hands the markup
+// to bluemonday, which would otherwise drop the style attributes and
+// make invisible text visible to the LLM.
+//
+// When nothing is removed the input is returned unchanged (byte for
+// byte). Otherwise the pruned tree is re-rendered. Markup the parser
+// refuses (nesting deeper than its 512-element limit) fails closed:
+// only a notice is returned, never the unpruned input.
+func stripHiddenElements(input string) string {
+	if !strings.Contains(input, "<") {
+		return input
+	}
+	d, ok := parseVisible(input)
+	if !ok {
+		return unparseableNotice
+	}
+	if !d.changed {
+		return input
+	}
+	var buf bytes.Buffer
+	if err := html.Render(&buf, d.root); err != nil {
+		return input
+	}
+	return buf.String()
 }

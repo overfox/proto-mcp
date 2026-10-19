@@ -23,10 +23,15 @@ import (
 //
 // M3: AppKit also breaks lines at U+2028 / U+2029 / U+0085 (and VT/FF),
 // and invisible format characters (bidi overrides, zero-width chars,
-// tag block) can reorder or hide text — sanitize.StripInvisible maps
-// the former to spaces and drops the latter.
+// tag block) can reorder or hide text.
+//
+// M6: blank-looking fillers (braille blank U+2800, Hangul fillers,
+// variation selectors, CGJ — sanitize.IsInvisible) are dropped and
+// every run of whitespace, ASCII or Unicode (NBSP, U+3000 …), becomes
+// one space, so a value can't be padded until a forged "Body:" line
+// wraps into view. sanitize.CollapseBlanks does all of it.
 func sanitizeField(s string) string {
-	return sanitize.StripInvisible(strings.NewReplacer("\r", " ", "\n", " ", "\t", " ").Replace(s))
+	return sanitize.CollapseBlanks(s)
 }
 
 // joinAddrs sanitizes each address (PROTO-126) then comma-joins for
