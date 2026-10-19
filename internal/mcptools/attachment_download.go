@@ -69,7 +69,7 @@ func mailDownloadAttachment(deps Deps) mcp.Tool {
 			"written to a local staging file and the response carries its path instead (keeping the " +
 			"response under the MCP token cap) — use mail_save_attachment to copy it somewhere permanent. " +
 			"Either way a sha256 of the plaintext is returned. On first call, fetches from Proton, decrypts " +
-			"with the address keyring, and caches locally for 30 days; subsequent calls return from cache. " +
+			"with the address keyring, and caches locally (7 days, 256 MiB cap); subsequent calls return from cache. " +
 			"Refuses attachments larger than max_attachment_bytes (policy; default 25 MiB) before any " +
 			"network traffic. Filenames are sanitized — RTL spoofing, control chars, path separators, and " +
 			"leading dots are stripped to defend the display + save paths.",
@@ -207,7 +207,7 @@ func mailDownloadAttachment(deps Deps) mcp.Tool {
 				slog.Warn("attachment_cache write failed; returning uncached", "err", err,
 					"message_id", payload.MessageID, "attachment_id", payload.AttachmentID)
 			} else {
-				// Best-effort eviction down to the 500 MiB ceiling.
+				// Best-effort eviction down to the 256 MiB ceiling.
 				// Errors only show up in the log; the user still gets
 				// their bytes.
 				if n, evictErr := deps.Store.EvictAttachmentsToFit(ctx.Std, attachmentCacheCeilingBytes); evictErr != nil {
@@ -281,7 +281,7 @@ func stagingDir() (string, error) {
 // dir stays bounded by the number of distinct large attachments fetched,
 // not the call count. Mode 0600 in a 0700 dir, mirroring the on-disk
 // hardening the SQLite cache and socket already use. The bytes are also
-// in the 500 MiB-capped SQLite cache; this is the filesystem handoff for
+// in the 256 MiB-capped SQLite cache; this is the filesystem handoff for
 // callers that can't read base64 out of a token-capped response.
 //
 // Retention: the file is swept by SweepStagingOlderThan (wired into
