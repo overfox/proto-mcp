@@ -342,11 +342,7 @@ func mailDraftList(deps Deps) mcp.Tool {
 			if err != nil {
 				return nil, err
 			}
-			summaries := make([]messageSummary, 0, len(hits))
-			for _, h := range hits {
-				summaries = append(summaries, hitToSummary(h))
-			}
-			res := listResult{Messages: summaries}
+			res := summarizeHits(hits)
 			if opts.Limit > 0 && len(hits) >= opts.Limit {
 				res.NextCursor = encodeCursor(opts.Offset+len(hits), qhash)
 			}

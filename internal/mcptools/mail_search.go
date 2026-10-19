@@ -36,7 +36,8 @@ func mailSearch(deps Deps) mcp.Tool {
 			"Repeating a prefix ANDs it (from:a from:b needs both). Date range can also be supplied as " +
 			"top-level since / until params (RFC3339 or YYYY-MM-DD). " +
 			"Read-only — does NOT pull fresh data from Proton; " +
-			"call mail_sync first if the user implies they want recent activity.",
+			"call mail_sync first if the user implies they want recent activity. " +
+			untrustedListNote,
 		InputSchema: json.RawMessage(`{
 			"type": "object",
 			"properties": {
@@ -93,11 +94,7 @@ func mailSearch(deps Deps) mcp.Tool {
 			if err != nil {
 				return nil, err
 			}
-			summaries := make([]messageSummary, 0, len(hits))
-			for _, h := range hits {
-				summaries = append(summaries, hitToSummary(h))
-			}
-			res := listResult{Messages: summaries}
+			res := summarizeHits(hits)
 			if opts.Limit > 0 && len(hits) >= opts.Limit {
 				res.NextCursor = encodeCursor(opts.Offset+len(hits), qhash)
 			}
