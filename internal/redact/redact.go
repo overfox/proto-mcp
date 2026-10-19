@@ -224,7 +224,7 @@ func Error(s string) string { return scrubEmbeddedTokens(s) }
 // snippet. Two patterns:
 //
 //  1. JWT-shaped: three base64url runs of ≥8 chars joined by dots.
-//  2. Long base64url runs of ≥40 chars (covers Proton's refresh
+//  2. Long base64url runs of ≥32 chars (covers Proton's refresh
 //     tokens, access tokens, UIDs, salted-key-pass etc.).
 //
 // Returns the input unchanged if neither matches. Caller can use
@@ -238,9 +238,9 @@ func scrubEmbeddedTokens(s string) string {
 	s = jwtTokenRE.ReplaceAllString(s, "[REDACTED-JWT]")
 	s = longBase64RE.ReplaceAllStringFunc(s, func(m string) string {
 		// Don't over-redact short alphanumeric runs that happen to
-		// be 40+ chars but aren't tokens (file paths missing
+		// be 32+ chars but aren't tokens (file paths missing
 		// slashes, hex hashes already-public, etc.). The
-		// constraint is "base64url charset + length ≥ 40" which
+		// constraint is "base64url charset + length ≥ 32" which
 		// is the regex's job; this hook is a future seam for
 		// allowlist tightening.
 		return "[REDACTED-TOKEN]"
@@ -250,7 +250,7 @@ func scrubEmbeddedTokens(s string) string {
 
 var (
 	jwtTokenRE   = regexp.MustCompile(`\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b`)
-	longBase64RE = regexp.MustCompile(`\b[A-Za-z0-9_+/=-]{40,}\b`)
+	longBase64RE = regexp.MustCompile(`\b[A-Za-z0-9_+/=-]{32,}\b`)
 )
 
 func looksLikeToken(s string) bool {

@@ -63,6 +63,7 @@ import (
 	"path/filepath"
 	"sync"
 	"syscall"
+	"testing"
 	"time"
 )
 
@@ -118,10 +119,12 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	// Allow override via env (test convenience). Production users
-	// shouldn't need this; the daemon's default path matches the
-	// shim's default lookup.
-	if v := os.Getenv("PROTONMCP_SOCKET"); v != "" {
+	// Env override is TEST-ONLY: the shim's environment comes from the
+	// MCP client config, which a prompt-injected model with file access
+	// can edit — pointing the shim at an attacker socket would let it
+	// impersonate the daemon to Claude. Production always uses the
+	// default path the daemon listens on.
+	if v := os.Getenv("PROTONMCP_SOCKET"); v != "" && testing.Testing() {
 		sockPath = v
 	}
 

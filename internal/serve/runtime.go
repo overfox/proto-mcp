@@ -108,6 +108,10 @@ type Runtime struct {
 	// by mu. Drives connectCooldown.
 	connectFailedAt time.Time
 
+	// unlockLimiter rate-limits unlock Touch ID prompts (SIGUSR2,
+	// proton_connect). Set by Setup; nil = unlimited.
+	unlockLimiter *promptLimiter
+
 	// Phase 7/A — auto-lock infrastructure. idleTracker bumps on
 	// every tool call via the mcp.WithToolCallObserver hook.
 	// lockwatchCancel terminates the Swift lockwatch helper on
@@ -204,6 +208,52 @@ func waitDrained(drained <-chan struct{}, timeout time.Duration) {
 // pending Touch ID prompt or a network retry) already holds the slot.
 var ErrUnlockInProgress = errors.New("an unlock is already in progress; try again shortly")
 
+// ErrUnlockRateLimited is returned when an unlock would exceed the
+// Touch ID prompt budget (promptLimiter).
+var ErrUnlockRateLimited = errors.New("too many unlock prompts")
+
+// Unlock prompt budget: at most one prompt per unlockPromptMinGap and
+// unlockPromptHourlyMax per rolling hour.
+const (
+	unlockPromptMinGap    = 30 * time.Second
+	unlockPromptHourlyMax = 6
+)
+
+// promptLimiter is the unlock prompt budget. Every attempt that would
+// prompt counts, approved or not.
+type promptLimiter struct {
+	mu     sync.Mutex
+	recent []time.Time
+	now    func() time.Time
+}
+
+func newPromptLimiter() *promptLimiter { return &promptLimiter{now: time.Now} }
+
+func (l *promptLimiter) allow() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	kept := l.recent[:0]
+	for _, t := range l.recent {
+		if now.Sub(t) < time.Hour {
+			kept = append(kept, t)
+		}
+	}
+	l.recent = kept
+	if n := len(l.recent); n > 0 {
+		if wait := unlockPromptMinGap - now.Sub(l.recent[n-1]); wait > 0 {
+			return fmt.Errorf("%w: retry in %ds", ErrUnlockRateLimited, int(wait.Seconds())+1)
+		}
+	}
+	if len(l.recent) >= unlockPromptHourlyMax {
+		wait := time.Hour - now.Sub(l.recent[0])
+		return fmt.Errorf("%w: %d in the last hour; retry in %s", ErrUnlockRateLimited,
+			len(l.recent), wait.Round(time.Minute))
+	}
+	l.recent = append(l.recent, now)
+	return nil
+}
+
 func (r *Runtime) unlockSlot() chan struct{} {
 	r.unlockSemOnce.Do(func() { r.unlockSem = make(chan struct{}, 1) })
 	return r.unlockSem
@@ -246,6 +296,16 @@ func (r *Runtime) unlock(ctx context.Context, wait bool) error {
 	}
 	if acquire == nil {
 		return errors.New("runtime: no acquireSession callback registered for unlock")
+	}
+	// Prompt fatigue: cap how often SIGUSR2 / proton_connect can put a
+	// Touch ID dialog in front of the user (a looping or injected model,
+	// or any same-user process sending signals, could otherwise train
+	// them to tap through). nil on hand-built test runtimes.
+	if r.unlockLimiter != nil {
+		if err := r.unlockLimiter.allow(); err != nil {
+			slog.Warn("unlock prompt rate-limited", "requester", unlockRequester(ctx), "err", err.Error())
+			return err
+		}
 	}
 
 	// PROTO-141: the Touch-ID-gated acquire (up to a 60s human prompt)
@@ -362,6 +422,11 @@ func (r *Runtime) Connect(ctx context.Context) (alreadyConnected bool, email str
 	if wait > 0 {
 		return false, "", fmt.Errorf("previous Touch ID attempt was declined; retry in %ds", int(wait.Seconds())+1)
 	}
+	who := "proton_connect (MCP tool)"
+	if c := caller.FromContext(ctx); c.PID != 0 {
+		who = "proton_connect from " + c.String()
+	}
+	ctx = withUnlockRequester(ctx, who)
 	ctx, cancel := context.WithTimeout(WithoutNetworkRetry(ctx), connectBound)
 	defer cancel()
 	if err := r.unlock(ctx, false); err != nil {
@@ -724,6 +789,7 @@ func Setup(ctx context.Context, cfg SetupConfig) (*Runtime, error) {
 		acquireSession: gatedAcquire,
 		state:          cfg.State,
 		bgSyncCancel:   bgCancel,
+		unlockLimiter:  newPromptLimiter(),
 	}
 	if ls != nil {
 		rt.live = ls
@@ -776,7 +842,9 @@ func Setup(ctx context.Context, cfg SetupConfig) (*Runtime, error) {
 				rt.Lock("SIGUSR1")
 			case syscall.SIGUSR2:
 				go func() {
-					uctx, cancel := context.WithTimeout(bgCtx, unlockTimeout)
+					uctx, cancel := context.WithTimeout(
+						withUnlockRequester(bgCtx, "SIGUSR2 (`protonmcp unlock`, the menu bar, or another local process)"),
+						unlockTimeout)
 					defer cancel()
 					if err := rt.unlock(uctx, false); err != nil {
 						logger.Warn("unlock failed", "err", err.Error())

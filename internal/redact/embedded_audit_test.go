@@ -40,6 +40,22 @@ func TestJSON_LeavesBenignStringsAlone(t *testing.T) {
 	}
 }
 
+// Proton access tokens are 32 chars; the embedded-token threshold used
+// to be 40, so one inside an error string survived.
+func TestError_Scrubs32CharToken(t *testing.T) {
+	tok := "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6" // 32 chars, Proton access-token shape
+	if len(tok) != 32 {
+		t.Fatal("fixture length")
+	}
+	out := Error("refresh failed: 401 for token " + tok + " (expired)")
+	if strings.Contains(out, tok) {
+		t.Fatalf("32-char token not scrubbed: %q", out)
+	}
+	if !strings.Contains(out, "(expired)") {
+		t.Fatalf("surrounding text lost: %q", out)
+	}
+}
+
 // PROTO-136 — Error() scrubs embedded tokens out of an audit error_msg.
 func TestError_ScrubsTokens(t *testing.T) {
 	tok := "abcdefghIJKLMNOP0123456789-_abcdefghIJKLMNOP0123456789" // ≥40 base64url
