@@ -2,6 +2,7 @@ package sanitize
 
 import (
 	"strings"
+	"unicode/utf8"
 )
 
 // Filename normalizes an attachment filename for safe display + safe
@@ -32,7 +33,8 @@ import (
 //   - Trailing whitespace + dots (Windows refuses these; macOS just
 //     finds them confusing).
 //   - Length capped at 255 bytes (POSIX NAME_MAX). Truncates from
-//     the end while preserving the file extension where possible.
+//     the end (on a rune boundary) while preserving the file
+//     extension where possible.
 //
 // Empty post-strip falls back to "attachment.bin". The caller can
 // override with a more informative default (e.g.
@@ -111,16 +113,28 @@ func truncatePreservingExt(s string, maxBytes int) string {
 		// No extension, or filename starts with '.' (defensive;
 		// shouldn't happen post-TrimLeft), or extension at very
 		// end with no following bytes.
-		return s[:maxBytes]
+		return cutUTF8(s, maxBytes)
 	}
 	ext := s[idx:]
 	if len(ext) >= maxBytes {
 		// Extension alone exceeds the cap; can't preserve it.
-		return s[:maxBytes]
+		return cutUTF8(s, maxBytes)
 	}
 	baseRoom := maxBytes - len(ext)
 	if baseRoom <= 0 {
-		return s[:maxBytes]
+		return cutUTF8(s, maxBytes)
 	}
-	return s[:baseRoom] + ext
+	return cutUTF8(s, baseRoom) + ext
+}
+
+// cutUTF8 returns the longest prefix of s of at most maxBytes that ends
+// on a rune boundary, so a cut never leaves half a character.
+func cutUTF8(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	for maxBytes > 0 && !utf8.RuneStart(s[maxBytes]) {
+		maxBytes--
+	}
+	return s[:maxBytes]
 }
