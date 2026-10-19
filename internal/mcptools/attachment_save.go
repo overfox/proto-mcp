@@ -74,11 +74,18 @@ func mailSaveAttachment(deps Deps) mcp.Tool {
 			var in input
 			_ = json.Unmarshal(raw, &in)
 			subj := lookupSubject(deps, in.MessageID)
+			// Show the name the handler will actually write (same
+			// transform), not a placeholder: the sender picks it.
 			fname := in.Filename
 			if fname == "" {
-				fname = "(name from message)"
+				fname = lookupAttachmentName(deps, in.MessageID, in.AttachmentID)
+			}
+			if fname == "" {
+				fname = "(attachment name unknown until fetched — checked against the refused-name list on save)"
+			} else if final, err := saveFilename(fname); err != nil {
+				fname = sanitize.Filename(fname) + " (WILL BE REFUSED: " + err.Error() + ")"
 			} else {
-				fname = sanitize.Filename(fname)
+				fname = final
 			}
 			dest := "~/Downloads"
 			if in.Directory != "" {
@@ -115,18 +122,8 @@ func mailSaveAttachment(deps Deps) mcp.Tool {
 			if in.Filename != "" {
 				fname = in.Filename
 			}
-			fname = sanitize.Filename(fname)
-			// filepath.Base + Clean — defense in depth even though
-			// sanitize.Filename already substituted separators.
-			fname = filepath.Base(filepath.Clean(fname))
-			if fname == "" || fname == "." || fname == "/" || fname == "\\" {
-				return mcp.ErrorResult("mail_save_attachment: refusing empty / invalid filename %q after sanitization", fname), nil
-			}
-			// Agent/IDE config names (CLAUDE.md, .mcp.json, ...) and
-			// run-on-open extensions (.command, .app, ...) are refused:
-			// Keep Alive can suppress this tool's Touch ID prompt, so
-			// these checks are the compensating control.
-			if err := checkSaveName(fname); err != nil {
+			fname, err = saveFilename(fname)
+			if err != nil {
 				return mcp.ErrorResult("mail_save_attachment: %v", err), nil
 			}
 
@@ -194,6 +191,63 @@ func mailSaveAttachment(deps Deps) mcp.Tool {
 			})
 		},
 	}
+}
+
+// saveFilename turns a sender- or caller-supplied name into the base
+// name mail_save_attachment writes, or refuses it. Shared by the
+// handler and the Touch ID prompt so the prompt shows exactly what
+// lands on disk. Agent/IDE config names (CLAUDE.md, .mcp.json, ...)
+// and run-on-open extensions (.command, .app, ...) are refused: Keep
+// Alive can suppress this tool's Touch ID prompt, so these checks are
+// the compensating control.
+func saveFilename(name string) (string, error) {
+	fname := sanitize.Filename(name)
+	// filepath.Base + Clean — defense in depth even though
+	// sanitize.Filename already substituted separators.
+	fname = filepath.Base(filepath.Clean(fname))
+	if fname == "" || fname == "." || fname == "/" || fname == "\\" {
+		return "", fmt.Errorf("refusing empty / invalid filename %q after sanitization", fname)
+	}
+	if err := checkSaveName(fname); err != nil {
+		return "", err
+	}
+	return fname, nil
+}
+
+// lookupAttachmentName finds an attachment's filename for the approval
+// prompt without fetching its bytes: the attachment cache, then the
+// attachment list cached with the body, then (bounded) the message
+// metadata from Proton. "" when none answers in time.
+func lookupAttachmentName(deps Deps, messageID, attachmentID string) string {
+	if messageID == "" || attachmentID == "" {
+		return ""
+	}
+	if deps.Store != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), promptLookupTimeout)
+		defer cancel()
+		if m, err := deps.Store.GetCachedAttachmentMeta(ctx, messageID, attachmentID); err == nil {
+			return m.Filename
+		}
+		if b, err := deps.Store.GetCachedBody(ctx, messageID); err == nil {
+			for _, a := range b.Attachments {
+				if a.ID == attachmentID {
+					return a.Name
+				}
+			}
+		}
+	}
+	if deps.Session != nil && deps.Session.Client != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*promptLookupTimeout)
+		defer cancel()
+		if m, err := deps.Session.Client.GetMessage(ctx, messageID); err == nil {
+			for _, a := range m.Attachments {
+				if a.ID == attachmentID {
+					return a.Name
+				}
+			}
+		}
+	}
+	return ""
 }
 
 // loadOrFetchAttachment returns the cached row + its plaintext
