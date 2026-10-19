@@ -135,17 +135,21 @@ func (m *Middleware) runTool(ctx context.Context, t Tool, args json.RawMessage, 
 	}
 
 	// Phase 6/E — locked daemon refuses every tool call until
-	// `protonmcp unlock` (or SIGUSR2). The check happens BEFORE
-	// the audit row so a locked-daemon flood doesn't write a
-	// row per attempt — only the first attempt per second is
-	// logged (logger.Warn-rate-limited at the caller level if
-	// needed). For now we log every locked call at Warn — the
-	// daemon is presumed to lock infrequently.
+	// `protonmcp unlock` (or SIGUSR2). The refusal is audited
+	// (outcome denied, reason "locked: …") so probing a locked daemon
+	// leaves a trail; the handler never runs and no decision is made.
 	if m.lockState != nil && !t.AllowWhenLocked {
 		if locked, reason := m.lockState(); locked {
 			logger.Warn("tool call refused: daemon locked",
 				"tool", t.Name, "reason", reason,
 				"caller_pid", callerInfo.PID)
+			if m.audit != nil {
+				m.audit.Record(ctx, &audit.Entry{
+					Caller:   callerInfo,
+					Tool:     t.Name,
+					ArgsJSON: redact.JSON(args),
+				}, audit.OutcomeDenied, "", redact.Error("locked: "+reason))
+			}
 			return ErrorResult("Proton is locked (%s). Call the proton_connect tool to ask the user "+
 				"for Touch ID, then retry this call.", reason), nil
 		}
@@ -209,7 +213,7 @@ func (m *Middleware) runTool(ctx context.Context, t Tool, args json.RawMessage, 
 	// rate → recipients → broker → handler.
 	if pol != nil && pol.RateLimit != "" {
 		m.ensureRate()
-		key := t.Name + "|" + strconv.Itoa(callerInfo.PID)
+		key := rateLimitKey(t.Name, callerInfo)
 		if ok, reason := m.rate.Allow(key, pol.RateLimit); !ok {
 			outcome = audit.OutcomeDenied
 			errMsg = reason
@@ -256,7 +260,12 @@ func (m *Middleware) runTool(ctx context.Context, t Tool, args json.RawMessage, 
 		src, perr := m.broker.Request(ctx, approval.Request{
 			Tool:   t.Name,
 			Caller: callerInfo,
-			Args:   args,
+			// The approval cache is keyed on Args: bind it to what the
+			// dialog SHOWED, not just the raw args, so a cached approval
+			// can't be reused once the state the prompt described has
+			// changed (M5: rules_run's body carries a hash of the rules'
+			// content — editing a rule forces a new prompt).
+			Args:   approvalBinding(args, title, body),
 			Policy: *pol,
 			Title:  title,
 			Body:   body,
@@ -303,6 +312,37 @@ func (m *Middleware) runTool(ctx context.Context, t Tool, args json.RawMessage, 
 	}
 	outcome = audit.OutcomeOK
 	return res, nil
+}
+
+// rateLimitKey scopes a tool's rate limit to the calling BINARY, not
+// its PID: every reconnect / respawn of a client (each Claude shim is
+// a fresh process) used to get a fresh budget. Falls back to the PID
+// only when the binary couldn't be resolved.
+func rateLimitKey(tool string, c caller.Caller) string {
+	if c.Binary != "" {
+		return tool + "|bin:" + c.Binary
+	}
+	return tool + "|pid:" + strconv.Itoa(c.PID)
+}
+
+// approvalBinding is the byte string an approval (and its cache entry)
+// is bound to: the raw args plus the exact title and body shown.
+// Valid JSON (an object), so field boundaries can't be shifted and any
+// consumer that parses Request.Args still can (args under "args").
+func approvalBinding(args json.RawMessage, title, body string) json.RawMessage {
+	argsStr := string(args)
+	if !json.Valid(args) {
+		argsStr = strconv.Quote(argsStr) // never fails the marshal below
+	}
+	out, err := json.Marshal(struct {
+		Args  json.RawMessage `json:"args"`
+		Title string          `json:"prompt_title"`
+		Body  string          `json:"prompt_body"`
+	}{Args: json.RawMessage(argsStr), Title: title, Body: body})
+	if err != nil {
+		return args
+	}
+	return out
 }
 
 // Logger is the minimal subset of *slog.Logger the middleware uses.

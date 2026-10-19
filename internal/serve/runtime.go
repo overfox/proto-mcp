@@ -12,6 +12,7 @@ package serve
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -30,6 +31,7 @@ import (
 	"github.com/just-an-oldsalt/proto-mcp/internal/mcptools"
 	"github.com/just-an-oldsalt/proto-mcp/internal/policy"
 	protonclient "github.com/just-an-oldsalt/proto-mcp/internal/proton"
+	"github.com/just-an-oldsalt/proto-mcp/internal/redact"
 	"github.com/just-an-oldsalt/proto-mcp/internal/remote"
 	"github.com/just-an-oldsalt/proto-mcp/internal/store"
 	syncpkg "github.com/just-an-oldsalt/proto-mcp/internal/sync"
@@ -953,7 +955,8 @@ func (r *Runtime) syncSession(ctx context.Context, sess *protonclient.Session, s
 
 	// Owner-defined auto rules (rules_set with auto: true, each created
 	// behind Touch ID) run on freshly synced mail. Actions are limited
-	// to label / move / star / mark_read by the rules engine; a failure
+	// to label / star / mark_read for auto rules (M5) and each action is
+	// audited (autoRuleAudit); a failure
 	// is logged and never aborts the sync.
 	r.applyAutoRules(syncCtx, sess, st, logger)
 
@@ -976,7 +979,11 @@ func (r *Runtime) syncSession(ctx context.Context, sess *protonclient.Session, s
 }
 
 func (r *Runtime) applyAutoRules(ctx context.Context, sess *protonclient.Session, st *store.Store, logger *slog.Logger) {
-	rep, err := mcptools.ApplyAutoRules(ctx, mcptools.Deps{Session: sess, Store: st, Policy: r.Policy})
+	var auditor mcptools.AutoRuleAuditor
+	if r.Audit != nil {
+		auditor = autoRuleAudit{w: r.Audit}
+	}
+	rep, err := mcptools.ApplyAutoRules(ctx, mcptools.Deps{Session: sess, Store: st, Policy: r.Policy}, auditor)
 	if err != nil {
 		if ctx.Err() == nil {
 			logger.Warn("auto rules failed", "err", err.Error())
@@ -990,6 +997,40 @@ func (r *Runtime) applyAutoRules(ctx context.Context, sess *protonclient.Session
 			logger.Info("auto rule applied", "rule", res.Rule, "matched", res.Matched, "applied", res.Applied)
 		}
 	}
+}
+
+// autoRuleAudit adapts the audit writer to mcptools.AutoRuleAuditor
+// (M5): every unattended auto-rule action gets an audit row, tool
+// "rules_auto", caller = the daemon itself, approval_source "auto_rule"
+// (the rule was approved with Touch ID when rules_set saved it).
+type autoRuleAudit struct{ w *audit.Writer }
+
+// maxAuditedIDs caps the message IDs written per row.
+const maxAuditedIDs = 200
+
+func (a autoRuleAudit) AutoRuleAction(ctx context.Context, ev mcptools.AutoRuleEvent) {
+	ids := ev.MessageIDs
+	if len(ids) > maxAuditedIDs {
+		ids = ids[:maxAuditedIDs]
+	}
+	args, _ := json.Marshal(struct {
+		Rule       string   `json:"rule"`
+		Action     string   `json:"action"`
+		Changed    int      `json:"changed"`
+		Matched    int      `json:"matched"`
+		MessageIDs []string `json:"message_ids"`
+	}{ev.Rule, ev.Action, ev.Changed, len(ev.MessageIDs), ids})
+	outcome, errMsg := audit.OutcomeOK, ""
+	if ev.Err != nil {
+		outcome, errMsg = audit.OutcomeError, redact.Error(ev.Err.Error())
+	}
+	exe, _ := os.Executable()
+	a.w.Record(ctx, &audit.Entry{
+		Caller:         caller.Caller{PID: os.Getpid(), UID: os.Getuid(), Binary: exe},
+		Tool:           "rules_auto",
+		ArgsJSON:       redact.JSON(args),
+		PolicyDecision: "auto",
+	}, outcome, "auto_rule", errMsg)
 }
 
 // fullRefreshMinInterval rate-limits the automatic backfill; a server
