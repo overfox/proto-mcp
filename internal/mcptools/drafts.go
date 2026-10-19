@@ -253,7 +253,7 @@ func mailDraftDelete(deps Deps) mcp.Tool {
 		DraftID string `json:"draft_id"`
 	}
 	return mcp.Tool{
-		Name:        "mail_draft_delete",
+		Name: "mail_draft_delete",
 		Description: "Delete a draft by moving it to Trash (not a permanent delete — it stays recoverable from Trash " +
 			"until Trash is emptied; move it back with mail_move destination=\"drafts\"). " +
 			"`deleted: true` means it was moved to Trash.",
@@ -355,6 +355,18 @@ func mailDraftList(deps Deps) mcp.Tool {
 	}
 }
 
+// maxDraftOutsideFiles caps how many distinct out-of-allowlist files
+// one draft call may attach (M3): every path must be visible in the
+// Touch ID prompt, so rather than letting a long list push sensitive
+// paths past what macOS displays, larger batches are refused.
+const maxDraftOutsideFiles = 5
+
+// draftOutsidePromptBudget is the rune budget for the draft
+// out-of-allowlist prompt — same LAContext display assumption as
+// sendPromptBudget (≈1500 chars shown, minus the helper's
+// "Requested by" line).
+const draftOutsidePromptBudget = sendPromptBudget
+
 // draftAttachmentGate returns the tier-b gate for the draft tools:
 // draft creation/update is policy `allow`, so files from outside
 // attachment_path_allowlist need their own Touch ID approval here. One
@@ -368,7 +380,10 @@ func draftAttachmentGate(ctx context.Context, deps Deps, tool, subject string, t
 			return fmt.Errorf("%q is outside attachment_path_allowlist and needs a Touch ID approval, "+
 				"but no approval broker is available", outside[0].Requested)
 		}
-		title, body := outsideAllowlistPrompt(tool, subject, to, outside)
+		title, body, err := outsideAllowlistPrompt(tool, subject, to, outside)
+		if err != nil {
+			return err
+		}
 		if err := deps.Approve(ctx, title, body); err != nil {
 			return fmt.Errorf("attaching files from outside attachment_path_allowlist was not approved: %w", err)
 		}
@@ -378,24 +393,59 @@ func draftAttachmentGate(ctx context.Context, deps Deps, tool, subject string, t
 
 // outsideAllowlistPrompt formats the per-call Touch ID prompt for
 // out-of-allowlist path attachments on a draft.
-func outsideAllowlistPrompt(tool, subject string, to []string, outside []resolvedAttachmentPath) (string, string) {
+//
+// M3: the file paths are what the user is approving, so they come
+// first, deduplicated, and are never truncated: more than
+// maxDraftOutsideFiles distinct files, or paths that alone don't fit
+// the prompt budget, are refused with an error telling the model to
+// split the call. Subject and recipients (context only — nothing is
+// sent) follow and are the part clipped to fit.
+func outsideAllowlistPrompt(tool, subject string, to []string, outside []resolvedAttachmentPath) (string, string, error) {
+	seen := map[string]bool{}
+	var files []resolvedAttachmentPath
+	for _, o := range outside {
+		if !seen[o.Resolved] {
+			seen[o.Resolved] = true
+			files = append(files, o)
+		}
+	}
+	if len(files) > maxDraftOutsideFiles {
+		return "", "", fmt.Errorf("%d files from outside attachment_path_allowlist in one call; at most %d can be "+
+			"shown in one Touch ID approval — attach them in several mail_draft_update calls of up to %d files each "+
+			"(or move them into an allowlisted folder)", len(files), maxDraftOutsideFiles, maxDraftOutsideFiles)
+	}
+
 	var b strings.Builder
 	noun := "file"
-	if len(outside) > 1 {
+	if len(files) > 1 {
 		noun = "files"
 	}
-	fmt.Fprintf(&b, "Attach %d %s from outside your attachment allowlist to a draft (%s)", len(outside), noun, tool)
-	if len(to) > 0 {
-		b.WriteString("\nTo: " + joinAddrs(to))
-	}
-	if subject != "" {
-		b.WriteString("\nSubject: " + clipRunes(sanitizeField(subject), 100))
-	}
-	for _, o := range outside {
+	fmt.Fprintf(&b, "Attach %d %s from outside your attachment allowlist to a draft (%s):", len(files), noun, tool)
+	for _, o := range files {
 		fmt.Fprintf(&b, "\n%s (%s)", sanitizeField(o.Resolved), humanBytes(o.Size))
 	}
+	head := b.String()
+	if runeLen(head) > draftOutsidePromptBudget {
+		return "", "", fmt.Errorf("the out-of-allowlist file paths are too long to show in full in one Touch ID " +
+			"approval; attach fewer files per call")
+	}
+
+	var ctxLines []string
+	if subject != "" {
+		ctxLines = append(ctxLines, "Subject: "+clipRunes(sanitizeField(subject), 100))
+	}
+	if len(to) > 0 {
+		ctxLines = append(ctxLines, "To: "+joinAddrs(to))
+	}
+	body := head
+	if len(ctxLines) > 0 {
+		room := draftOutsidePromptBudget - runeLen(head) - 1 - nfkcSlack
+		if room > 10 {
+			body += "\n" + clipRunes(strings.Join(ctxLines, "\n"), room)
+		}
+	}
 	return mcp.SanitizePromptText("Approve attaching files to "+tool+"?", 120),
-		mcp.SanitizePromptText(b.String(), 4000)
+		mcp.SanitizePromptText(body, 4000), nil
 }
 
 // buildDraftTemplate is the shared body-building path. Handles

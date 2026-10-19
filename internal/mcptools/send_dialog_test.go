@@ -80,8 +80,8 @@ func TestFormatSendPrompt_OrderAndContent(t *testing.T) {
 			t.Errorf("attachment %d missing:\n%s", i, body)
 		}
 	}
-	if n := len([]rune(body)); n > 700 {
-		t.Errorf("dialog is %d runes, want <= 700:\n%s", n, body)
+	if n := len([]rune(body)); n > sendPromptBudget {
+		t.Errorf("dialog is %d runes, want <= %d:\n%s", n, sendPromptBudget, body)
 	}
 }
 
@@ -89,7 +89,7 @@ func TestFormatSendPrompt_OrderAndContent(t *testing.T) {
 // recipients.
 func TestFormatSendPrompt_BudgetShrinksBodyFirst(t *testing.T) {
 	var to []string
-	for i := 0; i < 20; i++ {
+	for i := 0; i < 52; i++ {
 		to = append(to, fmt.Sprintf("person%02d@example.com", i))
 	}
 	body := formatSendPrompt(Deps{}, sendPromptSpec{

@@ -107,6 +107,11 @@ func mailSend(deps Deps) mcp.Tool {
 					"mail_send: subject and at least one to recipient are required")
 			}
 			entry, have := sendLedger.take("mail_send", raw)
+			if have && entry.failure != "" {
+				// M3: the dialog couldn't show every recipient and
+				// attachment — refuse even though it was approved.
+				return mcp.ErrorResult("mail_send refused: %s; nothing was sent", entry.failure), nil
+			}
 			return sendCompose(ctx, deps, "mail_send", "", gpa.ReplyAction, in, ledgerGate(entry, have))
 		},
 	}
@@ -152,8 +157,13 @@ func mailSendDraft(deps Deps) mcp.Tool {
 					Warnings: []string{"COULD NOT LOAD THE DRAFT — approving will NOT send it (" + clipRunes(err.Error(), 100) + ")"},
 				})
 			}
+			body, overflow := formatSendPromptChecked(deps, draftPromptSpec(draft, plain))
+			if overflow != "" {
+				sendLedger.record("mail_send_draft", args, sendApproval{failure: overflow})
+				return title, body
+			}
 			sendLedger.record("mail_send_draft", args, sendApproval{draftDigest: draftDigest(draft, plain)})
-			return title, formatSendPrompt(deps, draftPromptSpec(draft, plain))
+			return title, body
 		},
 		Handler: func(ctx mcp.Context, raw json.RawMessage) (*mcp.ToolResult, error) {
 			var in input
@@ -401,8 +411,12 @@ func replyPromptBody(deps Deps, tool string, replyAll bool) func(json.RawMessage
 		var outside []string
 		spec.Attachments, outside = describeAttachments(deps, in.Attachments)
 		rec.outsidePaths = pathSet(outside)
+		body, overflow := formatSendPromptChecked(deps, spec)
+		if overflow != "" && rec.failure == "" {
+			rec.failure = overflow
+		}
 		sendLedger.record(tool, args, rec)
-		return mcp.SanitizePromptText("Approve "+tool+"?", 120), formatSendPrompt(deps, spec)
+		return mcp.SanitizePromptText("Approve "+tool+"?", 120), body
 	}
 }
 
@@ -483,8 +497,8 @@ func mailForward(deps Deps) mcp.Tool {
 			}
 			entry, have := sendLedger.take("mail_forward", raw)
 			if have && entry.failure != "" {
-				return mcp.ErrorResult("mail_forward refused: the approval dialog could not show the forwarded "+
-					"attachments (%s); nothing was sent", entry.failure), nil
+				return mcp.ErrorResult("mail_forward refused: the approval dialog could not show all recipients "+
+					"and attachments (%s); nothing was sent", entry.failure), nil
 			}
 			return sendForward(ctx, deps, in, entry, have)
 		},
@@ -540,8 +554,12 @@ func forwardPromptBody(deps Deps) func(json.RawMessage) (string, string) {
 		newAtts, outside := describeAttachments(deps, in.Attachments)
 		spec.Attachments = append(spec.Attachments, newAtts...)
 		rec.outsidePaths = pathSet(outside)
+		body, overflow := formatSendPromptChecked(deps, spec)
+		if overflow != "" && rec.failure == "" {
+			rec.failure = overflow
+		}
 		sendLedger.record("mail_forward", args, rec)
-		return mcp.SanitizePromptText("Approve mail_forward?", 120), formatSendPrompt(deps, spec)
+		return mcp.SanitizePromptText("Approve mail_forward?", 120), body
 	}
 }
 
@@ -643,8 +661,9 @@ func sendPromptBodyWithDeps(deps Deps, toolName string) func(json.RawMessage) (s
 		}
 		var outside []string
 		spec.Attachments, outside = describeAttachments(deps, in.Attachments)
-		sendLedger.record(toolName, args, sendApproval{outsidePaths: pathSet(outside)})
-		return mcp.SanitizePromptText("Approve "+toolName+"?", 120), formatSendPrompt(deps, spec)
+		body, overflow := formatSendPromptChecked(deps, spec)
+		sendLedger.record(toolName, args, sendApproval{outsidePaths: pathSet(outside), failure: overflow})
+		return mcp.SanitizePromptText("Approve "+toolName+"?", 120), body
 	}
 }
 
