@@ -118,13 +118,20 @@ func TestTextStripsStyleAndScriptContent(t *testing.T) {
 // D42 edge: mixed-case tags + spaces in closing tag must also be
 // caught.
 func TestTextStripsCaseAndSpacedClosingTags(t *testing.T) {
-	in := `<STYLE>p{color:red}</ Style >hello<Script>x()</  SCRIPT>world`
+	in := `<STYLE>p{color:red}</Style >hello<Script>x()</SCRIPT  >world`
 	got := Text(in)
 	if strings.Contains(got, "color:red") || strings.Contains(got, "x()") {
 		t.Errorf("D42 case/space variant leaked: %q", got)
 	}
 	if !strings.Contains(got, "hello") || !strings.Contains(got, "world") {
 		t.Errorf("real content lost: %q", got)
+	}
+	// "</ Style >" is not an end tag in HTML5: the style element (and
+	// so everything after it) stays raw CSS text, which a browser
+	// never shows. Nothing may leak — matching the browser, the
+	// trailing text is not shown either.
+	if got := Text(`<STYLE>p{color:red}</ Style >hello<Script>x()</  SCRIPT>world`); strings.Contains(got, "color:red") || strings.Contains(got, "x()") {
+		t.Errorf("D42 bogus end tag leaked: %q", got)
 	}
 }
 
@@ -140,10 +147,15 @@ func TestTextStripsQuotedReplies(t *testing.T) {
 }
 
 func TestTextCollapsesWhitespace(t *testing.T) {
+	// Runs of spaces/tabs collapse to one space; runs of line breaks
+	// to one newline (M6: stable, readable line structure).
 	in := "Hello\n\n\n   world\t\tagain"
 	got := Text(in)
-	if got != "Hello world again" {
-		t.Errorf("Text = %q, want \"Hello world again\"", got)
+	if got != "Hello\nworld again" {
+		t.Errorf("Text = %q, want \"Hello\\nworld again\"", got)
+	}
+	if got := Snippet(in, 100); got != "Hello world again" {
+		t.Errorf("Snippet = %q, want one line", got)
 	}
 }
 

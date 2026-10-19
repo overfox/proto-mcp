@@ -33,8 +33,14 @@ func TestMailRead_DefaultsMetadataAndCacheHit(t *testing.T) {
 		t.Errorf("to = %+v", first.To)
 	}
 	if len(first.Attachments) != 1 || first.Attachments[0].ID != attIDs[0] ||
-		first.Attachments[0].Filename != "q3.csv" || first.Attachments[0].MIMEType != "text/csv" {
+		first.Attachments[0].MIMEType != "text/csv" {
 		t.Errorf("attachments = %+v", first.Attachments)
+	} else {
+		// M6: the filename is sender-controlled and comes fenced.
+		assertFenced(t, "attachment filename", first.Attachments[0].Filename, "q3.csv")
+		if first.UntrustedNotice == "" {
+			t.Error("fenced fields without untrusted_notice")
+		}
 	}
 	if first.MIMEType == "" {
 		t.Error("mime_type missing on fresh read")
@@ -48,8 +54,10 @@ func TestMailRead_DefaultsMetadataAndCacheHit(t *testing.T) {
 	if second.MIMEType != first.MIMEType {
 		t.Errorf("cache hit dropped mime_type: %q vs %q", second.MIMEType, first.MIMEType)
 	}
-	if len(second.Attachments) != 1 || second.Attachments[0].Filename != "q3.csv" {
+	if len(second.Attachments) != 1 {
 		t.Errorf("cache hit dropped attachments: %+v", second.Attachments)
+	} else {
+		assertFenced(t, "cached attachment filename", second.Attachments[0].Filename, "q3.csv")
 	}
 	if len(second.To) != 1 {
 		t.Errorf("cache hit dropped to: %+v", second.To)

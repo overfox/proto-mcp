@@ -98,3 +98,33 @@ func TestSanitizePromptText_UnicodeLineSeparators(t *testing.T) {
 		}
 	}
 }
+
+// M6 round 2: blank-looking fillers are dropped and runs of Unicode
+// spaces collapse, so a field can't be padded until a forged line
+// wraps into view. Plain ASCII runs (our layout) and a single emoji
+// presentation selector after a symbol ("⚠️") are kept.
+func TestSanitizePromptText_PaddingFillers(t *testing.T) {
+	for _, r := range []rune{0x2800, 0x3164, 0x1160, 0x115f, 0xffa0, 0x034f, 0x17b4, 0x180b, 0xfe00, 0x1d159, 0xe0100} {
+		if got := SanitizePromptText("a"+strings.Repeat(string(r), 40)+"b", 1000); got != "ab" {
+			t.Errorf("U+%04X not stripped: %q", r, got)
+		}
+	}
+	if got := SanitizePromptText("Q3 　　   Body: x", 1000); got != "Q3 Body: x" {
+		t.Errorf("unicode space run = %q", got)
+	}
+	if got := SanitizePromptText("To:  a\n\tb", 1000); got != "To:  a\n\tb" {
+		t.Errorf("ASCII layout changed: %q", got)
+	}
+	if got := SanitizePromptText("⚠️ warn", 1000); got != "⚠️ warn" {
+		t.Errorf("emoji selector lost: %q", got)
+	}
+	if got := SanitizePromptText("a️️️b", 1000); got != "ab" {
+		t.Errorf("stray selectors kept: %q", got)
+	}
+	invisible := []rune{0x2800, 0x3164}
+	for _, r := range invisible {
+		if got := SanitizePromptText("a"+string(r)+"b", 100); got != "ab" {
+			t.Errorf("U+%04X not stripped: %q", r, got)
+		}
+	}
+}

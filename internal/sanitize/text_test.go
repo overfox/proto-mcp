@@ -57,16 +57,21 @@ func TestVisibleStylesKept(t *testing.T) {
 	}
 }
 
-// Ordinary mail is returned byte-for-byte the way it was before the
-// hidden-element pass (entity handling unchanged).
+// Text shows text as displayed: entities decoded (M6 — an encoded
+// "&#73;GNORE" must not slip past filters that look for "IGNORE"),
+// identical with or without a hidden element alongside. HTML() leaves
+// ordinary markup byte-for-byte alone.
 func TestHiddenPassLeavesOrdinaryHTMLAlone(t *testing.T) {
 	in := `<p>Tom &amp; Jerry's "show"</p>`
-	if got := Text(in); got != `Tom &amp; Jerry's "show"` {
+	if got := Text(in); got != `Tom & Jerry's "show"` {
 		t.Errorf("Text = %q", got)
 	}
 	in2 := `<p>Tom &amp; Jerry's "show"</p><p hidden>x</p>`
-	if got := Text(in2); got != `Tom &amp; Jerry's "show"` {
+	if got := Text(in2); got != `Tom & Jerry's "show"` {
 		t.Errorf("Text with hidden = %q", got)
+	}
+	if got := stripHiddenElements(in); got != in {
+		t.Errorf("stripHiddenElements changed ordinary markup: %q", got)
 	}
 }
 

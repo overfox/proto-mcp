@@ -9,6 +9,7 @@ import (
 	gpa "github.com/ProtonMail/go-proton-api"
 
 	"github.com/just-an-oldsalt/proto-mcp/internal/mcp"
+	"github.com/just-an-oldsalt/proto-mcp/internal/sanitize"
 	"github.com/just-an-oldsalt/proto-mcp/internal/store"
 )
 
@@ -61,6 +62,9 @@ func mailListAttachments(deps Deps) mcp.Tool {
 	type result struct {
 		MessageID   string           `json:"message_id"`
 		Attachments []attachmentMeta `json:"attachments"`
+		// UntrustedNotice explains the fences around filename /
+		// content_id (sender-controlled — M6).
+		UntrustedNotice string `json:"untrusted_notice,omitempty"`
 	}
 
 	return mcp.Tool{
@@ -94,7 +98,8 @@ func mailListAttachments(deps Deps) mcp.Tool {
 						},
 						"required": ["id", "filename", "size_bytes"]
 					}
-				}
+				},
+				` + untrustedNoticeSchema + `
 			},
 			"required": ["message_id", "attachments"]
 		}`),
@@ -128,11 +133,14 @@ func mailListAttachments(deps Deps) mcp.Tool {
 				return mcp.ErrorResult("mail_list_attachments: fetch failed: %v", err), nil
 			}
 
+			// M6: filenames and content ids are sender-controlled;
+			// sanitize like every other display path, then fence.
+			fence := newFieldFence()
 			out := result{MessageID: in.MessageID}
 			for _, a := range m.Attachments {
 				meta := attachmentMeta{
 					ID:        a.ID,
-					Filename:  a.Name,
+					Filename:  fence.wrap(sanitize.Filename(a.Name)),
 					MIMEType:  string(a.MIMEType),
 					SizeBytes: int(a.Size),
 					Inline:    a.Disposition == "inline",
@@ -140,9 +148,12 @@ func mailListAttachments(deps Deps) mcp.Tool {
 				// ContentID isn't a top-level field on Attachment;
 				// it lives in the RFC 822 headers when present.
 				if cid := headerFirst(a.Headers, "Content-Id"); cid != "" {
-					meta.ContentID = cid
+					meta.ContentID = fence.wrap(sanitize.StripInvisible(cid))
 				}
 				out.Attachments = append(out.Attachments, meta)
+			}
+			if len(out.Attachments) > 0 {
+				out.UntrustedNotice = fence.notice("filename and content_id")
 			}
 			return mcp.StructuredResult(out)
 		},
