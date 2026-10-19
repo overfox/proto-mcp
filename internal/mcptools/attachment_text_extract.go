@@ -822,6 +822,40 @@ func (c *cappedBuffer) Write(p []byte) (int, error) {
 	return c.buf.Write(p)
 }
 
+// extractMaxChildren caps concurrent extraction children: each may use
+// up to extractChildMaxMemory and extractChildCPUSeconds, so a burst of
+// hostile documents can't multiply that across the machine.
+const extractMaxChildren = 2
+
+var (
+	// extractChildSlots holds one token per running child.
+	extractChildSlots = make(chan struct{}, extractMaxChildren)
+	// extractSlotWait bounds how long a call queues for a free slot
+	// (swapped in tests).
+	extractSlotWait = 30 * time.Second
+)
+
+// acquireExtractSlot waits (up to extractSlotWait, or until ctx ends)
+// for a free child slot. The returned func releases it.
+func acquireExtractSlot(ctx context.Context) (func(), error) {
+	release := func() { <-extractChildSlots }
+	select {
+	case extractChildSlots <- struct{}{}:
+		return release, nil
+	default:
+	}
+	timer := time.NewTimer(extractSlotWait)
+	defer timer.Stop()
+	select {
+	case extractChildSlots <- struct{}{}:
+		return release, nil
+	case <-timer.C:
+		return nil, fmt.Errorf("text extraction is busy (%d documents already being extracted); try again shortly", extractMaxChildren)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 // extractTextSubprocess runs the extraction child and parses its
 // "<total runes>\n<text>" reply.
 func extractTextSubprocess(ctx context.Context, format string, content []byte, limit int) (string, int, error) {
@@ -829,6 +863,11 @@ func extractTextSubprocess(ctx context.Context, format string, content []byte, l
 	if err != nil {
 		return "", 0, fmt.Errorf("text extraction unavailable: locate executable: %w", err)
 	}
+	release, err := acquireExtractSlot(ctx)
+	if err != nil {
+		return "", 0, err
+	}
+	defer release()
 	ctx, cancel := context.WithTimeout(ctx, extractSandboxTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, exe, ExtractTextSubcommand, format, strconv.Itoa(limit))

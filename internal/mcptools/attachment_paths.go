@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -34,7 +35,7 @@ import (
 // protected file and no path check can see it). The read uses
 // O_NOFOLLOW on the resolved path, verifies the opened file is the one
 // that was checked — and, for tier b, the one an approval dialog
-// showed (device, inode, size, mtime) — and re-runs the denylist on
+// showed (device, inode, size, mtime, ctime) — and re-runs the denylist on
 // the kernel's own name for the open file (F_GETPATH).
 
 type pathTier int
@@ -59,7 +60,8 @@ type resolvedAttachmentPath struct {
 
 // deniedHomeDirs (relative to a home folder, compared after canonName)
 // can never be attached from, allowlist or approval notwithstanding.
-// Applied to $HOME and to every /Volumes/<vol>/Users/<name> home.
+// Applied to $HOME and to every ".../Users/<name>/" folder anywhere in a
+// path (external disks, Time Machine snapshots, copied old homes).
 var deniedHomeDirs = canonList(
 	".ssh",
 	".gnupg",
@@ -174,7 +176,18 @@ func classifyAttachmentPath(deps Deps, resolved string) (pathClass, error) {
 // membership already decided.
 func classifyPathAllowlisted(resolved string, allowlisted bool) (pathClass, error) {
 	pc := pathClass{allowlisted: allowlisted}
+	resolved = filepath.Clean(resolved)
 	c := canonName(resolved)
+
+	// Decisions run on the canonical components; messages show the
+	// caller's spelling. (The counts differ only if canonName produced
+	// a separator, e.g. from a fullwidth solidus; messages then fall
+	// back to the canonical form.)
+	cParts := strings.Split(c, string(filepath.Separator))
+	oParts := strings.Split(resolved, string(filepath.Separator))
+	if len(oParts) != len(cParts) {
+		oParts = cParts
+	}
 
 	var relHome string
 	if home, herr := os.UserHomeDir(); herr == nil && home != "" {
@@ -183,6 +196,9 @@ func classifyPathAllowlisted(resolved string, allowlisted bool) (pathClass, erro
 	relVol, underVol := within(canonName(resolvedOrSelf("/Volumes")), c)
 	pc.underVol = underVol
 
+	if err := checkBackupDenylist(resolved, cParts, oParts); err != nil {
+		return pc, err
+	}
 	base := canonName(filepath.Base(resolved))
 	for _, pat := range deniedNamePatterns {
 		if ok, _ := filepath.Match(pat, base); ok {
@@ -190,37 +206,88 @@ func classifyPathAllowlisted(resolved string, allowlisted bool) (pathClass, erro
 		}
 	}
 	if pc.underHome {
-		if err := checkHomeDenylist(resolved, "~/", relHome, pc.allowlisted); err != nil {
+		var rel []string
+		if relHome != "." {
+			rel = strings.Split(relHome, string(filepath.Separator))
+		}
+		if err := checkHomeDenylist(resolved, "~/", rel, oParts, pc.allowlisted); err != nil {
 			return pc, err
 		}
 	}
-	if pc.underVol {
-		// Another Mac's (or a backup's) home folder on an external
-		// volume holds the same secrets as ours: /Volumes/<vol>/Users/
-		// <name>/... gets the home rules relative to that home.
-		parts := strings.Split(relVol, string(filepath.Separator))
-		if len(parts) >= 3 && parts[1] == canonName("users") {
-			homeLabel := "/Volumes/" + parts[0] + "/Users/" + parts[2] + "/"
-			if err := checkHomeDenylist(resolved, homeLabel, filepath.Join(parts[3:]...), pc.allowlisted); err != nil {
-				return pc, err
-			}
+	// Any ".../Users/<name>/..." is somebody's home folder — another
+	// Mac's on an external disk, one inside a Time Machine snapshot, an
+	// old home copied under ~/Backups — and holds the same secrets as
+	// ours: the home rules apply relative to it, wherever it sits.
+	for i := 1; i+1 < len(cParts); i++ {
+		if cParts[i] != canonUsers || cParts[i+1] == "" {
+			continue
 		}
-		if !pc.allowlisted && hasHiddenComponent(relVol) {
-			return pc, fmt.Errorf("refusing to attach %q: hidden files/folders are never attachable unless allowlisted", resolved)
+		homeLabel := strings.Join(oParts[:i+2], string(filepath.Separator)) + string(filepath.Separator)
+		if err := checkHomeDenylist(resolved, homeLabel, cParts[i+2:], oParts, pc.allowlisted); err != nil {
+			return pc, err
 		}
+	}
+	if pc.underVol && !pc.allowlisted && hasHiddenComponent(relVol) {
+		return pc, fmt.Errorf("refusing to attach %q: hidden files/folders are never attachable unless allowlisted", resolved)
 	}
 	return pc, nil
 }
 
-// checkHomeDenylist applies the home-folder rules to rel (canonical,
-// relative to a home folder labelled homeLabel in messages).
-func checkHomeDenylist(resolved, homeLabel, rel string, allowlisted bool) error {
-	for _, d := range deniedHomeDirs {
-		if rel == d || strings.HasPrefix(rel, d+"/") {
-			return fmt.Errorf("refusing to attach %q: %s%s is never attachable (credentials / app state)", resolved, homeLabel, d)
+// canonUsers is the canonical "Users" path component.
+var canonUsers = canonName("users")
+
+// Backup stores hold whole copies of a Mac, secrets included, so
+// nothing inside one is attachable: Time Machine's Backups.backupdb
+// and its network / disk-image bundles anywhere in a path, APFS local
+// snapshot mounts (/Volumes/com.apple.TimeMachine.localsnapshots) and
+// the old local-snapshot folder /.MobileBackups. Compared after
+// canonName.
+var (
+	deniedBackupComponents = canonSet("backups.backupdb")
+	deniedBackupExts       = canonSet(".backupbundle", ".sparsebundle")
+	deniedVolumeNames      = canonSet("com.apple.timemachine.localsnapshots")
+	deniedRootNames        = canonSet(".mobilebackups")
+)
+
+// checkBackupDenylist refuses paths inside a backup store. cParts /
+// oParts are the canonical and original components of the absolute
+// path (index 0 is the empty root).
+func checkBackupDenylist(resolved string, cParts, oParts []string) error {
+	refuse := func(i int) error {
+		return fmt.Errorf("refusing to attach %q: %s is a backup store (a whole-Mac copy, secrets included) and is never attachable",
+			resolved, strings.Join(oParts[:i+1], string(filepath.Separator)))
+	}
+	if len(cParts) > 1 && deniedRootNames[cParts[1]] {
+		return refuse(1)
+	}
+	if len(cParts) > 2 && cParts[1] == canonName("volumes") && deniedVolumeNames[cParts[2]] {
+		return refuse(2)
+	}
+	for i, part := range cParts {
+		if deniedBackupComponents[part] || deniedBackupExts[filepath.Ext(part)] {
+			return refuse(i)
 		}
 	}
-	if !allowlisted && hasHiddenComponent(rel) {
+	return nil
+}
+
+// checkHomeDenylist applies the home-folder rules to rel (canonical
+// components relative to a home folder labelled homeLabel in
+// messages). oParts are the whole path's components as the caller
+// spelled them; rel is a suffix of the same path.
+func checkHomeDenylist(resolved, homeLabel string, rel, oParts []string, allowlisted bool) error {
+	for _, d := range deniedHomeDirs {
+		dParts := strings.Split(d, "/")
+		if len(rel) < len(dParts) || !slices.Equal(rel[:len(dParts)], dParts) {
+			continue
+		}
+		shown := d
+		if off := len(oParts) - len(rel); off >= 0 {
+			shown = strings.Join(oParts[off:off+len(dParts)], "/")
+		}
+		return fmt.Errorf("refusing to attach %q: %s%s is never attachable (credentials / app state)", resolved, homeLabel, shown)
+	}
+	if !allowlisted && hasHiddenComponent(strings.Join(rel, string(filepath.Separator))) {
 		return fmt.Errorf("refusing to attach %q: hidden files/folders under a home folder are never attachable "+
 			"unless their directory is in attachment_path_allowlist", resolved)
 	}
@@ -233,7 +300,11 @@ type fileFingerprint struct {
 	dev, ino uint64
 	size     int64
 	mtimeNs  int64
-	nlink    uint64
+	// ctimeNs is the inode change time. Unlike mtime no API sets it,
+	// so a same-inode rewrite with mtime put back via Chtimes still
+	// shows (0 where the platform doesn't report it).
+	ctimeNs int64
+	nlink   uint64
 }
 
 func fingerprintOf(fi os.FileInfo) fileFingerprint {
@@ -242,12 +313,14 @@ func fingerprintOf(fi os.FileInfo) fileFingerprint {
 		fp.dev = uint64(st.Dev)
 		fp.ino = uint64(st.Ino)
 		fp.nlink = uint64(st.Nlink)
+		fp.ctimeNs = statCtimeNs(st)
 	}
 	return fp
 }
 
 func (f fileFingerprint) sameVersion(o fileFingerprint) bool {
-	return f.dev == o.dev && f.ino == o.ino && f.size == o.size && f.mtimeNs == o.mtimeNs
+	return f.dev == o.dev && f.ino == o.ino && f.size == o.size && f.mtimeNs == o.mtimeNs &&
+		f.ctimeNs == o.ctimeNs
 }
 
 func hardLinkError(p string, n uint64) error {
