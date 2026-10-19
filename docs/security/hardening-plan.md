@@ -69,4 +69,16 @@ ACL (needs a provisioned, Developer-ID-signed .app — H1/H3 full fix).
 - [x] WS-D Gates, CLI, policy, daemon (merged 22abff7)
 - [x] Merge + full test + govulncheck (0 vulnerabilities)
 - [x] Deploy + live re-probe (b0d3d9b; H1 still open by design)
-- [ ] Verification review
+- [x] Verification review (2 independent reviewers): C1 partial → fixed
+      (Remote never arms from disk), H6 latent rate_limit gap → fixed,
+      M2/M3/M6 bypasses → round 2
+- [x] Round 2: visible-text-only HTML (72 hiding techniques), filler
+      chars, look-alike fence markers, full fencing; /Users anywhere +
+      backup stores denied, ctime binding, more refused save names,
+      extraction concurrency cap
+
+## Open (needs a signed .app / later)
+- H1 any same-user process can use the unlocked connector
+- H3 Keychain item without OS biometric ACL
+- folders_delete: confirm Proton's handling of contained messages
+- @media hiding rules applied conservatively (may drop responsive copy)
