@@ -68,5 +68,5 @@ ACL (needs a provisioned, Developer-ID-signed .app — H1/H3 full fix).
 - [x] WS-C Files, parsers, data at rest (merged)
 - [x] WS-D Gates, CLI, policy, daemon (merged 22abff7)
 - [x] Merge + full test + govulncheck (0 vulnerabilities)
-- [ ] Deploy + live re-probe
+- [x] Deploy + live re-probe (b0d3d9b; H1 still open by design)
 - [ ] Verification review
