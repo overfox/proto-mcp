@@ -71,6 +71,7 @@
       try {
         const opts = await post("/api/enroll/begin", { token: enrollToken, name: $("devname").value });
         const cred = await navigator.credentials.create(creationOptions(opts));
+        msg("Now confirm this device on the Mac with Touch ID…", "muted");
         const r = await fetch("/api/enroll/finish?t=" + encodeURIComponent(enrollToken), {
           method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(credJSON(cred)) });
         const j = await r.json().catch(() => ({}));
@@ -80,8 +81,8 @@
         msg("✓ " + j.name + " added. Bookmark this page or add it to your home screen.", "ok");
         start();
       } catch (e) {
-        msg("Could not add this device: " + e.message, "bad");
-        $("enrollBtn").disabled = false;
+        // Links work once: a retry needs a new code from the Mac.
+        msg("Could not add this device: " + e.message + ". Create a new code from the Mac menu and scan it again.", "bad");
       }
     };
   }
@@ -89,6 +90,13 @@
   // ---- main view ----------------------------------------------------
   const busy = new Set();
   const render = (st) => {
+    if (!st.enrolled) {
+      // Only enrolled devices see approvals and status.
+      $("main").hidden = true;
+      $("ntfy").hidden = true;
+      msg("This device isn't enrolled. On the Mac, choose Add Remote Device… and scan the code.", "muted");
+      return;
+    }
     $("main").hidden = false;
     const conn = $("conn");
     const connected = st.connector === "unlocked";

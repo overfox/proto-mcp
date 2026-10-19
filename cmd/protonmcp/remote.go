@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,7 +23,7 @@ import (
 // you at the Mac (setup, on, add-device) show Touch ID from the daemon.
 func runRemote(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New(`usage: protonmcp remote {status|setup|on|off|add-device|remove-device <name>|test-notify} [--json]`)
+		return errors.New(`usage: protonmcp remote {status|setup [--port N]|on|off|add-device|remove-device <name>|test-notify} [--json]`)
 	}
 	asJSON := false
 	var rest []string
@@ -55,7 +56,7 @@ func runRemote(ctx context.Context, args []string) error {
 		}
 		return out(st, func() { printRemoteStatus(st) })
 	case "setup":
-		return remoteSetup(ctx, asJSON)
+		return remoteSetup(ctx, asJSON, rest)
 	case "add-device":
 		var res struct {
 			URL string `json:"url"`
@@ -66,7 +67,8 @@ func runRemote(ctx context.Context, args []string) error {
 		return out(res, func() {
 			fmt.Println("Open this link on the phone or tablet within 10 minutes (it works once):")
 			fmt.Println("  " + res.URL)
-			fmt.Println("The device must be signed in to Tailscale. The menu bar's \"Add Remote Device…\" shows it as a QR code.")
+			fmt.Println("The device must be signed in to Tailscale as you. After it creates its passkey, confirm the")
+			fmt.Println("device (named with its Tailscale node) with Touch ID here. The menu bar's \"Add Remote Device…\" shows a QR code.")
 		})
 	case "remove-device":
 		if len(rest) != 1 {
@@ -96,23 +98,57 @@ func printRemoteStatus(st remote.Status) {
 		state = "on, but inactive (needs setup and an enrolled device)"
 	}
 	fmt.Println("Remote mode:", state)
-	if st.Origin != "" {
-		fmt.Println("Address:    ", st.Origin)
-	} else {
+	switch {
+	case st.Origin == "":
 		fmt.Println("Address:     not set up — run `protonmcp remote setup`")
+	case st.Serving:
+		fmt.Println("Address:    ", st.Origin, "(listening on", st.Listen+")")
+	default:
+		fmt.Println("Address:    ", st.Origin, "(not listening yet — is Tailscale running? see the daemon log)")
 	}
 	if len(st.Devices) == 0 {
 		fmt.Println("Devices:     none — run `protonmcp remote add-device`")
 	} else {
-		fmt.Println("Devices:    ", strings.Join(st.Devices, ", "))
+		for i, d := range st.Devices {
+			label := "Devices:    "
+			if i > 0 {
+				label = "            "
+			}
+			if node := st.DeviceNodes[d]; node != "" {
+				d += " — tailscale node " + node
+			}
+			fmt.Println(label, d)
+		}
 	}
-	fmt.Printf("Alerts:      ntfy topic %s on %s\n", st.NtfyTopic, st.NtfyServer)
+	auth := ""
+	if st.NtfyToken {
+		auth = " (with access token)"
+	}
+	fmt.Printf("Alerts:      ntfy topic %s on %s%s\n", st.NtfyTopic, st.NtfyServer, auth)
+	fmt.Println("             Keep the topic name secret: anyone who knows it can see when approvals are pending.")
 }
 
-// remoteSetup publishes the daemon's loopback web app on the tailnet
-// with `tailscale serve` and records the HTTPS origin.
-func remoteSetup(ctx context.Context, asJSON bool) error {
-	ts, err := tailscaleCLI()
+// remoteSetup has the daemon serve the approval page on this Mac's
+// Tailscale address over HTTPS (a `tailscale cert` certificate) and
+// record the origin. The daemon derives the address from its own
+// Tailscale status; this side only checks Tailscale and cleans up the
+// `tailscale serve` config older versions created.
+func remoteSetup(ctx context.Context, asJSON bool, args []string) error {
+	body := map[string]any{}
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--port" && i+1 < len(args):
+			port, err := strconv.Atoi(args[i+1])
+			if err != nil {
+				return fmt.Errorf("bad --port %q", args[i+1])
+			}
+			body["port"] = port
+			i++
+		default:
+			return errors.New("usage: protonmcp remote setup [--port N] [--json]")
+		}
+	}
+	ts, err := remote.TailscaleCLI()
 	if err != nil {
 		return err
 	}
@@ -122,34 +158,18 @@ func remoteSetup(ctx context.Context, asJSON bool) error {
 	if err != nil {
 		return fmt.Errorf("tailscale status failed (is Tailscale running and signed in?): %w", err)
 	}
-	var tsStatus struct {
-		BackendState string
-		Self         struct{ DNSName string }
-	}
+	var tsStatus struct{ BackendState string }
 	if err := json.Unmarshal(raw, &tsStatus); err != nil {
 		return fmt.Errorf("unexpected output from %s status: %q", ts, firstLine(string(raw)))
 	}
 	if tsStatus.BackendState != "Running" {
 		return fmt.Errorf("Tailscale is %q — open the Tailscale app and sign in first", tsStatus.BackendState)
 	}
-	host := strings.TrimSuffix(tsStatus.Self.DNSName, ".")
-	if host == "" {
-		return errors.New("Tailscale reports no DNS name for this Mac — enable MagicDNS in the Tailscale admin console")
-	}
+	removeOldServe(ctx, ts)
 
+	fmt.Fprintln(os.Stderr, "Getting an HTTPS certificate from Tailscale, then confirm with Touch ID on the Mac…")
 	var st remote.Status
-	if err := remoteCall(ctx, http.MethodGet, "/status", nil, &st); err != nil {
-		return err
-	}
-	fmt.Fprintf(os.Stderr, "Publishing https://%s on your tailnet (tailscale serve → %s)…\n", host, st.Listen)
-	serve := exec.CommandContext(ctx, ts, "serve", "--bg", "--https=443", "http://"+st.Listen)
-	serve.Stdout, serve.Stderr = os.Stderr, os.Stderr
-	if err := serve.Run(); err != nil {
-		return fmt.Errorf("tailscale serve failed: %w — if it printed a link, open it to enable HTTPS for your tailnet, then rerun `protonmcp remote setup`", err)
-	}
-
-	fmt.Fprintln(os.Stderr, "Confirm with Touch ID on the Mac…")
-	if err := remoteCall(ctx, http.MethodPost, "/setup", map[string]string{"origin": "https://" + host}, &st); err != nil {
+	if err := remoteCall(ctx, http.MethodPost, "/setup", body, &st); err != nil {
 		return err
 	}
 	if asJSON {
@@ -160,36 +180,33 @@ func remoteSetup(ctx context.Context, asJSON bool) error {
 	return nil
 }
 
-// tailscaleCLI finds a working tailscale CLI. The app's own binary only
-// acts as a CLI when started from a terminal (from the menu bar's
-// launchd environment it prints "The Tailscale GUI failed to start"),
-// so the wrapper the app installs in /usr/local/bin comes first — the
-// menu bar's PATH doesn't include it.
-func tailscaleCLI() (string, error) {
-	for _, p := range []string{"/usr/local/bin/tailscale", "/opt/homebrew/bin/tailscale"} {
-		if _, err := os.Stat(p); err == nil {
-			return p, nil
-		}
+// removeOldServe drops the `tailscale serve` HTTPS proxy older versions
+// set up to the loopback listener (best effort; only when it points at
+// our old port).
+func removeOldServe(ctx context.Context, ts string) {
+	sctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	raw, err := exec.CommandContext(sctx, ts, "serve", "status", "--json").Output()
+	if err != nil || !strings.Contains(string(raw), "127.0.0.1:47811") {
+		return
 	}
-	if p, err := exec.LookPath("tailscale"); err == nil {
-		return p, nil
+	if err := exec.CommandContext(sctx, ts, "serve", "--https=443", "off").Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "Note: couldn't remove the old `tailscale serve` config (%v); run `%s serve --https=443 off`.\n", err, ts)
+		return
 	}
-	const app = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
-	if _, err := os.Stat(app); err == nil {
-		return app, nil
-	}
-	return "", errors.New("Tailscale isn't installed — install it from https://tailscale.com/download or `brew install --cask tailscale-app`")
+	fmt.Fprintln(os.Stderr, "Removed the old `tailscale serve` config (no longer used).")
 }
 
 // remoteCall does one JSON request on the daemon's control socket.
-// Touch ID-gated calls can take up to a minute.
+// Touch ID-gated calls can take up to a minute; setup also waits for
+// the first certificate from Tailscale.
 func remoteCall(ctx context.Context, method, path string, in, out any) error {
 	sock, err := remote.ControlSocketPath()
 	if err != nil {
 		return err
 	}
 	client := &http.Client{
-		Timeout: 90 * time.Second,
+		Timeout: 5 * time.Minute, // setup: certificate issuance + Touch ID
 		Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			var d net.Dialer
 			return d.DialContext(ctx, "unix", sock)
