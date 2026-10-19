@@ -370,3 +370,15 @@ func TestAttr_PreservesBenignProse(t *testing.T) {
 		t.Errorf("over-redacted a benign error: %s", out)
 	}
 }
+
+func TestScrubSparesPathsButNotTokens(t *testing.T) {
+	path := `socket="/Users/faridhafez/Library/Application Support/protonmcp/protonmcp.sock"`
+	if got := scrubEmbeddedTokens(path); got != path {
+		t.Errorf("path over-redacted: %s", got)
+	}
+	for _, tok := range []string{"a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6", "ZGVhZGJlZWYxMjM0NTY3ODkwYWJjZGVm/x9"} {
+		if got := scrubEmbeddedTokens("err=" + tok); strings.Contains(got, tok) {
+			t.Errorf("token %q not redacted: %s", tok, got)
+		}
+	}
+}

@@ -355,6 +355,9 @@ func SweepStagingOlderThan(cutoff time.Time) (int, error) {
 		}
 		return 0, err
 	}
+	// The sweep runs at startup and daily, so a staging dir created by
+	// an older build (before writes set the exclusion) is covered too.
+	_ = store.ExcludeFromBackup(dir)
 	removed := 0
 	var firstErr error
 	for _, e := range entries {

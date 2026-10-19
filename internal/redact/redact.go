@@ -237,12 +237,9 @@ func Error(s string) string { return scrubEmbeddedTokens(s) }
 func scrubEmbeddedTokens(s string) string {
 	s = jwtTokenRE.ReplaceAllString(s, "[REDACTED-JWT]")
 	s = longBase64RE.ReplaceAllStringFunc(s, func(m string) string {
-		// Don't over-redact short alphanumeric runs that happen to
-		// be 32+ chars but aren't tokens (file paths missing
-		// slashes, hex hashes already-public, etc.). The
-		// constraint is "base64url charset + length ≥ 32" which
-		// is the regex's job; this hook is a future seam for
-		// allowlist tightening.
+		if looksLikePath(m) {
+			return m
+		}
 		return "[REDACTED-TOKEN]"
 	})
 	return s
@@ -252,6 +249,29 @@ var (
 	jwtTokenRE   = regexp.MustCompile(`\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b`)
 	longBase64RE = regexp.MustCompile(`\b[A-Za-z0-9_+/=-]{32,}\b`)
 )
+
+// looksLikePath spares filesystem paths the 32-char token match
+// ("/Users/x/Library/Application Support/…" is all base64 charset):
+// a run with a '/' whose segments are all short, or with no digit at
+// all (and no base64 '+' / '='), isn't a random token. Proton tokens are [a-z0-9] runs, so a
+// 32-char one without a digit is vanishingly rare.
+func looksLikePath(m string) bool {
+	if strings.ContainsAny(m, "+=") { // base64 padding / alphabet, never in our paths
+		return false
+	}
+	if !strings.ContainsAny(m, "0123456789") {
+		return true
+	}
+	if !strings.Contains(m, "/") {
+		return false
+	}
+	for _, seg := range strings.Split(m, "/") {
+		if len(seg) >= 24 {
+			return false
+		}
+	}
+	return true
+}
 
 func looksLikeToken(s string) bool {
 	if len(s) < 32 {
